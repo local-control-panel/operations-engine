@@ -20,6 +20,10 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum Error {
+    /// `remote_url` starts with `-`, so `git` could parse it as a flag
+    /// (e.g. `--upload-pack=<command>`) instead of the repository argument.
+    /// Rejected before a subprocess is even started.
+    InvalidRemoteUrl,
     Run(ProcessRunError),
     /// The query itself succeeded, but no allowed branch currently points
     /// at the requested revision.
@@ -44,12 +48,20 @@ pub fn resolve_allowed_revision(
     identity_file: Option<&Path>,
     cancellation: &CancellationToken,
 ) -> Result<(), Error> {
+    if remote_url.starts_with('-') {
+        return Err(Error::InvalidRemoteUrl);
+    }
+
     let mut args: Vec<String> = Vec::new();
     if let Some(path) = identity_file {
         args.push("-c".to_owned());
         args.push(ssh_command_config(path));
     }
     args.push("ls-remote".to_owned());
+    // `--` stops option parsing so a permitted-but-unusual URL (one
+    // containing no leading `-` but still resembling a flag downstream)
+    // can never be reinterpreted as one of git's own options.
+    args.push("--".to_owned());
     args.push(remote_url.to_owned());
     args.extend(
         allowed_branches
@@ -210,5 +222,18 @@ mod tests {
             &CancellationToken::default(),
         );
         assert!(matches!(outcome, Err(Error::SubprocessFailed(_))));
+    }
+
+    #[test]
+    fn a_remote_url_starting_with_a_dash_is_rejected_before_any_subprocess_runs() {
+        let head = GitCommitSha::parse(&"a".repeat(40)).expect("test SHA should be valid");
+        let outcome = resolve_allowed_revision(
+            "--upload-pack=touch /tmp/should-not-run",
+            &["main".to_owned()],
+            &head,
+            None,
+            &CancellationToken::default(),
+        );
+        assert!(matches!(outcome, Err(Error::InvalidRemoteUrl)));
     }
 }
