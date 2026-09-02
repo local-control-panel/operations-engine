@@ -372,14 +372,46 @@ Completed:
   `ManagedRoot` primitives this needed (`symlink`, `read_link`, `rename`),
   each with its own filesystem.rs test, plus three activate.rs tests: first
   activation, a second activation's atomic swap (and that no `.tmp-*` link
-  survives it), and the unrecognized-target refusal.
+  survives it), and the unrecognized-target refusal;
+- assembled the full pipeline and persisted its result
+  (`src/deploy/execute.rs`): `execute` orders preflight → identity →
+  resolve → stage → validate → activate → persist, threading one
+  `CancellationToken`-backed `transaction::commit::PreCommit` through every
+  pre-activation step (`.check()` between each) and calling `.commit()`
+  only once `activate` has actually returned success — the true POSIX
+  commit point, not merely "the last step before it," since a failure
+  inside `activate` itself before its own rename call still means nothing
+  changed (see the module doc for why). A shared `fail` helper records
+  every pre-commit failure the same way: transition `TransactionState` to
+  `Failed` with a stage-appropriate `ErrorCode`, save it, append a
+  `Result` audit event, return the original error unchanged, and let the
+  lock guard drop normally. An idempotency replay now does real work: it
+  loads the original attempt's `TransactionState` and returns its stored
+  `DeployResult` (success) or stable code/message (failure) — a request
+  still `InProgress` replays as `Conflict` rather than silently starting a
+  second attempt. A post-commit persistence failure gets its own
+  `PostCommitRecordFailed { result, cause }` so a successful deployment can
+  never be silently lost even if writing its record fails. Added
+  `tests/deploy.rs`, exercising the assembled pipeline end to end against a
+  real local Git "remote": full success (release activated, `current`
+  resolves to a real checkout), idempotent replay (retry returns the
+  original release, stages nothing new), and a rejected revision (fails
+  without activating anything, lock is free immediately afterward for a
+  following successful attempt) — substantially covering the later "add
+  end-to-end tests" item already; only disconnect-during-operation
+  scenarios remain there, which need a real transport to test honestly and
+  are deferred to Phase 6 client integration.
+  `resolve_allowed_revision` also changed to return the matched branch
+  name (`Result<String, Error>`, was `Result<(), Error>`) — staging needs
+  to know exactly which branch to clone, not just that authorization
+  passed.
 
 Work items, in order:
 
-1. Persist result metadata and emit an audit event.
-2. Clean up according to bounded retention rules.
-3. Add end-to-end success, failure, disconnect, and retry tests.
-4. Advertise `site.deploy` only after all previous items pass.
+1. Clean up according to bounded retention rules.
+2. Add end-to-end disconnect tests (success/failure/retry already covered
+   by `tests/deploy.rs`).
+3. Advertise `site.deploy` only after all previous items pass.
 
 Exit criteria:
 

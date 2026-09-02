@@ -32,7 +32,9 @@ pub enum Error {
 }
 
 /// Resolves whether `revision` is the current tip of one of
-/// `allowed_branches` on `remote_url`. One bounded `git ls-remote` call,
+/// `allowed_branches` on `remote_url`, returning the matching branch name
+/// so a caller that goes on to stage a release knows exactly which branch
+/// to clone rather than re-deriving it. One bounded `git ls-remote` call,
 /// explicit argv only — no shell, no local clone, no working tree.
 ///
 /// `identity_file`, when given, pins the SSH key for this one call via
@@ -47,7 +49,7 @@ pub fn resolve_allowed_revision(
     revision: &GitCommitSha,
     identity_file: Option<&Path>,
     cancellation: &CancellationToken,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     if remote_url.starts_with('-') {
         return Err(Error::InvalidRemoteUrl);
     }
@@ -86,16 +88,18 @@ pub fn resolve_allowed_revision(
         )));
     }
 
-    let resolved = String::from_utf8_lossy(&output.stdout.bytes)
+    let matched_branch = String::from_utf8_lossy(&output.stdout.bytes)
         .lines()
-        .filter_map(|line| line.split('\t').next())
-        .any(|sha| sha == revision.as_str());
+        .find_map(|line| {
+            let (sha, reference) = line.split_once('\t')?;
+            if sha == revision.as_str() {
+                reference.strip_prefix("refs/heads/").map(str::to_owned)
+            } else {
+                None
+            }
+        });
 
-    if resolved {
-        Ok(())
-    } else {
-        Err(Error::NotAuthorized)
-    }
+    matched_branch.ok_or(Error::NotAuthorized)
 }
 
 #[cfg(all(test, unix))]
@@ -165,12 +169,19 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_current_tip_of_an_allowed_branch() {
+    fn accepts_the_current_tip_of_an_allowed_branch_and_returns_its_name() {
         let (directory, branch, head) = local_remote();
         let url = directory.path().to_str().expect("path should be UTF-8");
 
-        resolve_allowed_revision(url, &[branch], &head, None, &CancellationToken::default())
-            .expect("the branch tip should be authorized");
+        let resolved = resolve_allowed_revision(
+            url,
+            std::slice::from_ref(&branch),
+            &head,
+            None,
+            &CancellationToken::default(),
+        )
+        .expect("the branch tip should be authorized");
+        assert_eq!(resolved, branch);
     }
 
     #[test]

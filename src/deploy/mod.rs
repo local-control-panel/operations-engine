@@ -2,6 +2,7 @@
 //! `cli`/`capabilities` until every item in `PLAN.md`'s Phase 4 passes.
 
 pub mod activate;
+pub mod execute;
 pub mod preflight;
 pub mod resolve;
 pub mod staging;
@@ -11,7 +12,7 @@ pub use staging::SiteIdentity;
 
 use std::{fmt, path::Path};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     site::{GitCommitSha, SiteId},
@@ -36,7 +37,7 @@ fn ssh_command_config(identity_file: &Path) -> String {
 /// deploy produces at most one release per transaction, so reusing that
 /// identifier keeps a release, its transaction state, and its audit trail
 /// joinable without a second ID scheme to keep in sync.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ReleaseId(RequestId);
 
@@ -108,7 +109,7 @@ impl DeployRequest {
 /// The `result` payload of a successful `site.deploy` response. Every field
 /// is either an opaque stable identifier or a value the request already
 /// supplied — nothing here can carry secrets or subprocess output.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeployResult {
     pub release_id: ReleaseId,
