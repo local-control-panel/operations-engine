@@ -1,7 +1,8 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 4 — Git deploy pilot
+Current phase: 6 — client integration and compatibility (Phase 4's one
+remaining item is itself blocked on this phase; see its own section below)
 Last updated: 2026-09-02
 
 This file is the shared implementation plan for Operations Engine. It is the
@@ -471,26 +472,121 @@ complete because its happy path works.
 
 ## Phase 5 — Git rollback pilot
 
-Status: pending
+Status: complete
 
 Goal: switch safely to a known retained release using the same transaction,
 locking, audit, and recovery machinery.
 
-Work items, in order:
+Completed:
 
-1. Define which release identifiers are eligible for rollback.
-2. Validate retained release integrity before the commit point.
-3. Implement the atomic switch without rebuilding the release.
-4. Preserve forward recovery information.
-5. Add missing, invalid, concurrent, interrupted, and repeated rollback tests.
-6. Advertise `site.rollback` after the complete contract passes.
+- generalized Phase 4's `deploy::preflight` into `mutation::preflight`
+  (`src/mutation/preflight.rs`), the first shared module between two
+  mutating operations: `preflight::run` now takes a `RequestId`, an
+  `Option<&IdempotencyKey>`, and an `&'static str` operation name instead of
+  a deploy-specific request type, so rollback (and any future mutation)
+  reuses the exact same idempotency-replay, site-lock, transaction-state,
+  and `MutationStart`-audit sequence rather than a second copy of it.
+  `deploy::execute` was updated to call the moved module with no behavior
+  change (its own tests still pass unmodified);
+- defined which release identifiers are eligible for rollback
+  (`src/rollback/eligibility.rs`): `resolve_retained_release` accepts a
+  `ReleaseId` only if `sites/<siteId>/releases/<releaseId>/` already exists
+  as a directory this engine itself created, resolved and containment
+  checked through the same `TrustedRoot::resolve_existing` deploy's staging
+  step uses — never a bare path join. A syntactically valid `ReleaseId` is
+  not itself authorization, matching `docs/site-model.md`'s "rollback never
+  trusts client-side history as its authorization source." A pre-existing
+  symlink escape and a genuinely absent release are both reported as the
+  same `Error::NotFound` — the caller does not need to distinguish them,
+  and distinguishing them in the response would leak filesystem structure
+  for no operational benefit;
+- validated retained release integrity by reusing
+  `deploy::validate::validate_staged_release` verbatim, not a rollback-owned
+  copy: that function was already generic over "a Git working tree at this
+  path, run as this identity" and never assumed the directory had just been
+  freshly cloned. See the decision log for why this was reused rather than
+  forked;
+- implemented the atomic switch by reusing `deploy::activate::activate`
+  verbatim as well: its signature only ever needed a `TrustedRoot`,
+  `SiteId`, and `ReleaseId` — nothing about "was this release just staged"
+  — so rollback's commit point is the identical same-directory
+  symlink-rename `deploy::activate`'s own tests already cover. No new
+  atomic-switch code exists for rollback at all;
+- preserved forward recovery information: `RollbackResult` reports both
+  `releaseId` (the new target) and `previousReleaseId` (the source, exactly
+  as `activate::activate` already returns it). A successful rollback still
+  runs the same best-effort `deploy::cleanup::prune_old_releases` a deploy
+  runs, passing the new target as `active_release` — this does not reset
+  "recency" for the release just switched away from (age is still each
+  release directory's own creation-time modification time, an
+  approximation already documented in `deploy::cleanup`), so a release
+  remains a valid rollback target immediately afterward, but its
+  eligibility for a *later* rollback is bounded by the same retention count
+  a subsequent deploy would apply — a deliberate reuse of deploy's existing
+  approximation, not a new guarantee invented for rollback. Verified end to
+  end in `tests/rollback.rs` by rolling back and then rolling forward again
+  between two real releases;
+- assembled the pipeline (`src/rollback/execute.rs`): `execute` orders
+  preflight → identity → eligibility → validate → activate → persist,
+  threading the same `CancellationToken`-backed `PreCommit`/`PostCommit`
+  boundary deploy uses, with its own `fail`/`replay` helpers mirroring
+  `deploy::execute`'s byte for byte (same `Failed`-transition, same
+  `PostCommitRecordFailed` carrying the real result so a successful
+  rollback can never be silently lost, same `Replayed`/`ReplayInProgress`
+  idempotency handling);
+- added `tests/rollback.rs`, an end-to-end suite against a real local Git
+  "remote" mirroring `tests/deploy.rs`'s style, covering every failure case
+  the milestone's rollback section lists: a successful rollback and a
+  subsequent roll-forward (proving the source release is not invalidated),
+  rollback to a missing release, rollback to a corrupted release (dirty
+  working tree), concurrent rollback attempts on one site serialized by the
+  site lock (mirroring `tests/transaction.rs`'s two-thread contention
+  pattern, using a real background `thread::scope` call against the full
+  `execute()` pipeline rather than only the shared preflight primitive),
+  an interrupted/crashed rollback whose `InProgress` state survives on disk
+  and whose same-key retry is reported as a conflict rather than silently
+  redone or lost, and a retried idempotency key after a successful rollback
+  replaying the original result without a second switch;
+- advertised `site.rollback` (`src/cli.rs`, `src/commands/site.rs`): a new
+  `ops-engine site rollback --site-id <uuid> --release <releaseId>
+  --request-id <uuid> [--idempotency-key <key>]` subcommand following the
+  identical config-loading and error-mapping pattern `site deploy` uses,
+  including a `TransactionRecordIncomplete` warning on the same
+  post-commit-persistence-failure case. `capabilities` now lists
+  `"site.rollback"` alongside `"site.deploy"`. Smoke-tested against the
+  compiled binary (`capabilities`, `site rollback --help`, and an invalid
+  site ID) in addition to the automated suite.
 
-Exit criteria:
+Work items: none — all delivered above.
 
-- rollback cannot select arbitrary filesystem content;
-- the previous active release remains identifiable;
-- an interrupted rollback is recoverable deterministically;
-- audit and result data identify both source and target releases safely.
+Exit criteria (all met; see `tests/rollback.rs`):
+
+- rollback cannot select arbitrary filesystem content — met,
+  `eligibility::resolve_retained_release` only trusts engine-created
+  directories, never client-supplied paths or history;
+- the previous active release remains identifiable — met,
+  `RollbackResult::previous_release_id`;
+- an interrupted rollback is recoverable deterministically — met: state
+  persisted before any switch is attempted, a same-key retry against an
+  `InProgress` original is reported as `Conflict` rather than duplicating
+  or losing work;
+- audit and result data identify both source and target releases safely —
+  met, both are stable `ReleaseId`s; the audit `Result` event carries only
+  the request ID and error code, never free text, matching
+  `docs/protocol.md`'s `details` allowlist.
+
+Unlike Phase 4, rollback has no operation-specific disconnect exit
+criterion of its own (see Phase 4's section for why that one is blocked on
+Phase 6 transport) — everything Phase 5 requires was testable, and tested,
+without a live SSH transport.
+
+Inherited, not new, test-coverage gap: rollback's identity resolution and
+`validate::validate_staged_release` call run as the site identity exactly
+like deploy staging/validation do, and this environment still has no root
+to test a genuine cross-user drop with — see Phase 4's staging entry for
+the same, already-documented limitation. Nothing rollback-specific was
+added here; it simply inherits the gap by reusing deploy's own identity and
+validation code.
 
 ## Phase 6 — client integration and compatibility
 
@@ -581,6 +677,10 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | A deployed release's `ReleaseId` equals the `RequestId` of the transaction that created it, rather than a separately generated identifier. | Deploy makes at most one release per transaction; reusing the ID keeps the release directory, transaction state, and audit trail joinable on one value instead of three. |
 | 2026-09-02 | Site UID/GID is resolved via the `id` subprocess, and privilege-dropping lives on `ProcessRequest` (`run_as`) in the shared runner, not only in deploy code. | Keeps every subprocess call — including future build steps — on the same bounded, argv-only, no-shell, no-raw-FFI discipline instead of a one-off mechanism per operation. |
 | 2026-09-02 | Deploy staging was implemented and merged with cross-user privilege-dropping untested (only self-drop, tested for real). | Explicit user choice: build the real code now rather than deferring it, with the root-only test gap called out in `PLAN.md` and each affected file rather than silently shipped. Must be exercised under an actual multi-user Unix host before production use with more than one site owner. |
+| 2026-09-02 | Generalized `deploy::preflight` into `mutation::preflight`, parameterized by `RequestId`/`Option<&IdempotencyKey>`/operation name instead of a deploy-specific request type. | Rollback needed the identical idempotency-replay/lock/state/audit sequence; a second copy would let the two drift apart silently, and the primitive was already operation-agnostic in everything but its parameter type. |
+| 2026-09-02 | Rollback reuses `deploy::validate::validate_staged_release` and `deploy::activate::activate` verbatim rather than forking rollback-owned copies. | Neither function ever depended on "freshly staged" — both were already generic over "a Git working tree at this path" / "a `SiteId` and `ReleaseId`" respectively. Forking them would only create two integrity checks and two atomic-switch implementations to keep in sync for no behavioral difference. |
+| 2026-09-02 | Rollback runs the same best-effort `deploy::cleanup::prune_old_releases` after a successful switch, passing the new target as `active_release`; it does not reset or otherwise special-case "recency" for the release just switched away from. | Keeps retention behavior identical and predictable across both mutation types instead of inventing rollback-specific retention semantics; a rolled-back-from release stays retained immediately afterward purely because cleanup already keeps the most recent N regardless of which operation is calling it. |
+| 2026-09-02 | `RollbackResult` has no `commit` field, unlike `DeployResult`. | Deploy's `commit` echoes an already-validated request input (`DeployRequest::revision`); rollback's request carries a `ReleaseId`, not a commit, so there is no equivalent input to echo without an extra unrequired subprocess call. `releaseId`/`previousReleaseId` alone already satisfy the exit criterion to identify both releases safely. |
 
 ## Open decisions
 

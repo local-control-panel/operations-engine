@@ -1,10 +1,14 @@
 # Milestone 001: Git deploy and rollback
 
-Status: design pending
+Status: implemented — `site.deploy` (Phase 4) and `site.rollback` (Phase 5)
+are both advertised in `capabilities` and covered by end-to-end tests
+(`tests/deploy.rs`, `tests/rollback.rs`). One item remains open: deploy's
+disconnect-recovery exit criterion is documented but not yet tested, since
+that requires a real transport — see `PLAN.md`'s Phase 4 and Phase 6
+sections. The contract below reflects what was actually decided and built;
+see `PLAN.md` for the authoritative, up-to-date phase-by-phase record.
 
-Git deploy and rollback will be the first mutating Operations Engine workflow.
-Implementation should begin only after the inputs, invariants, and recovery
-contract below are resolved.
+Git deploy and rollback are the first mutating Operations Engine workflow.
 
 ## Goal
 
