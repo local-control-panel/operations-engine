@@ -4,6 +4,9 @@
 pub mod preflight;
 pub mod resolve;
 pub mod staging;
+pub mod validate;
+
+pub use staging::SiteIdentity;
 
 use std::{fmt, path::Path};
 

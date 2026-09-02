@@ -102,6 +102,10 @@ pub struct StagedRelease {
     pub release_id: ReleaseId,
     /// Path to `releases/<releaseId>`, relative to `content_root`.
     pub relative_path: SiteRelativePath,
+    /// The same location, already resolved and containment-checked, for
+    /// callers (validation, the atomic switch) that need an absolute path
+    /// without re-resolving it themselves.
+    pub absolute_path: PathBuf,
 }
 
 /// Clones `branch` from `remote_url` into a brand-new, exclusively-created
@@ -164,6 +168,7 @@ pub fn prepare(
     Ok(StagedRelease {
         release_id,
         relative_path: release_relative,
+        absolute_path: release_absolute,
     })
 }
 
@@ -348,6 +353,7 @@ mod tests {
         let StagedRelease {
             release_id: staged_release_id,
             relative_path,
+            ..
         } = prepare(
             &content_root,
             site_id,

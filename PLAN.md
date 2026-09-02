@@ -347,16 +347,27 @@ Completed:
   cross-user drop). Every mechanism is exercised for real except the one
   thing only root can prove — that a *different* uid/gid is actually
   enforced end to end. Verify that specifically before trusting this
-  against a real multi-tenant deployment.
+  against a real multi-tenant deployment;
+- implemented bounded post-clone validation (`src/deploy/validate.rs`):
+  `validate_staged_release` runs `git fsck --no-progress --no-dangling`
+  (object-database integrity) and `git status --porcelain` (working tree
+  must exactly match `HEAD`, empty output required) against the staged
+  release, both bounded and both `run_as` the site identity like every
+  other subprocess touching a site-owned directory. Deliberately scoped to
+  what is generic across *any* Git deploy — not a build or test step, which
+  is site/framework-specific and out of scope for this pilot per the
+  README's "Scope" section; a manifest-driven build step, if ever added, is
+  new scope for a later milestone, not implied by this item.
+  `StagedRelease` also grew an `absolute_path` field so this and the next
+  item (the atomic switch) don't each re-resolve it independently.
 
 Work items, in order:
 
-1. Run bounded validation steps.
-2. Perform one explicit atomic switch.
-3. Persist result metadata and emit an audit event.
-4. Clean up according to bounded retention rules.
-5. Add end-to-end success, failure, disconnect, and retry tests.
-6. Advertise `site.deploy` only after all previous items pass.
+1. Perform one explicit atomic switch.
+2. Persist result metadata and emit an audit event.
+3. Clean up according to bounded retention rules.
+4. Add end-to-end success, failure, disconnect, and retry tests.
+5. Advertise `site.deploy` only after all previous items pass.
 
 Exit criteria:
 
