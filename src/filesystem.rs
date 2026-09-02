@@ -22,6 +22,18 @@ impl ManagedRoot {
         self.directory.open_dir(path.as_path())
     }
 
+    /// Descends into `path` and returns it as its own `ManagedRoot`, so
+    /// every operation on the result is capability-scoped to that
+    /// subdirectory rather than merely path-prefixed under this one — a
+    /// bug that builds a wrong relative path still cannot reach outside
+    /// `path`. Used to scope a single site's locks/transactions/audit state
+    /// beneath the engine-wide state root.
+    pub fn open_managed_dir(&self, path: &SiteRelativePath) -> io::Result<Self> {
+        Ok(Self {
+            directory: self.open_dir(path)?,
+        })
+    }
+
     pub fn create_dir_all(&self, path: &SiteRelativePath) -> io::Result<()> {
         self.directory.create_dir_all(path.as_path())
     }
@@ -105,6 +117,30 @@ mod tests {
             .expect("state should be written");
         let state = SiteRelativePath::parse("sites/example/state").expect("path should be valid");
         assert_eq!(managed.read_to_string(&state).unwrap(), "ready");
+    }
+
+    #[test]
+    fn open_managed_dir_scopes_operations_beneath_the_subdirectory() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let site_dir = SiteRelativePath::parse("sites/example").expect("path should be valid");
+        managed
+            .create_dir_all(&site_dir)
+            .expect("site directory should be created");
+
+        let site_root = managed
+            .open_managed_dir(&site_dir)
+            .expect("subdirectory should open");
+        let marker = SiteRelativePath::parse("marker").expect("path should be valid");
+        site_root
+            .create_new(&marker, b"scoped")
+            .expect("write beneath the subdirectory should succeed");
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("sites/example/marker")).unwrap(),
+            "scoped"
+        );
     }
 
     #[test]

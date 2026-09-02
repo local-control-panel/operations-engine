@@ -255,7 +255,7 @@ Exit criteria (all met; see `tests/transaction.rs`):
 
 ## Phase 4 — Git deploy pilot
 
-Status: pending
+Status: in progress
 
 Goal: deliver one complete, recoverable Git deployment operation using the
 contracts from phases 2 and 3.
@@ -263,18 +263,51 @@ contracts from phases 2 and 3.
 The detailed contract checklist lives in
 [`docs/milestones/001-git-deploy-rollback.md`](./docs/milestones/001-git-deploy-rollback.md).
 
+Completed:
+
+- froze the `site.deploy` request/result schema (`src/deploy.rs`):
+  `DeployRequest` composes the already-validated `SiteId`, `GitCommitSha`,
+  `RequestId`, and `IdempotencyKey` types with one `parse` that reports
+  which field failed; `DeployResult` is release ID, previous release ID,
+  activated commit, and activation time — nothing else, so it cannot carry
+  secrets or subprocess output. Added `ReleaseId`, defined as *equal to* the
+  deploying transaction's `RequestId` (`From<RequestId>`) rather than a
+  second generated identifier — deploy makes at most one release per
+  transaction, so the release, its transaction state, and its audit trail
+  stay joinable on one ID. Not wired into `cli`/`capabilities` yet — that is
+  item 9, after preflight through cleanup exist;
+- implemented preflight (`src/deploy/preflight.rs`), composing the Phase 3
+  primitives into the first real caller they didn't have yet:
+  `open_site_state` descends an engine-wide state `ManagedRoot` into a
+  fresh, capability-scoped root for exactly one site (new
+  `ManagedRoot::open_managed_dir`), so a path-construction bug in later
+  deploy code cannot reach another site's lock, state, or audit log — the
+  OS-level directory handle has no authority to. `preflight::run` then, in
+  order: resolves an idempotency-key replay first (so a retry never takes
+  the site lock or writes new state at all), acquires the per-site mutation
+  lock, creates `InProgress` transaction state, and appends the
+  `MutationStart` audit event — returning either `Outcome::Proceed(Admitted
+  { lock, state })` for the caller to continue into fetch/stage/switch, or
+  `Outcome::Replay(RequestId)` naming the original attempt to load instead.
+  Every step here only touches engine-owned bookkeeping (locks/,
+  transactions/, audit/); nothing here can touch `releases/` or `current`.
+  Manifest/repository-policy loading is deferred to item 1 (fetch/resolve),
+  which needs it anyway and would otherwise load it twice. No disk-space
+  preflight check yet, either: std has no portable free-space API and
+  cap-std doesn't expose one; `rustix` (already a transitive dependency via
+  cap-std) has `fs::statvfs` on Linux if/when a real staging failure makes
+  this worth adding as a direct dependency.
+
 Work items, in order:
 
-1. Freeze the request and result schemas.
-2. Implement preflight checks without changing the active release.
-3. Fetch and resolve an allowed revision without shell interpolation.
-4. Prepare an isolated staging release.
-5. Run bounded validation steps.
-6. Perform one explicit atomic switch.
-7. Persist result metadata and emit an audit event.
-8. Clean up according to bounded retention rules.
-9. Add end-to-end success, failure, disconnect, and retry tests.
-10. Advertise `site.deploy` only after all previous items pass.
+1. Fetch and resolve an allowed revision without shell interpolation.
+2. Prepare an isolated staging release.
+3. Run bounded validation steps.
+4. Perform one explicit atomic switch.
+5. Persist result metadata and emit an audit event.
+6. Clean up according to bounded retention rules.
+7. Add end-to-end success, failure, disconnect, and retry tests.
+8. Advertise `site.deploy` only after all previous items pass.
 
 Exit criteria:
 
@@ -393,6 +426,7 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Invoke the daemonless mutation CLI through a dedicated sudo entry and drop Git/build children to the site UID/GID. | The engine needs bounded privileged coordination without granting a privileged shell or running application code as root. |
 | 2026-09-02 | Per-site lock staleness is a pure 15-minute time bound (`DEFAULT_STALE_AFTER`), not a holder-process liveness check. | Keeps recovery deterministic and portable (no `/proc` dependency) for a first pass; revisit only if a real workflow needs faster recovery than 15 minutes. |
 | 2026-09-02 | Idempotency-key lookup is a per-site, on-disk FNV-1a hash index with a stored-key check on read; key *retention* is not yet decided. | The exit criterion "retrying an idempotent request cannot create duplicate work" was blocking in Phase 3 itself, so the lookup half had to be resolved now; retention has no forcing operation yet and stays open for Phase 4. |
+| 2026-09-02 | A deployed release's `ReleaseId` equals the `RequestId` of the transaction that created it, rather than a separately generated identifier. | Deploy makes at most one release per transaction; reusing the ID keeps the release directory, transaction state, and audit trail joinable on one value instead of three. |
 
 ## Open decisions
 
