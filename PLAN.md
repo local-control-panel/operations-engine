@@ -1,7 +1,7 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 3 — transaction framework
+Current phase: 4 — Git deploy pilot
 Last updated: 2026-09-02
 
 This file is the shared implementation plan for Operations Engine. It is the
@@ -152,23 +152,100 @@ Exit criteria:
 
 ## Phase 3 — transaction framework
 
-Status: in progress
+Status: complete
 
 Goal: build reusable mutation infrastructure without yet exposing deploy or
 rollback as a capability.
 
-Work items, in order:
+Completed:
 
-1. Define request and idempotency identifiers.
-2. Implement per-site locking with bounded stale-lock recovery.
-3. Implement transaction state persisted outside temporary process memory.
-4. Define named progress steps and JSON Lines framing.
-5. Define the commit point and cancellation rules around it.
-6. Implement bounded subprocess execution with redacted diagnostics.
-7. Define audit events for mutation start, progress, result, and recovery.
-8. Add interruption, timeout, concurrency, and cleanup tests.
+- added validated `RequestId` (canonical, non-nil UUID; names transaction
+  state files) and `IdempotencyKey` (bounded, printable-ASCII, caller-supplied
+  retry token) types in `src/transaction/mod.rs`;
+- implemented per-site locking (`src/transaction/lock.rs`): atomic
+  create-if-absent lock files via a new `ManagedRoot::create_new`
+  (exclusive-create) primitive, a default 15-minute time-based stale bound
+  (`DEFAULT_STALE_AFTER`), one bounded reclaim retry, and an RAII guard that
+  releases on drop. Staleness is purely time-based (no holder-process
+  liveness check); see the `ponytail:` note in `lock.rs` for the upgrade
+  path if faster recovery is ever needed;
+- implemented persisted transaction state (`src/transaction/state.rs`):
+  `TransactionState` (request ID, idempotency key, operation, status,
+  timestamps, outcome) with guarded `InProgress` -> `Committed`/`Failed`
+  transitions (a second transition is rejected, not silently applied), plus
+  `create` (exclusive first write), `save` (atomic update), and `load`. Added
+  a new `ManagedRoot::write_atomic` primitive (same-directory temp file +
+  rename) that `save` uses and that later state or config writers can reuse.
+  (Looking up a transaction by idempotency key was deferred here and
+  implemented separately below, once it became blocking for this phase's own
+  exit criteria.);
+- defined named progress steps and JSON Lines framing
+  (`src/protocol/progress.rs`): a `Step` (`&'static str`, always an
+  engine-chosen constant, never request input), a `start`/`ok`/`failed`
+  `ProgressStatus`, and a `Line` enum (`{"type":"progress",...}` /
+  `{"type":"result",...}`) matching the README's documented framing.
+  `JsonLinesWriter` flushes every line immediately so a slow or
+  disconnecting reader observes progress as it happens, and its `finish`
+  method consumes the writer so at most one `Result` line can ever be
+  emitted through it. Not yet wired into `cli`/`lib.rs` dispatch or
+  `capabilities`'s `jsonLinesProgress` flag — there is still no long-running
+  operation to drive it; that lands with Phase 4 deploy;
+- defined the commit point and cancellation rules as a type-state pair in
+  `src/transaction/commit.rs`: `PreCommit::check` returns `Err(Cancelled)`
+  once `CancellationToken::cancel()` has been called, for operation code to
+  poll between abortable pre-commit steps; `PreCommit::commit(self)`
+  consumes it and returns a `PostCommit` that has no cancellation check at
+  all. "Cancellation cannot abort a committed mutation" is therefore a
+  compile-time guarantee for any operation built on this type, not a
+  runtime convention someone can forget;
+- implemented the redacted-diagnostics half of subprocess execution
+  (`src/process.rs`): `error_code`/`spawn_error_code` turn the runner's
+  `ProcessTermination`/`ProcessRunError` into the stable codes
+  `docs/subprocess.md` already documented but that had no code behind them,
+  and `SubprocessDiagnostics` is a `SUBPROCESS_FAILED`-details-shaped
+  summary (program name, exit code, timeout/cancelled flags, truncation
+  flags) built only from the runner's own bookkeeping — it has no field
+  captured stdout/stderr bytes could occupy, so it cannot leak them by
+  construction. The bounded-execution half (explicit args, timeout,
+  cancellation, concurrent draining, output caps) already shipped in
+  Phase 1;
+- defined mutation audit events (`src/transaction/audit.rs`): `AuditRecord`
+  wraps a schema version, timestamp, and one `AuditEvent`
+  (`MutationStart`/`Progress`/`Result`/`LockRecovered` — the last covers the
+  one recovery path that exists so far, the stale-lock reclaim from
+  `transaction::lock`). Events carry only stable identifiers and codes,
+  never an error message or other free-text field, matching the `details`
+  allowlist in `docs/protocol.md`. Appended via a new
+  `ManagedRoot::append` (create-if-missing, O_APPEND, `fsync`) to
+  `audit/events.jsonl` as one JSON Lines record per call;
+- implemented the idempotency-key lookup this phase's own exit criteria
+  require (`src/transaction/idempotency.rs`): `claim(root, key, requestId)`
+  registers a fresh attempt via `ManagedRoot::create_new`'s atomic
+  create-if-absent and reports `Claimed`, or — if another attempt already
+  owns the key — `AlreadyClaimed(RequestId)` so the caller loads that
+  attempt's `TransactionState` and returns its original outcome instead of
+  doing the work again. Keys are looked up by a dependency-free 64-bit
+  FNV-1a hash of the key bytes (stable across Rust versions, unlike
+  `std::hash::DefaultHasher`); a stored copy of the key is checked on every
+  read, so a hash collision is reported as `HashCollision` rather than ever
+  returning a different caller's outcome. Idempotency-key *retention* (when,
+  if ever, an old claim is pruned) is still open and deferred to Phase 4,
+  where a real operation exists to size it against;
+- added `tests/transaction.rs`, an integration suite that exercises
+  locking, state, the commit boundary, progress framing, audit, and
+  idempotency together the way a future operation will combine them, since
+  none exists yet to test through: two-OS-thread lock contention,
+  a full success lifecycle (state ends `Committed`, lock is free
+  afterward, JSON Lines carries exactly one `result` line, three audit
+  lines are written), cancellation observed and acted on before the commit
+  point vs. requested-but-ignored after it, a forgotten/crashed lock guard
+  left as `InProgress` state that the next attempt can see and reclaim, and
+  a retried idempotency key resolving to the original request's state
+  instead of creating a second one.
 
-Exit criteria:
+Work items: none — all delivered above.
+
+Exit criteria (all met; see `tests/transaction.rs`):
 
 - two mutations cannot run concurrently for the same site;
 - retrying an idempotent request cannot create duplicate work;
@@ -314,6 +391,8 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Resolve request paths through root-owned manifests and opened directory capabilities. | Caller-provided absolute paths and lexical checks are not a sufficient mutation boundary. |
 | 2026-09-02 | Activate releases by renaming a prepared relative symlink over a stable `current` path. | Caddy and runtime consumers keep one document root while activation has one explicit commit point. |
 | 2026-09-02 | Invoke the daemonless mutation CLI through a dedicated sudo entry and drop Git/build children to the site UID/GID. | The engine needs bounded privileged coordination without granting a privileged shell or running application code as root. |
+| 2026-09-02 | Per-site lock staleness is a pure 15-minute time bound (`DEFAULT_STALE_AFTER`), not a holder-process liveness check. | Keeps recovery deterministic and portable (no `/proc` dependency) for a first pass; revisit only if a real workflow needs faster recovery than 15 minutes. |
+| 2026-09-02 | Idempotency-key lookup is a per-site, on-disk FNV-1a hash index with a stored-key check on read; key *retention* is not yet decided. | The exit criterion "retrying an idempotent request cannot create duplicate work" was blocking in Phase 3 itself, so the lookup half had to be resolved now; retention has no forcing operation yet and stays open for Phase 4. |
 
 ## Open decisions
 
@@ -324,7 +403,7 @@ Resolve these in the phase where they first become blocking:
 - configuration source and trusted filesystem roots;
 - service user and sudo allowlist;
 - exact deploy commit mechanism;
-- idempotency-key ownership and retention;
+- idempotency-key retention (lookup mechanism decided in Phase 3);
 - cancellation behavior after disconnect;
 - audit-event destination;
 - protocol compatibility window;

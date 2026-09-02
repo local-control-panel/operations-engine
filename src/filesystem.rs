@@ -1,6 +1,9 @@
-use std::io;
+use std::io::{self, Write};
 
-use cap_std::{ambient_authority, fs::Dir};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, OpenOptions},
+};
 
 use crate::site::{SiteRelativePath, TrustedRoot};
 
@@ -30,6 +33,55 @@ impl ManagedRoot {
     pub fn exists(&self, path: &SiteRelativePath) -> bool {
         self.directory.exists(path.as_path())
     }
+
+    /// Creates `path` only if it does not already exist and writes `contents`
+    /// to it. The create-and-open step is atomic, so this is safe to use as a
+    /// mutual-exclusion primitive between racing processes.
+    pub fn create_new(&self, path: &SiteRelativePath, contents: &[u8]) -> io::Result<()> {
+        let mut file = self.directory.open_with(
+            path.as_path(),
+            OpenOptions::new().write(true).create_new(true),
+        )?;
+        file.write_all(contents)
+    }
+
+    pub fn remove_file(&self, path: &SiteRelativePath) -> io::Result<()> {
+        self.directory.remove_file(path.as_path())
+    }
+
+    /// Appends `contents` to `path`, creating it first if necessary. Meant
+    /// for an append-only history (e.g. an audit log), not a document with a
+    /// single current value — use `write_atomic` for that.
+    pub fn append(&self, path: &SiteRelativePath, contents: &[u8]) -> io::Result<()> {
+        let mut file = self
+            .directory
+            .open_with(path.as_path(), OpenOptions::new().create(true).append(true))?;
+        file.write_all(contents)?;
+        file.sync_all()
+    }
+
+    /// Replaces `path` with `contents` through a same-directory temp file and
+    /// rename, so a reader never observes a partially written file and an
+    /// interruption mid-write leaves the previous contents (or nothing)
+    /// rather than a corrupt file. Callers that may run concurrently for the
+    /// same path must serialize through a lock; this alone only prevents
+    /// torn reads, not lost updates.
+    pub fn write_atomic(&self, path: &SiteRelativePath, contents: &[u8]) -> io::Result<()> {
+        let temp_path = temp_sibling_path(path)?;
+        {
+            let mut file = self.directory.create(temp_path.as_path())?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+        }
+        self.directory
+            .rename(temp_path.as_path(), &self.directory, path.as_path())
+    }
+}
+
+fn temp_sibling_path(path: &SiteRelativePath) -> io::Result<SiteRelativePath> {
+    let mut temp = path.as_path().as_os_str().to_os_string();
+    temp.push(".tmp");
+    SiteRelativePath::parse(temp).map_err(|_| io::Error::other("invalid temp path"))
 }
 
 #[cfg(all(test, unix))]
@@ -53,6 +105,42 @@ mod tests {
             .expect("state should be written");
         let state = SiteRelativePath::parse("sites/example/state").expect("path should be valid");
         assert_eq!(managed.read_to_string(&state).unwrap(), "ready");
+    }
+
+    #[test]
+    fn write_atomic_replaces_contents_and_leaves_no_temp_file() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let path = SiteRelativePath::parse("state.json").expect("path should be valid");
+
+        managed
+            .write_atomic(&path, b"first")
+            .expect("initial write should succeed");
+        assert_eq!(managed.read_to_string(&path).unwrap(), "first");
+
+        managed
+            .write_atomic(&path, b"second")
+            .expect("overwrite should succeed");
+        assert_eq!(managed.read_to_string(&path).unwrap(), "second");
+        assert!(!directory.path().join("state.json.tmp").exists());
+    }
+
+    #[test]
+    fn append_creates_the_file_and_grows_it_across_calls() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let path = SiteRelativePath::parse("events.jsonl").expect("path should be valid");
+
+        managed
+            .append(&path, b"first\n")
+            .expect("first append should create the file");
+        managed
+            .append(&path, b"second\n")
+            .expect("second append should not truncate");
+
+        assert_eq!(managed.read_to_string(&path).unwrap(), "first\nsecond\n");
     }
 
     #[test]

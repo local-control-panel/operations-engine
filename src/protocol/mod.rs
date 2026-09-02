@@ -1,3 +1,5 @@
+pub mod progress;
+
 use serde::Serialize;
 use serde_json::Value;
 

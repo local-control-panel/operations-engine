@@ -10,6 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use serde::Serialize;
+
+use crate::error::ErrorCode;
+
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
 
@@ -92,6 +96,64 @@ pub enum ProcessRunError {
     Wait(io::Error),
     Capture(io::Error),
     CaptureThreadPanicked,
+}
+
+/// Maps a completed run to the stable protocol code documented in
+/// `docs/subprocess.md`, or `None` for a successful exit.
+pub fn error_code(termination: &ProcessTermination) -> Option<ErrorCode> {
+    match termination {
+        ProcessTermination::Exited { success: true, .. } => None,
+        ProcessTermination::Exited { success: false, .. } => Some(ErrorCode::SubprocessFailed),
+        ProcessTermination::TimedOut => Some(ErrorCode::Timeout),
+        ProcessTermination::Cancelled => Some(ErrorCode::Cancelled),
+    }
+}
+
+/// Maps a failure to start or supervise the child to the stable protocol
+/// code documented in `docs/subprocess.md`. A missing executable is a
+/// dependency-availability problem; every other runner failure is internal.
+pub fn spawn_error_code(error: &ProcessRunError) -> ErrorCode {
+    match error {
+        ProcessRunError::Spawn(_) => ErrorCode::DependencyUnavailable,
+        ProcessRunError::MissingPipe(_)
+        | ProcessRunError::Wait(_)
+        | ProcessRunError::Capture(_)
+        | ProcessRunError::CaptureThreadPanicked => ErrorCode::Internal,
+    }
+}
+
+/// A protocol-safe summary of a subprocess outcome for use as `SUBPROCESS_FAILED`
+/// error `details`. It is built only from the program name and the runner's own
+/// termination/truncation bookkeeping, never from captured stdout/stderr bytes,
+/// the full argument list, or environment — so it cannot carry secrets or
+/// command lines regardless of what the child was told to do.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubprocessDiagnostics {
+    pub program: String,
+    pub exit_code: Option<i32>,
+    pub timed_out: bool,
+    pub cancelled: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+impl SubprocessDiagnostics {
+    pub fn from_output(program: impl Into<String>, output: &ProcessOutput) -> Self {
+        let (exit_code, timed_out, cancelled) = match output.termination {
+            ProcessTermination::Exited { code, .. } => (code, false, false),
+            ProcessTermination::TimedOut => (None, true, false),
+            ProcessTermination::Cancelled => (None, false, true),
+        };
+        Self {
+            program: program.into(),
+            exit_code,
+            timed_out,
+            cancelled,
+            stdout_truncated: output.stdout.truncated,
+            stderr_truncated: output.stderr.truncated,
+        }
+    }
 }
 
 pub fn run(
@@ -185,9 +247,14 @@ fn join_capture(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{io, thread, time::Duration};
 
-    use super::{CancellationToken, ProcessLimits, ProcessRequest, ProcessTermination, run};
+    use super::{
+        CancellationToken, CapturedOutput, ProcessLimits, ProcessOutput, ProcessRequest,
+        ProcessRunError, ProcessTermination, SubprocessDiagnostics, error_code, run,
+        spawn_error_code,
+    };
+    use crate::error::ErrorCode;
 
     #[test]
     fn bounds_captured_output() {
@@ -239,5 +306,96 @@ mod tests {
         cancellation_thread.join().expect("thread should finish");
 
         assert_eq!(output.termination, ProcessTermination::Cancelled);
+    }
+
+    #[test]
+    fn error_code_maps_each_termination_to_its_stable_code() {
+        assert_eq!(
+            error_code(&ProcessTermination::Exited {
+                code: Some(0),
+                success: true
+            }),
+            None
+        );
+        assert_eq!(
+            error_code(&ProcessTermination::Exited {
+                code: Some(1),
+                success: false
+            }),
+            Some(ErrorCode::SubprocessFailed)
+        );
+        assert_eq!(
+            error_code(&ProcessTermination::TimedOut),
+            Some(ErrorCode::Timeout)
+        );
+        assert_eq!(
+            error_code(&ProcessTermination::Cancelled),
+            Some(ErrorCode::Cancelled)
+        );
+    }
+
+    #[test]
+    fn spawn_error_code_distinguishes_missing_executable_from_internal_failure() {
+        assert_eq!(
+            spawn_error_code(&ProcessRunError::Spawn(io::Error::from(
+                io::ErrorKind::NotFound
+            ))),
+            ErrorCode::DependencyUnavailable
+        );
+        assert_eq!(
+            spawn_error_code(&ProcessRunError::Wait(io::Error::other("boom"))),
+            ErrorCode::Internal
+        );
+        assert_eq!(
+            spawn_error_code(&ProcessRunError::CaptureThreadPanicked),
+            ErrorCode::Internal
+        );
+    }
+
+    #[test]
+    fn diagnostics_never_carry_captured_output_bytes() {
+        let output = ProcessOutput {
+            termination: ProcessTermination::Exited {
+                code: Some(1),
+                success: false,
+            },
+            stdout: CapturedOutput {
+                bytes: b"leaked-token=super-secret".to_vec(),
+                truncated: false,
+            },
+            stderr: CapturedOutput {
+                bytes: b"fatal: authentication failed for secret-repo".to_vec(),
+                truncated: true,
+            },
+        };
+
+        let diagnostics = SubprocessDiagnostics::from_output("git", &output);
+        let json = serde_json::to_string(&diagnostics).expect("diagnostics should serialize");
+
+        assert!(!json.contains("secret"));
+        assert!(!json.contains("token"));
+        assert_eq!(diagnostics.program, "git");
+        assert_eq!(diagnostics.exit_code, Some(1));
+        assert!(!diagnostics.stdout_truncated);
+        assert!(diagnostics.stderr_truncated);
+    }
+
+    #[test]
+    fn diagnostics_report_timeout_and_cancellation_as_flags_not_a_code() {
+        let timed_out = ProcessOutput {
+            termination: ProcessTermination::TimedOut,
+            stdout: CapturedOutput {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            stderr: CapturedOutput {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+        };
+        let diagnostics = SubprocessDiagnostics::from_output("git", &timed_out);
+        assert!(diagnostics.timed_out);
+        assert!(!diagnostics.cancelled);
+        assert_eq!(diagnostics.exit_code, None);
     }
 }

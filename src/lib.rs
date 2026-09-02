@@ -6,6 +6,7 @@ pub mod filesystem;
 pub mod process;
 pub mod protocol;
 pub mod site;
+pub mod transaction;
 
 use cli::{Cli, Command};
 use error::ErrorCode;
