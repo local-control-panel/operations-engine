@@ -57,3 +57,40 @@ selected and are currently emitted by the argument parser on stderr.
 If an operation result cannot be serialized, the engine returns an unsuccessful
 envelope with code `INTERNAL_SERIALIZATION_ERROR`. It does not emit a partial
 result or panic while constructing the response.
+
+## Error taxonomy
+
+Protocol version 1 reserves these stable codes:
+
+| Code | Meaning |
+| --- | --- |
+| `INVALID_INPUT` | The request failed validation before work began. |
+| `UNSUPPORTED_PLATFORM` | The host platform cannot run the requested operation. |
+| `DEPENDENCY_UNAVAILABLE` | A required local executable or service is unavailable. |
+| `CONFLICT` | Another operation or current state prevents this request. |
+| `TIMEOUT` | Work exceeded its documented time bound. |
+| `CANCELLED` | Cancellation was accepted before the operation completed. |
+| `SUBPROCESS_FAILED` | A bounded external process exited unsuccessfully. |
+| `INTERNAL_SERIALIZATION_ERROR` | A result could not be encoded safely. |
+| `INTERNAL` | An unexpected internal failure occurred. |
+
+Error messages are safe summaries for operators, not stable API values. The
+optional `details` object is `null` unless an operation documents an allowlisted
+shape for its error code. It must contain identifiers, limits, or state needed
+for recovery—not command lines, environment variables, unrestricted paths,
+subprocess output, or secret-bearing input.
+
+## Doctor semantics
+
+`doctor` is a diagnostic query. A successful diagnostic execution returns
+`ok: true` even when the host is not ready. Consumers must inspect
+`result.ready` and individual dependency checks:
+
+- `passed`: the dependency executed successfully;
+- `missing`: the executable could not be started;
+- `failed`: it started but did not complete successfully;
+- `timedOut`: the check exceeded its two-second bound.
+
+An unsupported platform or unavailable dependency makes `ready` false and adds
+a machine-readable warning. These conditions become operation errors only when
+a requested operation requires the missing capability.

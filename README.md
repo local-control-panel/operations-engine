@@ -176,6 +176,9 @@ macOS is useful for development, but production builds and operational behavior
 target Linux. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the contribution and
 validation workflow.
 
+External process execution follows the bounded timeout, output, and
+cancellation contract in [docs/subprocess.md](./docs/subprocess.md).
+
 ## Roadmap
 
 1. Define the protocol, privilege model, and threat model.

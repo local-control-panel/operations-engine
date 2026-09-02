@@ -25,6 +25,8 @@ still compiles with the minimum supported Rust version declared in
 - Use stable, documented operation names and error codes.
 - Keep protocol compatibility independent from the crate version.
 - Start subprocesses with an executable and explicit arguments. Avoid `sh -c`.
+- Run subprocesses through the bounded runner in `src/process.rs`; do not call
+  `std::process::Command` directly from operation modules.
 - Validate all identifiers and paths again at the server execution boundary.
 - Add integration tests for every command's public JSON shape.
 - Do not advertise an operation through `capabilities` before it is implemented.
@@ -42,3 +44,5 @@ still compiles with the minimum supported Rust version declared in
 Mutating commands additionally require an idempotency strategy, locking rules,
 an audit event shape, interruption tests, and an explicit recovery procedure.
 
+See [`docs/subprocess.md`](./docs/subprocess.md) before adding an external
+process.

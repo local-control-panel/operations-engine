@@ -1,7 +1,7 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 1 — foundation  
+Current phase: 2 — site and filesystem model
 Last updated: 2026-09-02
 
 This file is the shared implementation plan for Operations Engine. It is the
@@ -76,7 +76,7 @@ Decisions that remain reversible before the first public release:
 
 ## Phase 1 — foundation
 
-Status: in progress
+Status: complete
 
 Goal: establish a small, reliable read-only CLI and freeze the minimum protocol
 behavior needed by future operations.
@@ -93,20 +93,16 @@ Completed:
 - formatting, lint, test, and minimum-Rust CI jobs;
 - protocol and contribution documentation;
 - explicit `INTERNAL_SERIALIZATION_ERROR` response instead of a panic when an
-  operation result cannot be encoded.
-
-Remaining, in order:
-
-1. Define the stable error-code taxonomy and document which details are safe to
-   return.
-2. Decide whether unsupported platforms and missing required dependencies are
-   warnings, failed checks, or failed operations.
-3. Add structured build information needed for release diagnosis, without
-   exposing machine-specific build data.
-4. Add Linux integration coverage for `doctor` using controlled fake
-   dependencies rather than relying on the CI runner's installed software.
-5. Define bounded subprocess output, timeout, and cancellation primitives that
-   mutation commands can reuse.
+  operation result cannot be encoded;
+- stable protocol error and warning code enums with documented safe-detail
+  rules;
+- explicit `doctor` distinction between successful diagnostics (`ok`) and host
+  readiness (`result.ready`);
+- release-safe build target and optional Git commit metadata;
+- deterministic Linux `doctor` integration coverage with controlled fake
+  dependencies;
+- reusable subprocess execution with explicit arguments, timeout,
+  cancellation, concurrent stream draining, and retained-output bounds.
 
 Exit criteria:
 
@@ -118,7 +114,7 @@ Exit criteria:
 
 ## Phase 2 — site and filesystem model
 
-Status: pending
+Status: in progress
 
 Goal: define the trusted local model required by deploy and rollback before any
 mutation is implemented.

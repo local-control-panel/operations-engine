@@ -25,6 +25,8 @@ fn version_returns_protocol_envelope() {
         response["result"]["engineVersion"],
         env!("CARGO_PKG_VERSION")
     );
+    assert!(response["result"]["build"]["targetOs"].is_string());
+    assert!(response["result"]["build"]["targetArchitecture"].is_string());
     assert!(response["error"].is_null());
 }
 
@@ -44,6 +46,49 @@ fn doctor_returns_structured_checks() {
     let response = run_json(&["doctor"]);
 
     assert_eq!(response["operation"], "doctor");
+    assert_eq!(response["ok"], true);
+    assert!(response["result"]["ready"].is_boolean());
     assert!(response["result"]["platform"]["os"].is_string());
     assert!(response["result"]["dependencies"].is_array());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_is_deterministic_with_controlled_dependencies() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    for (name, version) in [
+        ("git", "git test 1.0"),
+        ("docker", "docker test 1.0"),
+        ("caddy", "caddy test 1.0"),
+    ] {
+        let path = directory.path().join(name);
+        fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{version}'\n"))
+            .expect("fake dependency should be written");
+        let mut permissions = fs::metadata(&path)
+            .expect("fake dependency metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("fake dependency should be executable");
+    }
+
+    let output = Command::cargo_bin("ops-engine")
+        .expect("binary should build")
+        .arg("doctor")
+        .env("PATH", directory.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value =
+        serde_json::from_slice(&output).expect("stdout should contain one JSON response");
+
+    assert_eq!(response["result"]["ready"], true);
+    assert_eq!(response["warnings"], serde_json::json!([]));
+    assert_eq!(
+        response["result"]["dependencies"][0]["version"],
+        "git test 1.0"
+    );
 }

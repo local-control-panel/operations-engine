@@ -1,8 +1,11 @@
 pub mod cli;
 pub mod commands;
+pub mod error;
+pub mod process;
 pub mod protocol;
 
 use cli::{Cli, Command};
+use error::ErrorCode;
 use protocol::{Response, ResponseBuildError};
 
 pub fn execute(cli: Cli) -> Response {
@@ -19,7 +22,7 @@ pub fn execute(cli: Cli) -> Response {
 fn internal_error(operation: &'static str, _error: ResponseBuildError) -> Response {
     Response::failure(
         operation,
-        "INTERNAL_SERIALIZATION_ERROR",
+        ErrorCode::InternalSerializationError,
         "The operation result could not be encoded safely",
     )
 }

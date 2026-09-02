@@ -1,0 +1,62 @@
+use serde::Serialize;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    Internal,
+    InternalSerializationError,
+    InvalidInput,
+    UnsupportedPlatform,
+    DependencyUnavailable,
+    Conflict,
+    Timeout,
+    Cancelled,
+    SubprocessFailed,
+}
+
+impl ErrorCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Internal => "INTERNAL",
+            Self::InternalSerializationError => "INTERNAL_SERIALIZATION_ERROR",
+            Self::InvalidInput => "INVALID_INPUT",
+            Self::UnsupportedPlatform => "UNSUPPORTED_PLATFORM",
+            Self::DependencyUnavailable => "DEPENDENCY_UNAVAILABLE",
+            Self::Conflict => "CONFLICT",
+            Self::Timeout => "TIMEOUT",
+            Self::Cancelled => "CANCELLED",
+            Self::SubprocessFailed => "SUBPROCESS_FAILED",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WarningCode {
+    UnsupportedPlatform,
+    DependencyUnavailable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ErrorCode, WarningCode};
+
+    #[test]
+    fn error_codes_have_stable_protocol_values() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::InternalSerializationError)
+                .expect("code should serialize"),
+            "\"INTERNAL_SERIALIZATION_ERROR\""
+        );
+        assert_eq!(ErrorCode::Timeout.as_str(), "TIMEOUT");
+    }
+
+    #[test]
+    fn warning_codes_have_stable_protocol_values() {
+        assert_eq!(
+            serde_json::to_string(&WarningCode::DependencyUnavailable)
+                .expect("code should serialize"),
+            "\"DEPENDENCY_UNAVAILABLE\""
+        );
+    }
+}

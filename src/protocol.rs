@@ -1,6 +1,8 @@
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::error::{ErrorCode, WarningCode};
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize)]
@@ -31,7 +33,7 @@ impl Response {
         })
     }
 
-    pub fn failure(operation: &'static str, code: &str, message: &str) -> Self {
+    pub fn failure(operation: &'static str, code: ErrorCode, message: &str) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             operation,
@@ -39,7 +41,7 @@ impl Response {
             result: None,
             warnings: Vec::new(),
             error: Some(ProtocolError {
-                code: code.to_owned(),
+                code,
                 message: message.to_owned(),
                 details: None,
             }),
@@ -58,14 +60,14 @@ pub struct ResponseBuildError;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Warning {
-    pub code: &'static str,
+    pub code: WarningCode,
     pub message: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolError {
-    pub code: String,
+    pub code: ErrorCode,
     pub message: String,
     pub details: Option<Value>,
 }
@@ -73,6 +75,8 @@ pub struct ProtocolError {
 #[cfg(test)]
 mod tests {
     use serde::{Serialize, Serializer};
+
+    use crate::error::ErrorCode;
 
     use super::Response;
 
@@ -94,13 +98,13 @@ mod tests {
 
     #[test]
     fn failure_response_has_no_partial_result() {
-        let response = Response::failure("test", "INTERNAL_ERROR", "safe message");
+        let response = Response::failure("test", ErrorCode::Internal, "safe message");
 
         assert!(!response.ok);
         assert!(response.result.is_none());
         assert_eq!(
             response.error.expect("error must exist").code,
-            "INTERNAL_ERROR"
+            ErrorCode::Internal
         );
     }
 }
