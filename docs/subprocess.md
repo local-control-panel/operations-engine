@@ -58,3 +58,7 @@ the response.
 The runner is tested for output truncation, timeout, and cancellation. Commands
 that use it must additionally test their own exit-code mapping, redaction, and
 operation-specific limits.
+
+Privileged mutations must drop to the manifest's per-site UID/GID before
+starting Git or build subprocesses. The UID/GID comes from root-owned policy,
+never from request arguments.

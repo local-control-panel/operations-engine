@@ -1,6 +1,8 @@
 pub mod cli;
 pub mod commands;
+pub mod config;
 pub mod error;
+pub mod filesystem;
 pub mod process;
 pub mod protocol;
 pub mod site;

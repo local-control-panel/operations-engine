@@ -35,7 +35,7 @@ The proposed manifest contains only execution policy and non-secret identity:
   "schemaVersion": 1,
   "siteId": "550e8400-e29b-41d4-a716-446655440000",
   "domain": "example.com",
-  "contentRoot": "sites/550e8400-e29b-41d4-a716-446655440000",
+  "contentRoot": "sites/550e8400-e29b-41d4-a716-446655440000/current",
   "siteUser": "site-example",
   "repository": {
     "url": "git@github.com:example/site.git",
@@ -78,9 +78,16 @@ Rules:
   symlink replacement races; lexical `join` plus a containment check is not
   sufficient for mutations.
 
-The current validation types implement lexical validation and safe resolution
-of existing paths. Creation/mutation primitives remain pending; no deploy code
-may use `TrustedRoot::join` alone as an authorization check.
+The validation types implement lexical validation and safe resolution of
+existing paths. Capability-relative directory creation and reads are available;
+atomic file/symlink replacement belongs to the transaction layer. No deploy
+code may use `TrustedRoot::join` alone as an authorization check.
+
+Race-safe relative access is implemented through `ManagedRoot`, backed by
+[`cap-std`](https://docs.rs/cap-std/latest/cap_std/fs/struct.Dir.html). Ambient
+authority is used only once to open a validated configured root; subsequent
+operations are relative to that directory capability. Pre-existing symlinks
+that escape the capability root are rejected.
 
 ## Filesystem layout
 
@@ -94,33 +101,64 @@ Proposed layout:
 /var/lib/operations-engine/
   credentials/<credentialId>          ops-engine:ops-engine 0600
   sites/<siteId>/
-    active                            symlink managed atomically
+    current                           relative symlink managed atomically
     releases/<releaseId>/             owned by the site's service user
+    shared/                            persistent site-owned content
     transactions/<requestId>.json     ops-engine:ops-engine 0600
     locks/mutation.lock               ops-engine:ops-engine 0600
     audit/events.jsonl                ops-engine:ops-engine 0600
 ```
 
-The final active-release switch mechanism is decided in Phase 2 after checking
-how Caddy and runtime configs currently reference document roots. Until then,
-`active` is a proposed representation, not an implemented contract.
+### Activation decision
+
+The stable document root is `<content-root>/sites/<siteId>/current`. `current`
+is a relative symlink to `releases/<releaseId>`. A new relative symlink is
+created under a unique temporary name in the same directory and then renamed
+over `current`; same-directory rename is the commit point.
+
+Caddy and the per-site FrankenPHP child currently embed an absolute document
+root, and the site's `.user.ini` currently restricts `open_basedir` to that
+exact root. Adopting the release layout therefore requires a one-time,
+transactional integration migration:
+
+1. import the existing content as the initial release;
+2. create `current` without changing live routing;
+3. regenerate runtime identity and Caddy configuration to point to `current`;
+4. set `open_basedir` to the stable site base so both `current` and declared
+   `shared` paths remain usable;
+5. reload and probe the runtime;
+6. retain the old configuration and content until the probe succeeds.
+
+Operations that need persistent writable content must declare allowlisted
+relative shared paths in a future manifest revision. Deploy creates only
+relative links from a release into the site's `shared` directory. No default
+shared-path guess is made for arbitrary applications.
 
 ## Ownership and privilege direction
 
 - `/usr/local/bin/ops-engine` is owned by root and not writable by its invoking
   user.
 - Root-owned configuration defines all trusted filesystem boundaries.
-- A non-login `ops-engine` service identity owns engine transaction state and
-  installed credentials.
+- The daemonless MVP is invoked by a dedicated non-login SSH automation user.
+  Its sudo policy permits only the root-owned `ops-engine` executable, not a
+  shell, Git, filesystem utilities, or user-selected binaries.
+- Mutation commands start with elevated authority, load root-owned policy, and
+  expose only the compiled operation allowlist. There is no arbitrary command
+  or absolute-path parameter.
+- Git and build subprocesses drop to the manifest's existing per-site UID/GID;
+  they do not run as root.
+- Each installed credential directory is owned by its per-site user with mode
+  `0700`; the private key is mode `0600`. Requests select only a validated
+  credential ID already registered in the manifest.
 - Site release contents are owned by the existing per-site Unix user where one
   exists.
-- Privilege escalation is limited to named entry points needed for manifest
-  installation, ownership changes, and atomic activation.
+- Engine state that controls activation, locks, transactions, and audit records
+  remains root-owned and is not writable by the site user.
 - The structured API never accepts arbitrary executables, shell commands,
   users, ownership IDs, or sudo arguments.
 
-The exact invoking user and sudoers entries remain open until the existing
-server bootstrap and per-site user lifecycle are mapped in detail.
+This is the MVP boundary. A later daemon/socket design requires a separate
+threat model and is not implied by these sudo rules.
 
 ## Git revision validation
 
@@ -141,3 +179,6 @@ with that object ID in engine-owned state.
 - Rollback never trusts client-side history as its authorization source.
 - A full commit SHA does not become eligible until repository policy or retained
   release state authorizes it.
+- The site user cannot rewrite `current`, transaction state, locks, or manifests.
+- The automation user cannot invoke a general privileged shell through the
+  Operations Engine sudo entry.

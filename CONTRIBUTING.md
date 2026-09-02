@@ -46,3 +46,7 @@ an audit event shape, interruption tests, and an explicit recovery procedure.
 
 See [`docs/subprocess.md`](./docs/subprocess.md) before adding an external
 process.
+
+Filesystem operations beneath configured roots must use the capability-based
+`ManagedRoot` API in `src/filesystem.rs`. `TrustedRoot::join` is for display and
+planning only; it is not mutation authorization.

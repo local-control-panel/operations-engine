@@ -1,7 +1,7 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 2 — site and filesystem model
+Current phase: 3 — transaction framework
 Last updated: 2026-09-02
 
 This file is the shared implementation plan for Operations Engine. It is the
@@ -114,7 +114,7 @@ Exit criteria:
 
 ## Phase 2 — site and filesystem model
 
-Status: in progress
+Status: complete
 
 Goal: define the trusted local model required by deploy and rollback before any
 mutation is implemented.
@@ -130,19 +130,17 @@ Completed:
 - defined the proposed release, transaction, lock, credential, and audit layout;
 - created validation types for site identifiers, full Git object IDs, trusted
   roots, and site-relative paths;
-- added traversal, NUL, malformed identifier, and symlink-escape tests.
-
-Remaining, in order:
-
-1. Verify how current Caddy/runtime configuration resolves document roots and
-   decide the active-release representation and atomic switch mechanism.
-2. Finalize the invoking service user, per-site ownership transitions, and
-   minimal sudo allowlist against the actual bootstrap lifecycle.
-3. Define race-safe creation beneath trusted roots; lexical joining is not an
-   authorization mechanism for mutations.
-4. Implement typed parsing for the root-owned engine config and site manifest.
-5. Test manifest mismatch, ownership, symlink replacement, and invalid
-   configuration cases.
+- added traversal, NUL, malformed identifier, and symlink-escape tests;
+- selected a stable `current` relative symlink with same-directory rename as
+  the future atomic activation commit point;
+- documented the required one-time runtime identity, Caddy root, and
+  `open_basedir` migration;
+- finalized the daemonless MVP sudo and per-site subprocess ownership boundary;
+- added capability-based filesystem access for race-safe operations beneath an
+  opened trusted root;
+- implemented strict typed engine config and site manifest parsing;
+- added schema, site mismatch, overlapping root, file ownership, file mode,
+  policy, and capability-root tests.
 
 Exit criteria:
 
@@ -154,7 +152,7 @@ Exit criteria:
 
 ## Phase 3 — transaction framework
 
-Status: pending
+Status: in progress
 
 Goal: build reusable mutation infrastructure without yet exposing deploy or
 rollback as a capability.
@@ -312,6 +310,10 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Start with a CLI over SSH and no daemon. | Prove the structured execution boundary before adding a persistent privileged service. |
 | 2026-09-02 | Separate protocol version from semantic release version. | Allow independent compatibility decisions and releases. |
 | 2026-09-02 | Use Git deploy/rollback as the first mutation pilot. | It exercises locking, staging, atomic switching, idempotency, progress, and recovery. |
+| 2026-09-02 | Use an opaque canonical UUID as `siteId`; domain is mutable metadata. | Renaming a domain must not rename security, transaction, or release state. |
+| 2026-09-02 | Resolve request paths through root-owned manifests and opened directory capabilities. | Caller-provided absolute paths and lexical checks are not a sufficient mutation boundary. |
+| 2026-09-02 | Activate releases by renaming a prepared relative symlink over a stable `current` path. | Caddy and runtime consumers keep one document root while activation has one explicit commit point. |
+| 2026-09-02 | Invoke the daemonless mutation CLI through a dedicated sudo entry and drop Git/build children to the site UID/GID. | The engine needs bounded privileged coordination without granting a privileged shell or running application code as root. |
 
 ## Open decisions
 

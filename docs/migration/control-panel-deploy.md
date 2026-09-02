@@ -72,15 +72,18 @@ recorded history.
 
 1. Add a stable `siteId` to the control plane without changing deploy behavior.
 2. Register or discover a root-owned site manifest on the server.
-3. Add engine compatibility and capability negotiation.
-4. Implement engine deploy behind an explicit feature flag.
-5. Compare engine state with the existing checkout/history without mutating it.
-6. Enable engine deploy for opt-in test sites and mirror results into SQLite.
-7. Add engine rollback and verify disconnect/retry recovery.
-8. Stop treating SQLite history as rollback authority.
-9. Remove old deploy/rollback shell builders and their SSH sequencing only
+3. Import the existing root as an initial release and transactionally update
+   runtime identity, Caddy root, and `open_basedir` to the stable `current`
+   path.
+4. Add engine compatibility and capability negotiation.
+5. Implement engine deploy behind an explicit feature flag.
+6. Compare engine state with the existing checkout/history without mutating it.
+7. Enable engine deploy for opt-in test sites and mirror results into SQLite.
+8. Add engine rollback and verify disconnect/retry recovery.
+9. Stop treating SQLite history as rollback authority.
+10. Remove old deploy/rollback shell builders and their SSH sequencing only
    after the engine path passes production rollout criteria.
-10. Evaluate clone/connect, credential installation, reconcile, and auto-deploy
+11. Evaluate clone/connect, credential installation, reconcile, and auto-deploy
     as separate migrations; do not bundle them into pilot removal.
 
 ## Code to remove eventually
@@ -104,4 +107,3 @@ No current deploy code is deleted until the control plane has verified a
 compatible engine protocol and the required operation capability before any
 mutation begins. A fallback may select the old implementation before a request
 starts; it must never switch implementation midway through a transaction.
-
