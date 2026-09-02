@@ -4,8 +4,10 @@ pub mod config;
 pub mod deploy;
 pub mod error;
 pub mod filesystem;
+pub mod mutation;
 pub mod process;
 pub mod protocol;
+pub mod rollback;
 pub mod site;
 pub mod transaction;
 

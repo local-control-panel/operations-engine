@@ -10,11 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     config::SiteManifest,
     deploy::{
-        DeployRequest, DeployResult, ReleaseId, activate, cleanup, preflight, resolve, staging,
+        DeployRequest, DeployResult, OPERATION, ReleaseId, activate, cleanup, resolve, staging,
         validate,
     },
     error::ErrorCode,
     filesystem::ManagedRoot,
+    mutation::preflight,
     process::{self, CancellationToken},
     site::{SiteRelativePath, TrustedRoot},
     transaction::{
@@ -183,7 +184,14 @@ pub fn execute(
     let site_state = preflight::open_site_state(context.engine_state, request.site_id)
         .map_err(DeployError::Io)?;
 
-    let admitted = match preflight::run(&site_state, request).map_err(DeployError::Preflight)? {
+    let admitted = match preflight::run(
+        &site_state,
+        request.request_id,
+        request.idempotency_key.as_ref(),
+        OPERATION,
+    )
+    .map_err(DeployError::Preflight)?
+    {
         preflight::Outcome::Replay(original) => return replay(&site_state, original),
         preflight::Outcome::Proceed(admitted) => admitted,
     };

@@ -4,7 +4,6 @@
 pub mod activate;
 pub mod cleanup;
 pub mod execute;
-pub mod preflight;
 pub mod resolve;
 pub mod staging;
 pub mod validate;

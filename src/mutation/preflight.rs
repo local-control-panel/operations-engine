@@ -1,7 +1,12 @@
-//! Phase 4, item 2: everything a deploy attempt must establish before it is
-//! allowed to touch `releases/` or `current` — and that must never, by
-//! itself, change either. Fetch, staging, and the atomic switch are later
-//! items and start only after `run` returns `Outcome::Proceed`.
+//! Everything a mutation attempt must establish before it is allowed to
+//! touch operation-specific content (a deploy's `releases/`/`current`, a
+//! rollback's `current`) — and that must never, by itself, change any of
+//! it. Originally built for Phase 4 deploy (`src/deploy/preflight.rs`) and
+//! generalized here once Phase 5 rollback needed the identical sequence:
+//! idempotency-key replay, site lock, transaction state, and the
+//! `MutationStart` audit event. Only `request_id`, `idempotency_key`, and
+//! `operation` are parameters — the caller's request type is otherwise
+//! irrelevant to this step.
 
 use std::io;
 
@@ -9,7 +14,7 @@ use crate::{
     filesystem::ManagedRoot,
     site::{SiteId, SiteRelativePath},
     transaction::{
-        RequestId,
+        IdempotencyKey, RequestId,
         audit::{self, AuditError, AuditRecord},
         idempotency::{self, IndexError, Resolution},
         lock::{self, DEFAULT_STALE_AFTER, LockError, SiteLockGuard},
@@ -17,11 +22,10 @@ use crate::{
     },
 };
 
-use super::{DeployRequest, OPERATION};
-
-/// Everything a caller needs to proceed into fetch/stage/switch: the held
-/// site lock (dropping it releases the site for the next attempt) and the
-/// `InProgress` transaction state to keep transitioning and saving.
+/// Everything a caller needs to proceed into its own operation-specific
+/// work: the held site lock (dropping it releases the site for the next
+/// attempt) and the `InProgress` transaction state to keep transitioning
+/// and saving.
 pub struct Admitted<'a> {
     pub lock: SiteLockGuard<'a>,
     pub state: TransactionState,
@@ -44,47 +48,37 @@ pub enum Error {
     Audit(AuditError),
 }
 
-/// Runs preflight for `request` against `site_state`, a `ManagedRoot`
-/// already scoped to this one site's state subtree (see
-/// `ManagedRoot::open_managed_dir`) — never the shared engine-wide state
-/// root, so nothing here can address another site's lock, state, or audit
-/// log even by a path-construction bug.
-pub fn run<'a>(site_state: &'a ManagedRoot, request: &DeployRequest) -> Result<Outcome<'a>, Error> {
-    if let Some(key) = &request.idempotency_key {
-        match idempotency::claim(site_state, key, request.request_id).map_err(Error::Idempotency)? {
+/// Runs preflight for one mutation attempt against `site_state`, a
+/// `ManagedRoot` already scoped to this one site's state subtree (see
+/// `open_site_state`) — never the shared engine-wide state root, so
+/// nothing here can address another site's lock, state, or audit log even
+/// by a path-construction bug. `operation` is the stable protocol
+/// operation name (e.g. `"site.deploy"`, `"site.rollback"`) recorded as
+/// `TransactionState::operation` and in the `MutationStart` audit event.
+pub fn run<'a>(
+    site_state: &'a ManagedRoot,
+    request_id: RequestId,
+    idempotency_key: Option<&IdempotencyKey>,
+    operation: &'static str,
+) -> Result<Outcome<'a>, Error> {
+    if let Some(key) = idempotency_key {
+        match idempotency::claim(site_state, key, request_id).map_err(Error::Idempotency)? {
             Resolution::AlreadyClaimed(existing) => return Ok(Outcome::Replay(existing)),
             Resolution::Claimed => {}
         }
     }
 
-    let lock = lock::acquire(
-        site_state,
-        &lock_path(),
-        request.request_id,
-        DEFAULT_STALE_AFTER,
-    )
-    .map_err(Error::Lock)?;
+    let lock = lock::acquire(site_state, &lock_path(), request_id, DEFAULT_STALE_AFTER)
+        .map_err(Error::Lock)?;
 
-    let transaction_state = TransactionState::start(
-        request.request_id,
-        request.idempotency_key.clone(),
-        OPERATION,
-    );
-    state::create(
-        site_state,
-        &state_path(request.request_id),
-        &transaction_state,
-    )
-    .map_err(Error::State)?;
+    let transaction_state =
+        TransactionState::start(request_id, idempotency_key.cloned(), operation);
+    state::create(site_state, &state_path(request_id), &transaction_state).map_err(Error::State)?;
 
     audit::append(
         site_state,
         &audit_path(),
-        &AuditRecord::mutation_start(
-            request.request_id,
-            request.idempotency_key.clone(),
-            OPERATION,
-        ),
+        &AuditRecord::mutation_start(request_id, idempotency_key.cloned(), operation),
     )
     .map_err(Error::Audit)?;
 
@@ -125,11 +119,10 @@ fn audit_path() -> SiteRelativePath {
 mod tests {
     use super::{Error, Outcome, lock_path, open_site_state, run};
     use crate::{
-        deploy::DeployRequest,
         filesystem::ManagedRoot,
         site::{SiteId, TrustedRoot},
         transaction::{
-            RequestId,
+            IdempotencyKey, RequestId,
             lock::{self, DEFAULT_STALE_AFTER},
             state::TransactionStatus,
         },
@@ -138,7 +131,7 @@ mod tests {
     const SITE_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
     const REQUEST_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
     const RETRY_REQUEST_ID: &str = "9b2f1c34-5678-4abc-9def-0123456789ab";
-    const REVISION: &str = "abcdef0123456789abcdef0123456789abcdef01";
+    const OPERATION: &str = "site.deploy";
 
     fn site_state() -> (tempfile::TempDir, ManagedRoot) {
         let directory = tempfile::tempdir().expect("temporary directory should exist");
@@ -149,15 +142,15 @@ mod tests {
         (directory, site_state)
     }
 
-    fn request(request_id: &str, idempotency_key: Option<&str>) -> DeployRequest {
-        DeployRequest::parse(SITE_ID, REVISION, request_id, idempotency_key)
-            .expect("request should be valid")
+    fn request_id(value: &str) -> RequestId {
+        RequestId::parse(value).expect("test UUID should be canonical")
     }
 
     #[test]
     fn admits_a_fresh_request_and_leaves_state_and_lock_in_place() {
         let (_directory, site_state) = site_state();
-        let outcome = run(&site_state, &request(REQUEST_ID, None)).expect("preflight should run");
+        let outcome = run(&site_state, request_id(REQUEST_ID), None, OPERATION)
+            .expect("preflight should run");
 
         let admitted = match outcome {
             Outcome::Proceed(admitted) => admitted,
@@ -170,7 +163,7 @@ mod tests {
         let contended = lock::acquire(
             &site_state,
             &lock_path(),
-            RequestId::parse(RETRY_REQUEST_ID).expect("test UUID should be canonical"),
+            request_id(RETRY_REQUEST_ID),
             DEFAULT_STALE_AFTER,
         );
         assert!(matches!(contended, Err(lock::LockError::Held { .. })));
@@ -179,9 +172,10 @@ mod tests {
     #[test]
     fn a_second_preflight_for_the_same_site_is_rejected_while_the_first_is_admitted() {
         let (_directory, site_state) = site_state();
-        let _admitted = run(&site_state, &request(REQUEST_ID, None)).expect("first should admit");
+        let _admitted =
+            run(&site_state, request_id(REQUEST_ID), None, OPERATION).expect("first should admit");
 
-        let second = run(&site_state, &request(RETRY_REQUEST_ID, None));
+        let second = run(&site_state, request_id(RETRY_REQUEST_ID), None, OPERATION);
         assert!(matches!(
             second,
             Err(Error::Lock(lock::LockError::Held { .. }))
@@ -191,16 +185,22 @@ mod tests {
     #[test]
     fn a_retry_with_the_same_idempotency_key_is_reported_as_a_replay_without_touching_the_lock() {
         let (_directory, site_state) = site_state();
-        let key = Some("deploy-2026-09-02-01");
+        let key = IdempotencyKey::parse("deploy-2026-09-02-01").expect("key should be valid");
 
-        let first = run(&site_state, &request(REQUEST_ID, key)).expect("first should admit");
+        let first = run(&site_state, request_id(REQUEST_ID), Some(&key), OPERATION)
+            .expect("first should admit");
         let Outcome::Proceed(admitted) = first else {
             panic!("first attempt must proceed")
         };
         // The first attempt's lock is still held at this point.
 
-        let retry =
-            run(&site_state, &request(RETRY_REQUEST_ID, key)).expect("replay should resolve");
+        let retry = run(
+            &site_state,
+            request_id(RETRY_REQUEST_ID),
+            Some(&key),
+            OPERATION,
+        )
+        .expect("replay should resolve");
         match retry {
             Outcome::Replay(original) => {
                 assert_eq!(original.to_string(), REQUEST_ID);
