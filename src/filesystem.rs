@@ -73,6 +73,11 @@ impl ManagedRoot {
         self.directory.remove_file(path.as_path())
     }
 
+    /// Recursively removes `path` and everything beneath it.
+    pub fn remove_dir_all(&self, path: &SiteRelativePath) -> io::Result<()> {
+        self.directory.remove_dir_all(path.as_path())
+    }
+
     /// Appends `contents` to `path`, creating it first if necessary. Meant
     /// for an append-only history (e.g. an audit log), not a document with a
     /// single current value — use `write_atomic` for that.
@@ -228,6 +233,23 @@ mod tests {
             .symlink(&current, &a)
             .expect("first link should succeed");
         assert!(managed.symlink(&current, &b).is_err());
+    }
+
+    #[test]
+    fn remove_dir_all_deletes_a_directory_and_its_contents() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let nested = SiteRelativePath::parse("releases/a/nested").expect("path should be valid");
+        managed
+            .create_dir_all(&nested)
+            .expect("nested directory should be created");
+
+        let target = SiteRelativePath::parse("releases/a").expect("path should be valid");
+        managed
+            .remove_dir_all(&target)
+            .expect("removal should succeed");
+        assert!(!directory.path().join("releases/a").exists());
     }
 
     #[test]

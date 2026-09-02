@@ -36,9 +36,15 @@ fn capabilities_describe_only_implemented_operations() {
 
     assert_eq!(
         response["result"]["operations"],
-        serde_json::json!(["version", "capabilities", "doctor"])
+        serde_json::json!(["version", "capabilities", "doctor", "site.deploy"])
     );
-    assert_eq!(response["result"]["features"]["mutations"], false);
+    assert_eq!(response["result"]["features"]["mutations"], true);
+    // Neither mechanism is wired to the CLI process lifecycle yet: nothing
+    // ever calls `CancellationToken::cancel()` from a signal, and `--output`
+    // has no JSON Lines variant. Advertising either now would be a real
+    // regression under the "don't advertise before implemented" rule.
+    assert_eq!(response["result"]["features"]["cancellation"], false);
+    assert_eq!(response["result"]["features"]["jsonLinesProgress"], false);
 }
 
 #[test]

@@ -19,6 +19,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Version => commands::version::run(),
         Command::Capabilities => commands::capabilities::run(),
         Command::Doctor => commands::doctor::run(),
+        Command::Site { command } => commands::site::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

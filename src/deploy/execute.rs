@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{
     config::SiteManifest,
     deploy::{
-        DeployRequest, DeployResult, ReleaseId, activate, preflight, resolve, staging, validate,
+        DeployRequest, DeployResult, ReleaseId, activate, cleanup, preflight, resolve, staging,
+        validate,
     },
     error::ErrorCode,
     filesystem::ManagedRoot,
@@ -85,7 +86,7 @@ impl DeployError {
     /// into the failed `TransactionState` (see `docs/protocol.md`'s
     /// `details` allowlist: no subprocess output, paths, or command lines
     /// beyond what `SubprocessDiagnostics` already redacted).
-    fn protocol(&self) -> (ErrorCode, String) {
+    pub fn protocol(&self) -> (ErrorCode, String) {
         match self {
             Self::Io(_) | Self::ContentRootMismatch | Self::State(_) => {
                 (ErrorCode::Internal, "internal deploy error".to_owned())
@@ -342,6 +343,16 @@ pub fn execute(
         &site_state,
         &audit_path,
         &AuditRecord::result(request.request_id, true, None),
+    );
+
+    // Best-effort: retention is a disk-usage concern, not a correctness
+    // one, and must never turn this successful deploy into a reported
+    // failure.
+    let _ = cleanup::prune_old_releases(
+        context.content_root,
+        request.site_id,
+        release_id,
+        cleanup::DEFAULT_RETAIN_COUNT,
     );
 
     Ok(result)

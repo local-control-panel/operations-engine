@@ -35,6 +35,10 @@ impl ErrorCode {
 pub enum WarningCode {
     UnsupportedPlatform,
     DependencyUnavailable,
+    /// A mutation completed — the state it reports actually changed — but
+    /// its transaction record could not be persisted afterward. The
+    /// result is genuine; only the durable bookkeeping is in question.
+    TransactionRecordIncomplete,
 }
 
 #[cfg(test)]

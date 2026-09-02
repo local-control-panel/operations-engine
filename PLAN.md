@@ -406,20 +406,68 @@ Completed:
   to know exactly which branch to clone, not just that authorization
   passed.
 
+Completed:
+
+- implemented bounded release retention (`src/deploy/cleanup.rs`):
+  `prune_old_releases` keeps the `DEFAULT_RETAIN_COUNT` (5) most recently
+  created releases plus whichever one is currently active — regardless of
+  its own age or position — and best-effort-removes the rest (a failure to
+  remove one specific release is skipped, not propagated; cleanup must
+  never turn a successful deploy into a reported failure). Age is the
+  release directory's own filesystem modification time, not a
+  cross-reference against `TransactionState.finishedAt` — a documented
+  approximation, not exact accounting. Wired into `execute::execute` as
+  the last, best-effort step after a successful deploy. New
+  `ManagedRoot::remove_dir_all` backs the actual removal;
+- advertised `site.deploy` (`src/commands/site.rs`, wired through a new
+  `ops-engine site deploy` CLI subcommand): loads the root-owned engine
+  config and site manifest from their documented paths
+  (`/etc/operations-engine/config.json`,
+  `/etc/operations-engine/sites/<siteId>.json`), builds a `DeployContext`,
+  and maps `deploy::execute::DeployError` to the protocol envelope via the
+  `DeployError::protocol` method added in the previous item — including a
+  new `WarningCode::TransactionRecordIncomplete` for the
+  `PostCommitRecordFailed` case, so a deploy that actually succeeded but
+  failed to persist its own record still reports `ok: true` with a
+  warning, never a false failure. `capabilities` now lists `"site.deploy"`
+  and sets `features.mutations: true`; `cancellation` and
+  `jsonLinesProgress` stay `false` — the internal plumbing for both exists
+  (`transaction::commit`, `protocol::progress`) but neither is wired to
+  the CLI process lifecycle (no signal handler calls
+  `CancellationToken::cancel()`; `--output` has no JSON Lines variant), so
+  advertising either now would violate the "don't advertise before
+  implemented" rule. Picking a content root when more than one is
+  configured is still unsolved generically — `run_deploy` requires exactly
+  one and fails safely (`INTERNAL`) otherwise, a known, narrow gap.
+  Smoke-tested against the real compiled binary (`capabilities`,
+  `site deploy --help`, an invalid site ID, and a valid request against a
+  dev host with no engine config installed) in addition to the automated
+  suite.
+
 Work items, in order:
 
-1. Clean up according to bounded retention rules.
-2. Add end-to-end disconnect tests (success/failure/retry already covered
-   by `tests/deploy.rs`).
-3. Advertise `site.deploy` only after all previous items pass.
+1. Add end-to-end disconnect tests. Success, failure, and retry are
+   already covered by `tests/deploy.rs`; disconnect specifically needs a
+   real transport to test honestly (there is none yet — SSH integration is
+   Phase 6), so this is the one item genuinely blocked on later phases
+   rather than on more code here.
 
 Exit criteria:
 
-- failed pre-commit work leaves the active release unchanged;
-- post-commit failures report that deployment changed state;
-- disconnects have a documented and tested recovery path;
-- repeated idempotent requests return the original outcome;
-- the control plane needs one structured operation rather than a shell sequence.
+- failed pre-commit work leaves the active release unchanged — met, see
+  `tests/deploy.rs`;
+- post-commit failures report that deployment changed state — met,
+  `PostCommitRecordFailed` plus the `TransactionRecordIncomplete` warning;
+- disconnects have a documented and tested recovery path — **not met**:
+  documented (see the migration/site-model notes on SSH disconnect
+  recovery) but not tested; blocked on Phase 6 transport;
+- repeated idempotent requests return the original outcome — met;
+- the control plane needs one structured operation rather than a shell
+  sequence — met, `ops-engine site deploy` is that one operation.
+
+Phase 4 stays **in progress**, not complete, until the disconnect exit
+criterion has a real test — per this file's own rule not to mark a phase
+complete because its happy path works.
 
 ## Phase 5 — Git rollback pilot
 

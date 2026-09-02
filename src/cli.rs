@@ -25,6 +25,12 @@ pub enum Command {
 
     /// Inspect whether the current host can run planned operations.
     Doctor,
+
+    /// Site-scoped mutation operations.
+    Site {
+        #[command(subcommand)]
+        command: SiteCommand,
+    },
 }
 
 impl Command {
@@ -33,6 +39,38 @@ impl Command {
             Self::Version => "version",
             Self::Capabilities => "capabilities",
             Self::Doctor => "doctor",
+            Self::Site { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SiteCommand {
+    /// Deploy a resolved Git revision for one site.
+    Deploy {
+        #[arg(long = "site-id")]
+        site_id: String,
+
+        /// A full Git object ID already resolved from an allowed branch.
+        #[arg(long)]
+        revision: String,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of deploying twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl SiteCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Deploy { .. } => "site.deploy",
         }
     }
 }

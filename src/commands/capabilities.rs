@@ -5,7 +5,7 @@ use crate::protocol::{Response, ResponseBuildError};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CapabilitiesResult {
-    operations: [&'static str; 3],
+    operations: [&'static str; 4],
     output_formats: [&'static str; 1],
     features: Features,
 }
@@ -22,12 +22,12 @@ pub fn run() -> Result<Response, ResponseBuildError> {
     Response::success(
         "capabilities",
         CapabilitiesResult {
-            operations: ["version", "capabilities", "doctor"],
+            operations: ["version", "capabilities", "doctor", "site.deploy"],
             output_formats: ["json"],
             features: Features {
                 json_lines_progress: false,
                 cancellation: false,
-                mutations: false,
+                mutations: true,
             },
         },
     )
