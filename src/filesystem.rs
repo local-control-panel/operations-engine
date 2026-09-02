@@ -1,4 +1,7 @@
-use std::io::{self, Write};
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+};
 
 use cap_std::{
     ambient_authority,
@@ -97,6 +100,27 @@ impl ManagedRoot {
         self.directory
             .rename(temp_path.as_path(), &self.directory, path.as_path())
     }
+
+    /// Creates `link` as a new relative symlink pointing at `target`,
+    /// failing if `link` already exists (symlink creation is inherently
+    /// exclusive — there is no "replace" mode). Pair with `rename` for an
+    /// atomic same-directory symlink swap: create the new link under a
+    /// unique temporary name, then `rename` it over the real one.
+    pub fn symlink(&self, link: &SiteRelativePath, target: &SiteRelativePath) -> io::Result<()> {
+        self.directory.symlink(target.as_path(), link.as_path())
+    }
+
+    pub fn read_link(&self, link: &SiteRelativePath) -> io::Result<PathBuf> {
+        self.directory.read_link(link.as_path())
+    }
+
+    /// Renames `from` to `to` within this same directory. This is the
+    /// atomic commit point for callers that stage a temp file or symlink
+    /// under `from` and want it to become `to` in one step.
+    pub fn rename(&self, from: &SiteRelativePath, to: &SiteRelativePath) -> io::Result<()> {
+        self.directory
+            .rename(from.as_path(), &self.directory, to.as_path())
+    }
 }
 
 fn temp_sibling_path(path: &SiteRelativePath) -> io::Result<SiteRelativePath> {
@@ -163,6 +187,47 @@ mod tests {
             .create_dir(&path)
             .expect("first create should succeed");
         assert!(managed.create_dir(&path).is_err());
+    }
+
+    #[test]
+    fn symlink_and_rename_perform_an_atomic_swap() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let a = SiteRelativePath::parse("releases/a").expect("path should be valid");
+        let b = SiteRelativePath::parse("releases/b").expect("path should be valid");
+        let current = SiteRelativePath::parse("current").expect("path should be valid");
+        let temp = SiteRelativePath::parse("current.tmp").expect("path should be valid");
+
+        managed
+            .symlink(&current, &a)
+            .expect("initial link should be created");
+        assert_eq!(managed.read_link(&current).unwrap(), a.as_path());
+
+        managed
+            .symlink(&temp, &b)
+            .expect("temp link should be created");
+        managed
+            .rename(&temp, &current)
+            .expect("rename should swap the link atomically");
+
+        assert_eq!(managed.read_link(&current).unwrap(), b.as_path());
+        assert!(!directory.path().join("current.tmp").exists());
+    }
+
+    #[test]
+    fn symlink_does_not_replace_an_existing_link() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let a = SiteRelativePath::parse("releases/a").expect("path should be valid");
+        let b = SiteRelativePath::parse("releases/b").expect("path should be valid");
+        let current = SiteRelativePath::parse("current").expect("path should be valid");
+
+        managed
+            .symlink(&current, &a)
+            .expect("first link should succeed");
+        assert!(managed.symlink(&current, &b).is_err());
     }
 
     #[test]

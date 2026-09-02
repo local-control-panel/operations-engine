@@ -1,6 +1,7 @@
 //! The `site.deploy` operation (Phase 4). Nothing here is wired into
 //! `cli`/`capabilities` until every item in `PLAN.md`'s Phase 4 passes.
 
+pub mod activate;
 pub mod preflight;
 pub mod resolve;
 pub mod staging;

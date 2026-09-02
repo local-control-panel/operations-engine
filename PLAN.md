@@ -359,15 +359,27 @@ Completed:
   README's "Scope" section; a manifest-driven build step, if ever added, is
   new scope for a later milestone, not implied by this item.
   `StagedRelease` also grew an `absolute_path` field so this and the next
-  item (the atomic switch) don't each re-resolve it independently.
+  item (the atomic switch) don't each re-resolve it independently;
+- implemented the atomic switch (`src/deploy/activate.rs`), the one commit
+  point of a deploy: `activate` creates a new relative symlink
+  (`releases/<releaseId>`) under a unique temp name and `rename`s it over
+  `sites/<siteId>/current` in the same directory — the rename call is the
+  single line that makes a deploy visible; everything before it is still
+  abortable. Reads the previous `current` target first so the result can
+  report `previousReleaseId`, but refuses to guess at an existing target
+  that isn't shaped exactly like `releases/<releaseId>` rather than
+  silently reporting "no previous release." Added three new generic
+  `ManagedRoot` primitives this needed (`symlink`, `read_link`, `rename`),
+  each with its own filesystem.rs test, plus three activate.rs tests: first
+  activation, a second activation's atomic swap (and that no `.tmp-*` link
+  survives it), and the unrecognized-target refusal.
 
 Work items, in order:
 
-1. Perform one explicit atomic switch.
-2. Persist result metadata and emit an audit event.
-3. Clean up according to bounded retention rules.
-4. Add end-to-end success, failure, disconnect, and retry tests.
-5. Advertise `site.deploy` only after all previous items pass.
+1. Persist result metadata and emit an audit event.
+2. Clean up according to bounded retention rules.
+3. Add end-to-end success, failure, disconnect, and retry tests.
+4. Advertise `site.deploy` only after all previous items pass.
 
 Exit criteria:
 
