@@ -65,12 +65,36 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Switch a site back to a previously retained release.
+    Rollback {
+        #[arg(long = "site-id")]
+        site_id: String,
+
+        /// A retained release identifier previously returned by
+        /// `site deploy` or `site rollback` as `releaseId`. Not trusted as
+        /// authorization by itself — the engine only accepts a release it
+        /// itself still retains for this site.
+        #[arg(long)]
+        release: String,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of rolling back twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SiteCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Deploy { .. } => "site.deploy",
+            Self::Rollback { .. } => "site.rollback",
         }
     }
 }

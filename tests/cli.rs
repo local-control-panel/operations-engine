@@ -36,7 +36,13 @@ fn capabilities_describe_only_implemented_operations() {
 
     assert_eq!(
         response["result"]["operations"],
-        serde_json::json!(["version", "capabilities", "doctor", "site.deploy"])
+        serde_json::json!([
+            "version",
+            "capabilities",
+            "doctor",
+            "site.deploy",
+            "site.rollback"
+        ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
     // Neither mechanism is wired to the CLI process lifecycle yet: nothing
