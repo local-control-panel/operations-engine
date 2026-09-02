@@ -12,6 +12,9 @@ machine-readable result.
 > This project is in the planning and early development stage. The command-line
 > interface, protocol, and installation process are not stable yet.
 
+Development follows the shared [implementation plan](./PLAN.md). It records the
+current phase, agreed decisions, completion criteria, and the next work item.
+
 ## Why it exists
 
 Remote orchestration built from shell commands becomes difficult to maintain as
@@ -184,6 +187,7 @@ validation workflow.
    measurable benefit.
 
 Detailed implementation milestones live in [`docs/milestones`](./docs/milestones).
+The authoritative execution order and current status live in [PLAN.md](./PLAN.md).
 
 ## Naming
 

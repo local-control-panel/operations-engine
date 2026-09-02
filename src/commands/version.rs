@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::protocol::{PROTOCOL_VERSION, Response};
+use crate::protocol::{PROTOCOL_VERSION, Response, ResponseBuildError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -9,7 +9,7 @@ struct VersionResult {
     protocol_version: u32,
 }
 
-pub fn run() -> Response {
+pub fn run() -> Result<Response, ResponseBuildError> {
     Response::success(
         "version",
         VersionResult {

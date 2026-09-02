@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::protocol::Response;
+use crate::protocol::{Response, ResponseBuildError};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,7 +18,7 @@ struct Features {
     mutations: bool,
 }
 
-pub fn run() -> Response {
+pub fn run() -> Result<Response, ResponseBuildError> {
     Response::success(
         "capabilities",
         CapabilitiesResult {

@@ -15,14 +15,34 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn success<T: Serialize>(operation: &'static str, result: T) -> Self {
-        Self {
+    pub fn success<T: Serialize>(
+        operation: &'static str,
+        result: T,
+    ) -> Result<Self, ResponseBuildError> {
+        let result = serde_json::to_value(result).map_err(|_| ResponseBuildError)?;
+
+        Ok(Self {
             protocol_version: PROTOCOL_VERSION,
             operation,
             ok: true,
-            result: Some(serde_json::to_value(result).expect("result must be serializable")),
+            result: Some(result),
             warnings: Vec::new(),
             error: None,
+        })
+    }
+
+    pub fn failure(operation: &'static str, code: &str, message: &str) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            operation,
+            ok: false,
+            result: None,
+            warnings: Vec::new(),
+            error: Some(ProtocolError {
+                code: code.to_owned(),
+                message: message.to_owned(),
+                details: None,
+            }),
         }
     }
 
@@ -31,6 +51,9 @@ impl Response {
         self
     }
 }
+
+#[derive(Debug)]
+pub struct ResponseBuildError;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,4 +68,39 @@ pub struct ProtocolError {
     pub code: String,
     pub message: String,
     pub details: Option<Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::{Serialize, Serializer};
+
+    use super::Response;
+
+    struct FailingResult;
+
+    impl Serialize for FailingResult {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(serde::ser::Error::custom("intentional test failure"))
+        }
+    }
+
+    #[test]
+    fn result_serialization_failure_is_returned_instead_of_panicking() {
+        assert!(Response::success("test", FailingResult).is_err());
+    }
+
+    #[test]
+    fn failure_response_has_no_partial_result() {
+        let response = Response::failure("test", "INTERNAL_ERROR", "safe message");
+
+        assert!(!response.ok);
+        assert!(response.result.is_none());
+        assert_eq!(
+            response.error.expect("error must exist").code,
+            "INTERNAL_ERROR"
+        );
+    }
 }

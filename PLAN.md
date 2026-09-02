@@ -1,0 +1,332 @@
+# Operations Engine implementation plan
+
+Status: active  
+Current phase: 1 — foundation  
+Last updated: 2026-09-02
+
+This file is the shared implementation plan for Operations Engine. It is the
+authoritative source for what we build next, in what order, and what must be
+true before a phase is considered complete.
+
+The README explains the project. Documents under `docs/` describe individual
+contracts and milestones. This file coordinates their execution.
+
+## Working agreement
+
+All contributors and coding agents should follow these rules:
+
+1. Read this file, `docs/protocol.md`, and the relevant milestone before making
+   architectural or protocol changes.
+2. Work on the earliest incomplete phase unless a documented dependency or
+   production issue requires otherwise.
+3. Complete one small, testable vertical slice at a time.
+4. Do not advertise commands or features through `capabilities` before they are
+   implemented and tested.
+5. Do not implement a mutating operation before its inputs, invariants, commit
+   point, failure states, and recovery behavior are documented.
+6. Keep protocol changes backward-compatible within a protocol version.
+7. Update this plan in the same change whenever phase status, scope, or an
+   architectural decision changes.
+8. Keep unfinished work explicit. Do not mark a phase complete because its
+   happy path works.
+
+## Definition of done
+
+A work item is complete only when all applicable requirements are satisfied:
+
+- code is formatted and passes Clippy with warnings denied;
+- unit and integration tests cover public behavior and failure paths;
+- stdout contains only the documented protocol output;
+- errors and warnings use stable machine-readable codes;
+- inputs are validated at the server execution boundary;
+- logs and responses do not expose secrets;
+- documentation and `capabilities` match the implementation;
+- Linux behavior is tested in CI;
+- recovery behavior is tested for mutations;
+- `cargo check` passes with the minimum supported Rust version.
+
+Required local validation:
+
+```console
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo +1.85.0 check --all-features
+```
+
+## Phase 0 — project direction
+
+Status: complete
+
+Delivered:
+
+- neutral project name: Operations Engine;
+- initial binary name: `ops-engine`;
+- separate repository and release lifecycle;
+- Linux-only production target;
+- CLI-first architecture without a persistent daemon;
+- SSH as the initial transport used by a separate control plane;
+- Git deploy/rollback selected as the first mutation pilot.
+
+Decisions that remain reversible before the first public release:
+
+- adding a stable product prefix to the repository and binary names;
+- selecting the final distribution and installation mechanism;
+- changing the minimum Rust version when required by supported platforms.
+
+## Phase 1 — foundation
+
+Status: in progress
+
+Goal: establish a small, reliable read-only CLI and freeze the minimum protocol
+behavior needed by future operations.
+
+Completed:
+
+- Rust crate and `ops-engine` binary;
+- command parsing with JSON as the initial output format;
+- protocol response envelope;
+- `version` command;
+- `capabilities` command;
+- `doctor` command with platform and dependency checks;
+- unit and CLI integration tests;
+- formatting, lint, test, and minimum-Rust CI jobs;
+- protocol and contribution documentation;
+- explicit `INTERNAL_SERIALIZATION_ERROR` response instead of a panic when an
+  operation result cannot be encoded.
+
+Remaining, in order:
+
+1. Define the stable error-code taxonomy and document which details are safe to
+   return.
+2. Decide whether unsupported platforms and missing required dependencies are
+   warnings, failed checks, or failed operations.
+3. Add structured build information needed for release diagnosis, without
+   exposing machine-specific build data.
+4. Add Linux integration coverage for `doctor` using controlled fake
+   dependencies rather than relying on the CI runner's installed software.
+5. Define bounded subprocess output, timeout, and cancellation primitives that
+   mutation commands can reuse.
+
+Exit criteria:
+
+- the response envelope has no panic-based serialization path;
+- protocol and exit-status semantics are documented and tested;
+- diagnostic results are deterministic in integration tests;
+- subprocess execution has explicit time and output bounds;
+- the initial read-only command surface is safe to tag as an alpha release.
+
+## Phase 2 — site and filesystem model
+
+Status: pending
+
+Goal: define the trusted local model required by deploy and rollback before any
+mutation is implemented.
+
+Work items, in order:
+
+1. Inventory the current control plane's Git deploy/rollback contract.
+2. Choose a canonical site identifier; do not assume the domain is the identity.
+3. Define trusted filesystem roots and path-containment rules.
+4. Define site discovery/configuration input without accepting arbitrary paths.
+5. Define service user, file ownership, and minimal sudo boundaries.
+6. Define release, staging, lock, and metadata directory layouts.
+7. Define the active-release representation and atomic switch mechanism.
+8. Create validation types for site identifiers, revisions, and bounded paths.
+9. Test traversal, symlink, ownership, and invalid-identifier cases.
+
+Exit criteria:
+
+- untrusted input cannot select a path outside configured roots;
+- filesystem layout and ownership rules are documented;
+- site identity is stable across domain changes;
+- validation types are reusable and fully tested;
+- no deploy subprocess is started in this phase.
+
+## Phase 3 — transaction framework
+
+Status: pending
+
+Goal: build reusable mutation infrastructure without yet exposing deploy or
+rollback as a capability.
+
+Work items, in order:
+
+1. Define request and idempotency identifiers.
+2. Implement per-site locking with bounded stale-lock recovery.
+3. Implement transaction state persisted outside temporary process memory.
+4. Define named progress steps and JSON Lines framing.
+5. Define the commit point and cancellation rules around it.
+6. Implement bounded subprocess execution with redacted diagnostics.
+7. Define audit events for mutation start, progress, result, and recovery.
+8. Add interruption, timeout, concurrency, and cleanup tests.
+
+Exit criteria:
+
+- two mutations cannot run concurrently for the same site;
+- retrying an idempotent request cannot create duplicate work;
+- interrupted operations leave enough state for deterministic recovery;
+- progress and final responses can be parsed without human text;
+- tests cover process interruption on both sides of the commit point.
+
+## Phase 4 — Git deploy pilot
+
+Status: pending
+
+Goal: deliver one complete, recoverable Git deployment operation using the
+contracts from phases 2 and 3.
+
+The detailed contract checklist lives in
+[`docs/milestones/001-git-deploy-rollback.md`](./docs/milestones/001-git-deploy-rollback.md).
+
+Work items, in order:
+
+1. Freeze the request and result schemas.
+2. Implement preflight checks without changing the active release.
+3. Fetch and resolve an allowed revision without shell interpolation.
+4. Prepare an isolated staging release.
+5. Run bounded validation steps.
+6. Perform one explicit atomic switch.
+7. Persist result metadata and emit an audit event.
+8. Clean up according to bounded retention rules.
+9. Add end-to-end success, failure, disconnect, and retry tests.
+10. Advertise `site.deploy` only after all previous items pass.
+
+Exit criteria:
+
+- failed pre-commit work leaves the active release unchanged;
+- post-commit failures report that deployment changed state;
+- disconnects have a documented and tested recovery path;
+- repeated idempotent requests return the original outcome;
+- the control plane needs one structured operation rather than a shell sequence.
+
+## Phase 5 — Git rollback pilot
+
+Status: pending
+
+Goal: switch safely to a known retained release using the same transaction,
+locking, audit, and recovery machinery.
+
+Work items, in order:
+
+1. Define which release identifiers are eligible for rollback.
+2. Validate retained release integrity before the commit point.
+3. Implement the atomic switch without rebuilding the release.
+4. Preserve forward recovery information.
+5. Add missing, invalid, concurrent, interrupted, and repeated rollback tests.
+6. Advertise `site.rollback` after the complete contract passes.
+
+Exit criteria:
+
+- rollback cannot select arbitrary filesystem content;
+- the previous active release remains identifiable;
+- an interrupted rollback is recoverable deterministically;
+- audit and result data identify both source and target releases safely.
+
+## Phase 6 — client integration and compatibility
+
+Status: pending
+
+Goal: integrate one real control plane while keeping client and engine releases
+independent.
+
+Work items:
+
+- define the supported protocol-version window;
+- implement version and capability negotiation in the client;
+- safely reject incompatible engines;
+- map progress and stable error codes to client state;
+- test older-client/newer-engine and newer-client/older-engine combinations;
+- document bootstrap behavior when the engine is absent;
+- compare SSH round trips, failure recovery, and orchestration complexity with
+  the previous implementation.
+
+Exit criteria:
+
+- neither repository requires a simultaneous merge or release;
+- incompatibility fails before a mutation begins;
+- the pilot demonstrates measurable operational or maintenance improvement.
+
+## Phase 7 — release and production hardening
+
+Status: pending
+
+Goal: make installation, upgrade, downgrade, and recovery safer than manual
+binary replacement.
+
+Work items:
+
+- reproducible Linux AMD64 and ARM64 builds;
+- checksums and signed release artifacts;
+- explicit, pinned installation through the control plane;
+- atomic upgrade and downgrade with previous-binary recovery;
+- release compatibility matrix;
+- redaction and bounded-log review;
+- package and incident-recovery documentation;
+- opt-in rollout to test servers before broader deployment.
+
+Exit criteria:
+
+- downloaded artifacts are verified before execution;
+- failed upgrades retain a runnable previous binary;
+- release provenance and compatibility can be audited;
+- production rollout and rollback procedures have been exercised.
+
+## Phase 8 — selective expansion
+
+Status: pending
+
+Additional workflows are considered only after the Git pilot succeeds. Each
+workflow requires its own milestone document and measurable reason to move into
+Operations Engine.
+
+Potential candidates:
+
+- atomic Caddy and site configuration changes;
+- stack status and reconciliation;
+- backup and restore;
+- narrowly scoped scheduled jobs.
+
+Interactive terminals, arbitrary shell execution, general file browsing, and
+live log streaming remain outside the structured privileged API unless a new
+architecture and threat model explicitly justify them.
+
+## Decision log
+
+Record decisions here when they affect more than one milestone. Detailed ADRs
+may later live under `docs/decisions/` and be linked from this table.
+
+| Date | Decision | Reason |
+| --- | --- | --- |
+| 2026-09-02 | Use the neutral working name Operations Engine and binary `ops-engine`. | Avoid coupling the server component to a client product name that may change. |
+| 2026-09-02 | Keep the engine in a separate repository. | It has a distinct Linux target, security boundary, release cadence, and compatibility lifecycle. |
+| 2026-09-02 | Start with a CLI over SSH and no daemon. | Prove the structured execution boundary before adding a persistent privileged service. |
+| 2026-09-02 | Separate protocol version from semantic release version. | Allow independent compatibility decisions and releases. |
+| 2026-09-02 | Use Git deploy/rollback as the first mutation pilot. | It exercises locking, staging, atomic switching, idempotency, progress, and recovery. |
+
+## Open decisions
+
+Resolve these in the phase where they first become blocking:
+
+- final product prefix, if any;
+- canonical site identity;
+- configuration source and trusted filesystem roots;
+- service user and sudo allowlist;
+- exact deploy commit mechanism;
+- idempotency-key ownership and retention;
+- cancellation behavior after disconnect;
+- audit-event destination;
+- protocol compatibility window;
+- release signing and distribution mechanism.
+
+## How to update this plan
+
+When work advances:
+
+1. mark individual delivered items under the active phase;
+2. do not change a phase to complete until every exit criterion is satisfied;
+3. move `Current phase` only after the prior phase is complete;
+4. add new scope to the appropriate future phase instead of silently inserting
+   it into current implementation work;
+5. record cross-cutting decisions in the decision log;
+6. update `Last updated` in the same change.

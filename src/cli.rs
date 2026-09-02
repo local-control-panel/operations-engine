@@ -26,3 +26,13 @@ pub enum Command {
     /// Inspect whether the current host can run planned operations.
     Doctor,
 }
+
+impl Command {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Version => "version",
+            Self::Capabilities => "capabilities",
+            Self::Doctor => "doctor",
+        }
+    }
+}

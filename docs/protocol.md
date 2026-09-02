@@ -54,3 +54,6 @@ An envelope with `ok: true` exits with status 0. An envelope with `ok: false`
 exits with a non-zero status. CLI parsing errors occur before an operation is
 selected and are currently emitted by the argument parser on stderr.
 
+If an operation result cannot be serialized, the engine returns an unsuccessful
+envelope with code `INTERNAL_SERIALIZATION_ERROR`. It does not emit a partial
+result or panic while constructing the response.

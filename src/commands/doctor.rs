@@ -2,7 +2,7 @@ use std::process::Command;
 
 use serde::Serialize;
 
-use crate::protocol::{Response, Warning};
+use crate::protocol::{Response, ResponseBuildError, Warning};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -28,7 +28,7 @@ struct Dependency {
     required_for: &'static [&'static str],
 }
 
-pub fn run() -> Response {
+pub fn run() -> Result<Response, ResponseBuildError> {
     let supported = cfg!(target_os = "linux");
     let warnings = if supported {
         Vec::new()
@@ -55,7 +55,7 @@ pub fn run() -> Response {
         ],
     };
 
-    Response::success("doctor", result).with_warnings(warnings)
+    Response::success("doctor", result).map(|response| response.with_warnings(warnings))
 }
 
 fn inspect_dependency(
