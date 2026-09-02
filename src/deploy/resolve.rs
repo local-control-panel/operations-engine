@@ -55,7 +55,7 @@ pub fn resolve_allowed_revision(
     let mut args: Vec<String> = Vec::new();
     if let Some(path) = identity_file {
         args.push("-c".to_owned());
-        args.push(ssh_command_config(path));
+        args.push(super::ssh_command_config(path));
     }
     args.push("ls-remote".to_owned());
     // `--` stops option parsing so a permitted-but-unusual URL (one
@@ -96,13 +96,6 @@ pub fn resolve_allowed_revision(
     } else {
         Err(Error::NotAuthorized)
     }
-}
-
-fn ssh_command_config(identity_file: &Path) -> String {
-    format!(
-        "core.sshCommand=ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
-        identity_file.display()
-    )
 }
 
 #[cfg(all(test, unix))]

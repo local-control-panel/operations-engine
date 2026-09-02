@@ -312,17 +312,51 @@ Completed:
   that value when invoking `ssh`. Tested against a real local `git`
   repository (`git ls-remote` accepts a plain filesystem path), not a mock —
   covers an authorized branch tip, an unrelated revision, a revision on a
-  non-allow-listed branch, and an unreachable remote.
+  non-allow-listed branch, and an unreachable remote;
+- found and fixed an argument-injection gap in the item above via automated
+  security review: `resolve_allowed_revision` passed `remote_url` straight
+  after `ls-remote` with no `--`, so a manifest `repository.url` value
+  starting with `-` (a config-schema field that only bans control
+  characters, not a leading dash) could be parsed by `git` as a flag —
+  `--upload-pack=<command>` is a real remote-code-execution primitive.
+  Fixed by rejecting a leading `-` outright and adding `--` before the
+  positional URL regardless; added a regression test asserting the
+  rejection happens before any subprocess starts;
+- added general privilege-dropping to the Phase 1 subprocess runner itself
+  (`ProcessRequest::run_as(uid, gid)` in `src/process.rs`, Unix-only), not
+  just to deploy: `run()` now calls `Command::uid`/`gid` when set. Every
+  future build/Git subprocess reuses this one mechanism rather than each
+  operation growing its own. Supplementary groups are not yet explicitly
+  cleared (`setgroups`) — documented as a gap in the method's own doc
+  comment;
+- implemented staging (`src/deploy/staging.rs`), the first item that
+  writes real content into a site-owned directory: `resolve_site_identity`
+  turns the manifest's `siteUser` into a numeric uid/gid via `id -u`/`id
+  -g` (bounded subprocess, not a raw NSS/FFI call); `prepare` then
+  exclusively creates `sites/<siteId>/releases/<releaseId>/` (new
+  `ManagedRoot::create_dir`, fails instead of reusing an existing
+  directory), `chown`s it to that identity *before* anything else touches
+  it, clones the resolved branch via `run_as` so `git` never runs at the
+  engine's own privilege level, and finally verifies the checked-out HEAD
+  still equals the revision `resolve` authorized — closing the TOCTOU
+  window where the remote branch could have moved in between.
+  **Test-coverage gap, by explicit user decision**: this environment has no
+  root and cannot create a second real Unix user, so the tests resolve and
+  use the *current* user's own identity throughout (chown-to-self and
+  `run_as` with one's own uid/gid are always permitted, unlike a genuine
+  cross-user drop). Every mechanism is exercised for real except the one
+  thing only root can prove — that a *different* uid/gid is actually
+  enforced end to end. Verify that specifically before trusting this
+  against a real multi-tenant deployment.
 
 Work items, in order:
 
-1. Prepare an isolated staging release.
-2. Run bounded validation steps.
-3. Perform one explicit atomic switch.
-4. Persist result metadata and emit an audit event.
-5. Clean up according to bounded retention rules.
-6. Add end-to-end success, failure, disconnect, and retry tests.
-7. Advertise `site.deploy` only after all previous items pass.
+1. Run bounded validation steps.
+2. Perform one explicit atomic switch.
+3. Persist result metadata and emit an audit event.
+4. Clean up according to bounded retention rules.
+5. Add end-to-end success, failure, disconnect, and retry tests.
+6. Advertise `site.deploy` only after all previous items pass.
 
 Exit criteria:
 
@@ -442,6 +476,8 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Per-site lock staleness is a pure 15-minute time bound (`DEFAULT_STALE_AFTER`), not a holder-process liveness check. | Keeps recovery deterministic and portable (no `/proc` dependency) for a first pass; revisit only if a real workflow needs faster recovery than 15 minutes. |
 | 2026-09-02 | Idempotency-key lookup is a per-site, on-disk FNV-1a hash index with a stored-key check on read; key *retention* is not yet decided. | The exit criterion "retrying an idempotent request cannot create duplicate work" was blocking in Phase 3 itself, so the lookup half had to be resolved now; retention has no forcing operation yet and stays open for Phase 4. |
 | 2026-09-02 | A deployed release's `ReleaseId` equals the `RequestId` of the transaction that created it, rather than a separately generated identifier. | Deploy makes at most one release per transaction; reusing the ID keeps the release directory, transaction state, and audit trail joinable on one value instead of three. |
+| 2026-09-02 | Site UID/GID is resolved via the `id` subprocess, and privilege-dropping lives on `ProcessRequest` (`run_as`) in the shared runner, not only in deploy code. | Keeps every subprocess call — including future build steps — on the same bounded, argv-only, no-shell, no-raw-FFI discipline instead of a one-off mechanism per operation. |
+| 2026-09-02 | Deploy staging was implemented and merged with cross-user privilege-dropping untested (only self-drop, tested for real). | Explicit user choice: build the real code now rather than deferring it, with the root-only test gap called out in `PLAN.md` and each affected file rather than silently shipped. Must be exercised under an actual multi-user Unix host before production use with more than one site owner. |
 
 ## Open decisions
 

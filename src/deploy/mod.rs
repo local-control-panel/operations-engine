@@ -3,8 +3,9 @@
 
 pub mod preflight;
 pub mod resolve;
+pub mod staging;
 
-use std::fmt;
+use std::{fmt, path::Path};
 
 use serde::Serialize;
 
@@ -12,6 +13,19 @@ use crate::{
     site::{GitCommitSha, SiteId},
     transaction::{IdempotencyKey, IdentifierError, RequestId},
 };
+
+/// Pins the SSH identity used for one `git` invocation via
+/// `-c core.sshCommand=...`, rather than the process environment or a
+/// shared SSH config. `identity_file` must already be trusted and
+/// engine-derived (an installed credential file resolved through the
+/// manifest's `credentialId`) — never raw request input — because git
+/// itself shell-interprets this value when it invokes `ssh`.
+fn ssh_command_config(identity_file: &Path) -> String {
+    format!(
+        "core.sshCommand=ssh -i {} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
+        identity_file.display()
+    )
+}
 
 /// Identifies one prepared release directory (`releases/<releaseId>/`).
 /// Always equal to the `RequestId` of the deploy attempt that created it:

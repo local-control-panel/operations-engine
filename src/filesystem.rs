@@ -34,6 +34,15 @@ impl ManagedRoot {
         })
     }
 
+    /// Creates `path` as a new directory, failing if it already exists (its
+    /// parent must already exist — use `create_dir_all` for that first).
+    /// Use this, not `create_dir_all`, wherever the caller needs a
+    /// guarantee of a brand-new, empty directory rather than "this
+    /// directory now exists, possibly with prior contents."
+    pub fn create_dir(&self, path: &SiteRelativePath) -> io::Result<()> {
+        self.directory.create_dir(path.as_path())
+    }
+
     pub fn create_dir_all(&self, path: &SiteRelativePath) -> io::Result<()> {
         self.directory.create_dir_all(path.as_path())
     }
@@ -141,6 +150,19 @@ mod tests {
             fs::read_to_string(directory.path().join("sites/example/marker")).unwrap(),
             "scoped"
         );
+    }
+
+    #[test]
+    fn create_dir_fails_instead_of_reusing_an_existing_directory() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let path = SiteRelativePath::parse("fresh").expect("path should be valid");
+
+        managed
+            .create_dir(&path)
+            .expect("first create should succeed");
+        assert!(managed.create_dir(&path).is_err());
     }
 
     #[test]

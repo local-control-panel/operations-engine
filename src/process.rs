@@ -48,6 +48,8 @@ impl Default for ProcessLimits {
 pub struct ProcessRequest {
     program: OsString,
     args: Vec<OsString>,
+    #[cfg(unix)]
+    run_as: Option<(u32, u32)>,
 }
 
 impl ProcessRequest {
@@ -55,6 +57,8 @@ impl ProcessRequest {
         Self {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
+            #[cfg(unix)]
+            run_as: None,
         }
     }
 
@@ -65,6 +69,21 @@ impl ProcessRequest {
     {
         self.args
             .extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
+        self
+    }
+
+    /// Runs the child as `uid`/`gid` instead of this process's own identity.
+    /// Git and build subprocesses must use this with a site's resolved
+    /// identity rather than ever running as the engine's own privilege
+    /// level. Supplementary groups are not explicitly cleared, so the child
+    /// still carries this process's supplementary group memberships in
+    /// addition to `gid` — acceptable while the engine itself runs as root
+    /// with no meaningful supplementary groups, but a gap worth closing
+    /// (`setgroups`) before relying on group membership as an isolation
+    /// boundary.
+    #[cfg(unix)]
+    pub fn run_as(mut self, uid: u32, gid: u32) -> Self {
+        self.run_as = Some((uid, gid));
         self
     }
 }
@@ -161,13 +180,18 @@ pub fn run(
     limits: &ProcessLimits,
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, ProcessRunError> {
-    let mut child = Command::new(&request.program)
+    let mut command = Command::new(&request.program);
+    command
         .args(&request.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ProcessRunError::Spawn)?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if let Some((uid, gid)) = request.run_as {
+        use std::os::unix::process::CommandExt;
+        command.uid(uid).gid(gid);
+    }
+    let mut child = command.spawn().map_err(ProcessRunError::Spawn)?;
 
     let stdout = child
         .stdout
@@ -397,5 +421,49 @@ mod tests {
         assert!(diagnostics.timed_out);
         assert!(!diagnostics.cancelled);
         assert_eq!(diagnostics.exit_code, None);
+    }
+
+    #[test]
+    fn run_as_ones_own_identity_still_runs_the_child() {
+        // Dropping to a *different* uid/gid needs root, which this
+        // environment cannot assume. Re-asserting one's own current
+        // identity via `run_as` needs no privilege at all and still
+        // exercises the real `Command::uid`/`gid` wiring end to end: if it
+        // were silently ignored or wired to the wrong field, `id -u`
+        // executed this way would either fail to spawn or print something
+        // else.
+        let resolve = |flag: &str| {
+            let output = run(
+                &ProcessRequest::new("id").args([flag]),
+                &ProcessLimits::default(),
+                &CancellationToken::default(),
+            )
+            .expect("id should run");
+            String::from_utf8_lossy(&output.stdout.bytes)
+                .trim()
+                .parse::<u32>()
+                .expect("id should print a number")
+        };
+        let uid = resolve("-u");
+        let gid = resolve("-g");
+
+        let baseline = run(
+            &ProcessRequest::new("id").args(["-u"]),
+            &ProcessLimits::default(),
+            &CancellationToken::default(),
+        )
+        .expect("baseline id -u should run");
+        let dropped = run(
+            &ProcessRequest::new("id").args(["-u"]).run_as(uid, gid),
+            &ProcessLimits::default(),
+            &CancellationToken::default(),
+        )
+        .expect("run_as with the caller's own uid/gid should still spawn");
+
+        assert_eq!(dropped.stdout.bytes, baseline.stdout.bytes);
+        assert!(matches!(
+            dropped.termination,
+            ProcessTermination::Exited { success: true, .. }
+        ));
     }
 }
