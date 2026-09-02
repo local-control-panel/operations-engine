@@ -15,12 +15,13 @@ fails.
 ## Proposed operations
 
 ```console
-ops-engine site deploy --domain example.com --revision abc123 --output json
-ops-engine site rollback --domain example.com --revision abc123 --output json
+ops-engine site deploy --site-id <uuid> --revision <full-object-id> --output json
+ops-engine site rollback --site-id <uuid> --release <release-id> --output json
 ```
 
-The final interface may use a site identifier instead of a domain. The choice
-must be made before the operation is exposed through `capabilities`.
+The stable site identifier is an opaque canonical UUID. Domain is mutable
+display/routing metadata and is not accepted as operation identity. Rollback
+selects an engine-owned retained release rather than trusting client history.
 
 ## Contract to define
 

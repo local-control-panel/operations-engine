@@ -3,6 +3,7 @@ pub mod commands;
 pub mod error;
 pub mod process;
 pub mod protocol;
+pub mod site;
 
 use cli::{Cli, Command};
 use error::ErrorCode;

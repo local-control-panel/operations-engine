@@ -57,9 +57,9 @@ ops-engine version --output json
 ops-engine capabilities --output json
 ops-engine doctor --output json
 ops-engine stack status --output json
-ops-engine site inspect --domain example.com --output json
-ops-engine site deploy --domain example.com --revision abc123 --output json
-ops-engine site rollback --domain example.com --revision abc123 --output json
+ops-engine site inspect --site-id <uuid> --output json
+ops-engine site deploy --site-id <uuid> --revision <full-object-id> --output json
+ops-engine site rollback --site-id <uuid> --release <release-id> --output json
 ops-engine reconcile --output json
 ```
 

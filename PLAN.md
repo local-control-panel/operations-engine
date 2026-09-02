@@ -121,15 +121,28 @@ mutation is implemented.
 
 Work items, in order:
 
-1. Inventory the current control plane's Git deploy/rollback contract.
-2. Choose a canonical site identifier; do not assume the domain is the identity.
-3. Define trusted filesystem roots and path-containment rules.
-4. Define site discovery/configuration input without accepting arbitrary paths.
-5. Define service user, file ownership, and minimal sudo boundaries.
-6. Define release, staging, lock, and metadata directory layouts.
-7. Define the active-release representation and atomic switch mechanism.
-8. Create validation types for site identifiers, revisions, and bounded paths.
-9. Test traversal, symlink, ownership, and invalid-identifier cases.
+Completed:
+
+- inventoried the control plane's current Git deploy/rollback lifecycle,
+  safeguards, state ownership, and migration sequence;
+- selected a canonical lowercase UUID `siteId` independent of domain;
+- defined root-owned manifests and configured trusted filesystem roots;
+- defined the proposed release, transaction, lock, credential, and audit layout;
+- created validation types for site identifiers, full Git object IDs, trusted
+  roots, and site-relative paths;
+- added traversal, NUL, malformed identifier, and symlink-escape tests.
+
+Remaining, in order:
+
+1. Verify how current Caddy/runtime configuration resolves document roots and
+   decide the active-release representation and atomic switch mechanism.
+2. Finalize the invoking service user, per-site ownership transitions, and
+   minimal sudo allowlist against the actual bootstrap lifecycle.
+3. Define race-safe creation beneath trusted roots; lexical joining is not an
+   authorization mechanism for mutations.
+4. Implement typed parsing for the root-owned engine config and site manifest.
+5. Test manifest mismatch, ownership, symlink replacement, and invalid
+   configuration cases.
 
 Exit criteria:
 
