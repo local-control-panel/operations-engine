@@ -2,6 +2,7 @@
 //! `cli`/`capabilities` until every item in `PLAN.md`'s Phase 4 passes.
 
 pub mod preflight;
+pub mod resolve;
 
 use std::fmt;
 

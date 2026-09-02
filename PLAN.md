@@ -291,23 +291,38 @@ Completed:
   `Outcome::Replay(RequestId)` naming the original attempt to load instead.
   Every step here only touches engine-owned bookkeeping (locks/,
   transactions/, audit/); nothing here can touch `releases/` or `current`.
-  Manifest/repository-policy loading is deferred to item 1 (fetch/resolve),
-  which needs it anyway and would otherwise load it twice. No disk-space
-  preflight check yet, either: std has no portable free-space API and
-  cap-std doesn't expose one; `rustix` (already a transitive dependency via
-  cap-std) has `fs::statvfs` on Linux if/when a real staging failure makes
-  this worth adding as a direct dependency.
+  Manifest/repository-policy loading is deferred to the item below
+  (fetch/resolve), which needs it anyway and would otherwise load it twice.
+  No disk-space preflight check yet, either: std has no portable free-space
+  API and cap-std doesn't expose one; `rustix` (already a transitive
+  dependency via cap-std) has `fs::statvfs` on Linux if/when a real staging
+  failure makes this worth adding as a direct dependency;
+- implemented revision resolution (`src/deploy/resolve.rs`):
+  `resolve_allowed_revision` runs one bounded `git ls-remote <url>
+  refs/heads/<branch>...` (explicit argv via the Phase 1 runner, no shell)
+  and accepts the request only if the requested `GitCommitSha` is the
+  *current tip* of one of the manifest's allowed branches — a syntactically
+  valid object ID is not authorization by itself, matching
+  `docs/site-model.md`. This is a pure read against the remote: no clone, no
+  local working tree, so it needs no per-site UID/GID drop (that becomes
+  required starting at the next item, which does write into a site-owned
+  directory). An optional SSH identity file pins `core.sshCommand` for this
+  one call; the path must already be engine-derived (an installed
+  credential), never raw request input, since git itself shell-interprets
+  that value when invoking `ssh`. Tested against a real local `git`
+  repository (`git ls-remote` accepts a plain filesystem path), not a mock —
+  covers an authorized branch tip, an unrelated revision, a revision on a
+  non-allow-listed branch, and an unreachable remote.
 
 Work items, in order:
 
-1. Fetch and resolve an allowed revision without shell interpolation.
-2. Prepare an isolated staging release.
-3. Run bounded validation steps.
-4. Perform one explicit atomic switch.
-5. Persist result metadata and emit an audit event.
-6. Clean up according to bounded retention rules.
-7. Add end-to-end success, failure, disconnect, and retry tests.
-8. Advertise `site.deploy` only after all previous items pass.
+1. Prepare an isolated staging release.
+2. Run bounded validation steps.
+3. Perform one explicit atomic switch.
+4. Persist result metadata and emit an audit event.
+5. Clean up according to bounded retention rules.
+6. Add end-to-end success, failure, disconnect, and retry tests.
+7. Advertise `site.deploy` only after all previous items pass.
 
 Exit criteria:
 
