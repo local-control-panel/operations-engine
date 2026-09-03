@@ -71,8 +71,7 @@ mod tests {
     #[test]
     fn new_artifact_error_codes_have_stable_protocol_values() {
         assert_eq!(
-            serde_json::to_string(&ErrorCode::ArtifactFetchFailed)
-                .expect("code should serialize"),
+            serde_json::to_string(&ErrorCode::ArtifactFetchFailed).expect("code should serialize"),
             "\"ARTIFACT_FETCH_FAILED\""
         );
         assert_eq!(
