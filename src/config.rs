@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::site::{SiteId, SiteRelativePath, TrustedRoot, ValidationError};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug)]
@@ -12,6 +12,7 @@ pub struct EngineConfig {
     pub content_roots: Vec<TrustedRoot>,
     pub state_root: TrustedRoot,
     pub credential_root: TrustedRoot,
+    pub ingress_root: TrustedRoot,
 }
 
 impl EngineConfig {
@@ -41,8 +42,11 @@ impl EngineConfig {
 
         let state_root = TrustedRoot::parse(raw.state_root)?;
         let credential_root = TrustedRoot::parse(raw.credential_root)?;
+        let ingress_root = TrustedRoot::parse(raw.ingress_root)?;
         if content_roots.iter().any(|content| {
-            roots_overlap(content, &state_root) || roots_overlap(content, &credential_root)
+            roots_overlap(content, &state_root)
+                || roots_overlap(content, &credential_root)
+                || roots_overlap(content, &ingress_root)
         }) {
             return Err(ConfigError::PrivilegedRootOverlapsContent);
         }
@@ -51,6 +55,7 @@ impl EngineConfig {
             content_roots,
             state_root,
             credential_root,
+            ingress_root,
         })
     }
 
@@ -145,6 +150,7 @@ struct RawEngineConfig {
     content_roots: Vec<String>,
     state_root: String,
     credential_root: String,
+    ingress_root: String,
 }
 
 #[derive(Deserialize)]
@@ -264,10 +270,11 @@ mod tests {
 
     fn config_json() -> &'static str {
         r#"{
-          "schemaVersion": 1,
+          "schemaVersion": 2,
           "contentRoots": ["/var/www"],
           "stateRoot": "/var/lib/operations-engine",
-          "credentialRoot": "/var/lib/operations-engine-credentials"
+          "credentialRoot": "/var/lib/operations-engine-credentials",
+          "ingressRoot": "/var/lib/operations-engine-ingress"
         }"#
     }
 
@@ -314,6 +321,18 @@ mod tests {
         let overlapping = config_json().replace(
             "\"/var/lib/operations-engine\"",
             "\"/var/www/engine-state\"",
+        );
+        assert_eq!(
+            EngineConfig::from_json(&overlapping).unwrap_err(),
+            ConfigError::PrivilegedRootOverlapsContent
+        );
+    }
+
+    #[test]
+    fn ingress_root_must_not_overlap_content() {
+        let overlapping = config_json().replace(
+            "\"/var/lib/operations-engine-ingress\"",
+            "\"/var/www/engine-ingress\"",
         );
         assert_eq!(
             EngineConfig::from_json(&overlapping).unwrap_err(),
