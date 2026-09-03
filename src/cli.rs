@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
@@ -37,6 +39,12 @@ pub enum Command {
         #[command(subcommand)]
         command: EngineCommand,
     },
+
+    /// Ingress route-configuration operations.
+    Ingress {
+        #[command(subcommand)]
+        command: IngressCommand,
+    },
 }
 
 impl Command {
@@ -47,6 +55,7 @@ impl Command {
             Self::Doctor => "doctor",
             Self::Site { command } => command.operation(),
             Self::Engine { command } => command.operation(),
+            Self::Ingress { command } => command.operation(),
         }
     }
 }
@@ -141,6 +150,51 @@ impl EngineCommand {
         match self {
             Self::Install { .. } => "engine.install",
             Self::Rollback { .. } => "engine.rollback",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum IngressCommand {
+    /// Atomically replace one domain's live ingress route file, validating
+    /// the new content before it can reach the live path and restoring the
+    /// previous content if the live reload rejects it.
+    ActivateConfig {
+        /// The domain whose route file is being replaced. The engine
+        /// derives the file name from it (`<domain>.caddyfile`).
+        #[arg(long)]
+        domain: String,
+
+        /// Path to a file holding the complete new contents of the route
+        /// file. Whole-file replacement, not a patch: read the current
+        /// file, transform it, and pass the result here.
+        #[arg(long = "content-file")]
+        content_file: PathBuf,
+
+        /// The SHA-256 digest of the route file's current live contents,
+        /// as an optimistic-concurrency precondition. Omit only when no
+        /// config is expected to exist yet for this domain (asserts
+        /// absence — fails if one is already live). To update an existing
+        /// config, pass its current content hash.
+        #[arg(long = "expected-hash")]
+        expected_hash: Option<String>,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of activating twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl IngressCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::ActivateConfig { .. } => "ingress.activateConfig",
         }
     }
 }

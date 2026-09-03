@@ -43,7 +43,8 @@ fn capabilities_describe_only_implemented_operations() {
             "site.deploy",
             "site.rollback",
             "engine.install",
-            "engine.rollback"
+            "engine.rollback",
+            "ingress.activateConfig"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
@@ -120,4 +121,50 @@ fn engine_install_requires_a_version_and_request_id() {
         stderr.contains("--version"),
         "clap should report the missing --version flag"
     );
+}
+
+#[test]
+fn ingress_activate_config_requires_a_domain_content_file_and_request_id() {
+    let output = Command::cargo_bin("ops-engine")
+        .expect("binary should build")
+        .args(["ingress", "activate-config"])
+        .assert()
+        .failure();
+    let stderr =
+        String::from_utf8(output.get_output().stderr.clone()).expect("stderr should be UTF-8");
+    assert!(
+        stderr.contains("--domain"),
+        "clap should report the missing --domain flag"
+    );
+    assert!(
+        stderr.contains("--content-file"),
+        "clap should report the missing --content-file flag"
+    );
+}
+
+#[test]
+fn ingress_activate_config_rejects_an_invalid_domain_before_touching_the_filesystem() {
+    let output = Command::cargo_bin("ops-engine")
+        .expect("binary should build")
+        .args([
+            "ingress",
+            "activate-config",
+            "--domain",
+            "NOT A DOMAIN",
+            "--content-file",
+            "/nonexistent/path/should/not/be/read.caddyfile",
+            "--request-id",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value =
+        serde_json::from_slice(&output).expect("stdout should contain one JSON response");
+
+    assert_eq!(response["operation"], "ingress.activateConfig");
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "INVALID_INPUT");
 }

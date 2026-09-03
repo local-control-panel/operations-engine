@@ -5,7 +5,7 @@ use crate::protocol::{Response, ResponseBuildError};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CapabilitiesResult {
-    operations: [&'static str; 7],
+    operations: [&'static str; 8],
     output_formats: [&'static str; 1],
     features: Features,
 }
@@ -30,6 +30,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "site.rollback",
                 "engine.install",
                 "engine.rollback",
+                "ingress.activateConfig",
             ],
             output_formats: ["json"],
             features: Features {
