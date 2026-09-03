@@ -1,9 +1,10 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 6 — client integration and compatibility (Phase 4's one
-remaining item is itself blocked on this phase; see its own section below)
-Last updated: 2026-09-02
+Current phase: 4 — Phase 6 (client integration) is now complete, which
+unblocks Phase 4's one remaining item (an end-to-end disconnect test); it
+just hasn't been written yet. See both phases' sections below.
+Last updated: 2026-09-03
 
 This file is the shared implementation plan for Operations Engine. It is the
 authoritative source for what we build next, in what order, and what must be
@@ -449,9 +450,15 @@ Work items, in order:
 
 1. Add end-to-end disconnect tests. Success, failure, and retry are
    already covered by `tests/deploy.rs`; disconnect specifically needs a
-   real transport to test honestly (there is none yet — SSH integration is
-   Phase 6), so this is the one item genuinely blocked on later phases
-   rather than on more code here.
+   real transport to test honestly. That transport now exists — Phase 6
+   landed a real SSH-connected client (`website-control-panel`) driving
+   this engine against a real Docker test server — so this item is no
+   longer blocked on a later phase not existing, it is simply not written
+   yet. It belongs in `website-control-panel`'s own workflow test suite
+   (`src-tauri/src/workflow_tests/ops_engine_deploy_rollback.rs`), which
+   already owns the real SSH connection, not in this repo's `tests/`
+   (those exercise the engine against a local Git "remote" with no real
+   transport to disconnect).
 
 Exit criteria:
 
@@ -461,7 +468,8 @@ Exit criteria:
   `PostCommitRecordFailed` plus the `TransactionRecordIncomplete` warning;
 - disconnects have a documented and tested recovery path — **not met**:
   documented (see the migration/site-model notes on SSH disconnect
-  recovery) but not tested; blocked on Phase 6 transport;
+  recovery) but not tested; no longer blocked on Phase 6 (complete), just
+  not yet written;
 - repeated idempotent requests return the original outcome — met;
 - the control plane needs one structured operation rather than a shell
   sequence — met, `ops-engine site deploy` is that one operation.
@@ -590,27 +598,63 @@ validation code.
 
 ## Phase 6 — client integration and compatibility
 
-Status: pending
+Status: complete
 
 Goal: integrate one real control plane while keeping client and engine releases
 independent.
 
-Work items:
+Completed (all in `website-control-panel`, not this repo):
 
-- define the supported protocol-version window;
-- implement version and capability negotiation in the client;
-- safely reject incompatible engines;
-- map progress and stable error codes to client state;
-- test older-client/newer-engine and newer-client/older-engine combinations;
-- document bootstrap behavior when the engine is absent;
-- compare SSH round trips, failure recovery, and orchestration complexity with
-  the previous implementation.
+- protocol-version window defined and enforced:
+  `check_protocol_version` (`src-tauri/src/ops_engine/mod.rs`) accepts
+  exactly version 1 and rejects both lower and higher, run on every
+  envelope before any operation-specific handling — tested for the
+  accept case and both reject directions;
+- version and capability negotiation implemented in the client: every
+  `opsEngine:*` call goes through `capabilities` first, cached per
+  `server_id` for the life of the SSH connection
+  (`ops_engine::CapabilityCache`, invalidated on reconnect in
+  `commands/ssh.rs`) rather than re-fetched per call;
+- incompatible engines are rejected before any mutation begins — the
+  protocol-version check happens ahead of dispatch, not inside a specific
+  operation;
+- progress and stable error codes are mapped to client state: typed
+  `#[derive(Deserialize)]` envelopes (`ops_engine/envelope.rs`) replace
+  hand-written output parsing, and `opsEngine:log` (`ProgressStepEvent`)
+  carries progress to the renderer (still unconsumed by any UI — that is
+  tracked separately, not a Phase 6 gap);
+- older-client/older-engine and older-engine compatibility are tested
+  directly (`workflow_tests/ops_engine_deploy_rollback.rs`:
+  `older_engine_build_genuinely_lacks_site_rollback`,
+  `both_vendored_engine_builds_report_protocol_version_one`) against two
+  real vendored engine binaries built from pinned commits
+  (`docker/test-server/build-ops-engine.sh`). The newer-client/older-
+  engine gap called out in `docs/ops-engine-comparison.md` (no way yet to
+  target a specific installed binary) was closed separately in
+  `website-control-panel` commit `bd22b8c`. The newer-engine/older-client
+  direction has no real coverage yet, honestly: this repo has shipped
+  exactly one protocol version so far, so there is nothing newer to test
+  against. Revisit once a protocol v2 exists;
+- bootstrap behavior when the engine is absent is documented and tested:
+  a missing/not-on-PATH `ops-engine` returns "ops-engine is not installed
+  (or not on PATH) on this server", asserted in `ops_engine/mod.rs`'s own
+  test suite;
+- SSH round trips, failure recovery, and orchestration complexity were
+  compared against the previous shell-based path in
+  `docs/devdocs/ops-engine-comparison.md`, measured against the real
+  Docker test server rather than estimated (deploy: 2 round trips → 1;
+  rollback: 1 → 1, same, but gains transactional idempotent replay the
+  old path never had) — including the honest added costs (a new
+  capability cache, a required enrollment step, elevated `sudo`
+  invocation, two vendored binaries for compatibility testing).
 
 Exit criteria:
 
-- neither repository requires a simultaneous merge or release;
-- incompatibility fails before a mutation begins;
-- the pilot demonstrates measurable operational or maintenance improvement.
+- neither repository requires a simultaneous merge or release — met, the
+  two repos ship and version independently;
+- incompatibility fails before a mutation begins — met;
+- the pilot demonstrates measurable operational or maintenance
+  improvement — met, see the comparison doc's "Net read".
 
 ## Phase 7 — release and production hardening
 
@@ -681,6 +725,7 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Rollback reuses `deploy::validate::validate_staged_release` and `deploy::activate::activate` verbatim rather than forking rollback-owned copies. | Neither function ever depended on "freshly staged" — both were already generic over "a Git working tree at this path" / "a `SiteId` and `ReleaseId`" respectively. Forking them would only create two integrity checks and two atomic-switch implementations to keep in sync for no behavioral difference. |
 | 2026-09-02 | Rollback runs the same best-effort `deploy::cleanup::prune_old_releases` after a successful switch, passing the new target as `active_release`; it does not reset or otherwise special-case "recency" for the release just switched away from. | Keeps retention behavior identical and predictable across both mutation types instead of inventing rollback-specific retention semantics; a rolled-back-from release stays retained immediately afterward purely because cleanup already keeps the most recent N regardless of which operation is calling it. |
 | 2026-09-02 | `RollbackResult` has no `commit` field, unlike `DeployResult`. | Deploy's `commit` echoes an already-validated request input (`DeployRequest::revision`); rollback's request carries a `ReleaseId`, not a commit, so there is no equivalent input to echo without an extra unrequired subprocess call. `releaseId`/`previousReleaseId` alone already satisfy the exit criterion to identify both releases safely. |
+| 2026-09-03 | Phase 6 marked complete; Phase 4's disconnect-test item reclassified from "blocked" to "actionable, not yet written". | `website-control-panel` already has a full, tested client integration (protocol negotiation, capability cache, typed envelopes, older-engine compatibility test, comparison doc) — this repo's `PLAN.md` had not been updated to reflect it. The one remaining Phase 6 gap (newer-engine/older-client coverage) is structurally untestable until a protocol v2 ships, so it is recorded as deferred rather than blocking. |
 
 ## Open decisions
 
