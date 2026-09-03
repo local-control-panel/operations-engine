@@ -92,6 +92,11 @@ impl InstallError {
                 ErrorCode::UnsupportedPlatform,
                 "this host's architecture has no published engine build".to_owned(),
             ),
+            Self::Verify(verify::Error::Fetch(fetch::Error::Timeout))
+            | Self::Fetch(fetch::Error::Timeout) => (
+                ErrorCode::Timeout,
+                "fetching the release exceeded its time bound".to_owned(),
+            ),
             Self::Verify(verify::Error::Fetch(_)) => (
                 ErrorCode::ArtifactFetchFailed,
                 "the release manifest could not be fetched".to_owned(),
