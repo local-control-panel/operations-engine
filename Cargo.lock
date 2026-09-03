@@ -502,6 +502,7 @@ dependencies = [
  "assert_cmd",
  "cap-std",
  "clap",
+ "libc",
  "minisign-verify",
  "serde",
  "serde_json",

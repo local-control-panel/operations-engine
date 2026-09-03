@@ -22,6 +22,9 @@ sha2 = "0.11.0"
 ureq = "3.4.0"
 uuid = { version = "1.18", features = ["serde"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.20"

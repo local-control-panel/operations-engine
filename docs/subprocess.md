@@ -13,6 +13,12 @@ Every call defines:
 - maximum retained stdout and stderr byte counts;
 - a cancellation token.
 
+Optionally, a call may also set an explicit working directory
+(`ProcessRequest::current_dir`), wired straight through to
+`std::process::Command::current_dir`. This exists so operation code that
+needs "run this in that directory" never reaches for a `cd <dir> &&` shell
+prefix to get it.
+
 The runner does not invoke a shell. Operation code must not concatenate an
 executable and untrusted input into a command string.
 

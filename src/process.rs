@@ -1,6 +1,7 @@
 use std::{
     ffi::{OsStr, OsString},
     io::{self, Read},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -48,6 +49,8 @@ impl Default for ProcessLimits {
 pub struct ProcessRequest {
     program: OsString,
     args: Vec<OsString>,
+    current_dir: Option<PathBuf>,
+    env_overrides: Vec<(OsString, OsString)>,
     #[cfg(unix)]
     run_as: Option<(u32, u32)>,
 }
@@ -57,6 +60,8 @@ impl ProcessRequest {
         Self {
             program: program.as_ref().to_owned(),
             args: Vec::new(),
+            current_dir: None,
+            env_overrides: Vec::new(),
             #[cfg(unix)]
             run_as: None,
         }
@@ -69,6 +74,31 @@ impl ProcessRequest {
     {
         self.args
             .extend(args.into_iter().map(|arg| arg.as_ref().to_owned()));
+        self
+    }
+
+    /// Runs the child with `dir` as its working directory instead of
+    /// inheriting this process's own. Still argv-only: this sets the
+    /// standard `Command::current_dir`, never `cd <dir> &&` prepended to a
+    /// shell string, so callers that previously modeled "run in this
+    /// directory" as a shell one-liner (e.g. `website-control-panel`'s
+    /// `cd {base} && docker compose ...`) have a direct, shell-free
+    /// equivalent here.
+    pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.current_dir = Some(dir.into());
+        self
+    }
+
+    /// Overrides a single environment variable for the child, merged into
+    /// this process's own inherited environment (`std::process::Command`'s
+    /// default) rather than replacing it outright. This is a per-child
+    /// override, not a mutation of this process's own environment, so it
+    /// is safe to use concurrently (e.g. from multiple test threads
+    /// pointing `PATH` at different fixture directories) without any
+    /// process-wide synchronization.
+    pub fn env(mut self, key: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> Self {
+        self.env_overrides
+            .push((key.as_ref().to_owned(), value.as_ref().to_owned()));
         self
     }
 
@@ -186,6 +216,12 @@ pub fn run(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(dir) = &request.current_dir {
+        command.current_dir(dir);
+    }
+    for (key, value) in &request.env_overrides {
+        command.env(key, value);
+    }
     #[cfg(unix)]
     if let Some((uid, gid)) = request.run_as {
         use std::os::unix::process::CommandExt;
@@ -295,6 +331,56 @@ mod tests {
 
         assert_eq!(output.stdout.bytes, b"1234");
         assert!(output.stdout.truncated);
+    }
+
+    #[test]
+    fn env_overrides_a_single_variable_without_clearing_the_rest() {
+        // Uses `sh -c` (an absolute-search-free builtin) so this test does
+        // not depend on any external fixture executable, and asserts a
+        // second, non-overridden inherited variable survives — proving
+        // `env()` merges into the inherited environment rather than
+        // replacing it outright.
+        // SAFETY: this test only reads the parent's env via `var_os`; it
+        // never mutates it.
+        let inherited_key = "PATH";
+        let inherited_value =
+            std::env::var_os(inherited_key).expect("PATH should be set in the test environment");
+
+        let output = run(
+            &ProcessRequest::new("sh")
+                .args(["-c", "printf '%s\\n' \"$MARKER-$PATH\""])
+                .env("MARKER", "compose-env-override"),
+            &ProcessLimits::default(),
+            &CancellationToken::default(),
+        )
+        .expect("process should run");
+
+        let stdout = String::from_utf8_lossy(&output.stdout.bytes);
+        assert_eq!(
+            stdout.trim(),
+            format!("compose-env-override-{}", inherited_value.to_string_lossy())
+        );
+    }
+
+    #[test]
+    fn current_dir_changes_the_childs_working_directory() {
+        let temp = tempfile::tempdir().expect("temp directory should be created");
+        let canonical = temp
+            .path()
+            .canonicalize()
+            .expect("temp directory should canonicalize");
+
+        let output = run(
+            &ProcessRequest::new("pwd").current_dir(&canonical),
+            &ProcessLimits::default(),
+            &CancellationToken::default(),
+        )
+        .expect("process should run");
+
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout.bytes).trim(),
+            canonical.to_string_lossy()
+        );
     }
 
     #[test]
