@@ -116,6 +116,12 @@ impl ActivateConfigError {
                  restored and is live"
                     .to_owned(),
             ),
+            Self::Activate(activate::Error::ReloadFailedUnchanged(failure)) => (
+                compose_failure_code(failure, ErrorCode::ConfigReloadFailed),
+                "the configuration was already in place but failed to load; nothing was \
+                 changed"
+                    .to_owned(),
+            ),
             // Deliberately one code regardless of which half of the
             // recovery failed: every variant here means the same thing to
             // a client - do not retry, the live configuration needs an
@@ -581,7 +587,11 @@ mod tests {
         let error = run(
             &host,
             &docker,
-            &request(HashGuard::Unchecked, REQUEST_ID, None),
+            &request(
+                HashGuard::Sha256(ConfigHash::of(PREVIOUS.as_bytes())),
+                REQUEST_ID,
+                None,
+            ),
         )
         .expect_err("an unrecoverable reload failure must be reported");
 
@@ -617,7 +627,11 @@ mod tests {
 
         assert!(!result.activated);
         assert_eq!(host.transaction(REQUEST_ID)["status"], "COMMITTED");
-        assert!(docker.calls("reload").is_empty());
+        assert_eq!(
+            docker.calls("reload").len(),
+            1,
+            "a no-op still converges the running server onto the file"
+        );
     }
 
     #[test]
@@ -703,6 +717,12 @@ mod tests {
             ),
             (
                 ActivateConfigError::Activate(activate::Error::ReloadFailedAndRestored(
+                    activate::ComposeFailure::Rejected(diagnostics(false)),
+                )),
+                ErrorCode::ConfigReloadFailed,
+            ),
+            (
+                ActivateConfigError::Activate(activate::Error::ReloadFailedUnchanged(
                     activate::ComposeFailure::Rejected(diagnostics(false)),
                 )),
                 ErrorCode::ConfigReloadFailed,

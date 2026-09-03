@@ -115,21 +115,25 @@ impl fmt::Display for ConfigHash {
 /// The optimistic-concurrency precondition an activation is allowed to
 /// proceed under.
 ///
-/// `website-control-panel` expresses this as a single `Option<&str>` where
-/// `None` means "the file must not currently exist"
-/// (`activate_caddyfile_checked`'s doc comment) — while its *unchecked*
-/// `activate_caddyfile`, which ~27 call sites use, means "no precondition
-/// at all" by simply being a different function. Collapsing those two
-/// codebases' three real states onto one `Option` here would make the
-/// safest-looking call (`expected_prior_hash: None`) mean two opposite
-/// things depending on which function you reached for, so they are three
-/// named variants instead.
+/// Every activation carries one. There is deliberately no "skip the
+/// check" variant: the plan makes the hash guard part of this operation's
+/// contract, not an option, so the two variants below are the only two
+/// states a request can be in — either the caller believes there is no
+/// live file yet, or it read one and is telling us what it read.
+///
+/// `website-control-panel` reaches the same two states through two
+/// different functions plus one overloaded `Option<&str>`:
+/// `activate_caddyfile_checked(.., None)` means "must not currently
+/// exist" (its own doc comment), while the ~27 call sites on unchecked
+/// `activate_caddyfile` mean "no precondition at all" by calling
+/// something else entirely. Naming the states removes that ambiguity, and
+/// dropping the unchecked one removes the silent-overwrite default with
+/// it — nothing this pilot's caller does needs it (`disable_basic_auth`
+/// always has a prior file it just read, so it always has a real hash to
+/// send). A future caller that genuinely wants "overwrite regardless"
+/// should have to add that path back deliberately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HashGuard {
-    /// No precondition: activate whatever is there now. The equivalent of
-    /// calling `activate_caddyfile` rather than
-    /// `activate_caddyfile_checked`.
-    Unchecked,
     /// The route file must not currently exist — a first activation for
     /// this domain, refusing to silently overwrite one that appeared in
     /// the meantime.
@@ -144,7 +148,6 @@ impl HashGuard {
     /// (`None` when it does not exist).
     pub fn is_satisfied_by(&self, current: Option<&[u8]>) -> bool {
         match (self, current) {
-            (Self::Unchecked, _) => true,
             (Self::Absent, current) => current.is_none(),
             (Self::Sha256(expected), Some(bytes)) => &ConfigHash::of(bytes) == expected,
             (Self::Sha256(_), None) => false,
@@ -205,15 +208,24 @@ impl ActivateConfigRequest {
         })
     }
 
-    /// Parses the wire form of `guard`, where a caller supplies either an
-    /// expected hash string or nothing. Separate from `parse` so a caller
-    /// that already holds a `HashGuard` (or wants `Absent`, which has no
-    /// string form) is not forced through a string round-trip.
+    /// Parses the wire form of `guard`: a caller supplies either the hash
+    /// it read or nothing.
+    ///
+    /// Omitting the hash means `Absent` — "there is no live file for this
+    /// domain yet" — and *not* "activate regardless of what is there". A
+    /// caller that omits it while a live file does exist gets a hash
+    /// mismatch, which is the point: the omission is a claim about the
+    /// current state, and a wrong claim has to fail closed. Nothing a
+    /// client can send reaches an unguarded activation, because no such
+    /// state exists (see `HashGuard`).
+    ///
+    /// Separate from `parse` so a caller that already holds a `HashGuard`
+    /// is not forced through a string round-trip.
     pub fn guard_from_expected_hash(
         expected: Option<&str>,
     ) -> Result<HashGuard, ActivateConfigRequestError> {
         match expected {
-            None => Ok(HashGuard::Unchecked),
+            None => Ok(HashGuard::Absent),
             Some(value) => ConfigHash::parse(value)
                 .map(HashGuard::Sha256)
                 .map_err(|_| ActivateConfigRequestError::InvalidExpectedHash),
@@ -282,12 +294,6 @@ mod tests {
     }
 
     #[test]
-    fn unchecked_guard_accepts_any_current_state() {
-        assert!(HashGuard::Unchecked.is_satisfied_by(None));
-        assert!(HashGuard::Unchecked.is_satisfied_by(Some(b"anything")));
-    }
-
-    #[test]
     fn absent_guard_accepts_only_a_missing_file() {
         assert!(HashGuard::Absent.is_satisfied_by(None));
         assert!(!HashGuard::Absent.is_satisfied_by(Some(b"")));
@@ -336,7 +342,7 @@ mod tests {
                 ActivateConfigRequest::parse(
                     "NOT A DOMAIN",
                     "",
-                    HashGuard::Unchecked,
+                    HashGuard::Absent,
                     REQUEST_ID,
                     None,
                 ),
@@ -346,7 +352,7 @@ mod tests {
                 ActivateConfigRequest::parse(
                     "example.com",
                     "x".repeat(MAX_CONTENT_BYTES + 1),
-                    HashGuard::Unchecked,
+                    HashGuard::Absent,
                     REQUEST_ID,
                     None,
                 ),
@@ -356,7 +362,7 @@ mod tests {
                 ActivateConfigRequest::parse(
                     "example.com",
                     "",
-                    HashGuard::Unchecked,
+                    HashGuard::Absent,
                     "not-a-uuid",
                     None,
                 ),
@@ -366,7 +372,7 @@ mod tests {
                 ActivateConfigRequest::parse(
                     "example.com",
                     "",
-                    HashGuard::Unchecked,
+                    HashGuard::Absent,
                     REQUEST_ID,
                     Some("has space"),
                 ),
@@ -383,8 +389,25 @@ mod tests {
         );
         assert_eq!(
             ActivateConfigRequest::guard_from_expected_hash(None)
-                .expect("no expected hash should mean no precondition"),
-            HashGuard::Unchecked
+                .expect("an omitted hash is a claim, not an opt-out"),
+            HashGuard::Absent
+        );
+    }
+
+    /// The wire form has exactly two reachable states, and neither of
+    /// them is "activate regardless of what is there". Omitting the hash
+    /// is a claim that no live file exists, which `HashGuard::Absent`
+    /// makes the engine verify rather than assume.
+    #[test]
+    fn omitting_the_expected_hash_asserts_absence_rather_than_skipping_the_check() {
+        let guard = ActivateConfigRequest::guard_from_expected_hash(None)
+            .expect("an omitted hash should parse");
+
+        assert_eq!(guard, HashGuard::Absent);
+        assert!(guard.is_satisfied_by(None));
+        assert!(
+            !guard.is_satisfied_by(Some(b"a live route file")),
+            "omitting the hash must not authorize overwriting an existing file"
         );
     }
 
@@ -393,7 +416,7 @@ mod tests {
         let request = ActivateConfigRequest::parse(
             "example.com",
             "x".repeat(MAX_CONTENT_BYTES),
-            HashGuard::Unchecked,
+            HashGuard::Absent,
             REQUEST_ID,
             None,
         )

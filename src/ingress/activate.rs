@@ -69,6 +69,10 @@ pub enum Error {
     /// fully restored *and* reloaded — so what is live now is exactly what
     /// was live before this call.
     ReloadFailedAndRestored(ComposeFailure),
+    /// The route file already held the requested content, so nothing was
+    /// written — but the reload that has to confirm the running server is
+    /// actually on it failed. Nothing on disk was changed by this call.
+    ReloadFailedUnchanged(ComposeFailure),
     /// The reload after activation failed and recovery did not complete.
     /// Both failures are reported, because the second one is the reason
     /// this needs an operator rather than a retry.
@@ -84,15 +88,25 @@ pub enum Error {
 /// contents are retained in while the new ones are proven live; see
 /// `execute.rs` for what this engine passes.
 ///
-/// Returns `activated: false` without writing or reloading anything when
-/// the route file already holds exactly `content`. This is the one
-/// deliberate divergence from `activate_caddyfile`, which always rewrites
-/// and always reloads: the caller of a whole-file-replacement API cannot
-/// tell "already in the requested state" from "changed" without it, and
-/// re-running a converged mutation is the common case (`disable_basic_auth`
-/// on a site that already has no basic auth). It is only ever taken when
-/// the bytes on disk are byte-identical to the bytes requested, so it
-/// cannot skip a real change.
+/// When the route file already holds exactly `content`, the write, the
+/// backup, and the rename are all skipped and the call reports
+/// `activated: false` — but the reload still runs. That last part is not
+/// optional. "The file already says X" does not imply "the running server
+/// is already on X": a previous attempt can leave exactly that divergence
+/// behind, by renaming the new content into place and then failing both
+/// its reload *and* its restore (`RecoveryFailed { restore:
+/// RestoreFailure::File(_) }`). Skipping the reload here would make the
+/// operator's or the client's natural next move — re-submitting the same
+/// request — return success while the server stayed on the stale config.
+/// `activate_caddyfile` cannot have that failure mode because it always
+/// reloads, so neither does this.
+///
+/// Reporting `activated: false` for that case is the one deliberate
+/// divergence from `activate_caddyfile` that remains, and it is only about
+/// what is *reported*: a caller of a whole-file-replacement API cannot
+/// otherwise tell "already in the requested state" from "changed", and
+/// re-running a converged mutation is the common case
+/// (`disable_basic_auth` on a site that already has no basic auth).
 pub fn activate(
     ingress_root: &TrustedRoot,
     domain: &Domain,
@@ -109,7 +123,13 @@ pub fn activate(
         return Err(Error::HashGuardMismatch);
     }
     if current.as_deref() == Some(content.as_bytes()) {
-        return Ok(Activation { activated: false });
+        // Converge, do not assume. See this function's doc comment for the
+        // exact sequence that leaves the file already correct while the
+        // running server is not.
+        return match reload(compose) {
+            Ok(()) => Ok(Activation { activated: false }),
+            Err(failure) => Err(Error::ReloadFailedUnchanged(failure)),
+        };
     }
 
     // The `.tmp` sibling is deliberately not named `*.caddyfile`, so the
@@ -348,6 +368,11 @@ mod tests {
         Domain::parse(DOMAIN).expect("test domain should be valid")
     }
 
+    /// The guard a caller that just read `contents` would send.
+    fn guard_on(contents: &str) -> HashGuard {
+        HashGuard::Sha256(ConfigHash::of(contents.as_bytes()))
+    }
+
     fn run(
         root: &Root,
         docker: &FakeDocker,
@@ -465,22 +490,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unchecked_guard_activates_over_whatever_is_there() {
-        let root = ingress_root(Some(PREVIOUS));
-        let docker = FakeDocker::new();
-
-        run(&root, &docker, UPDATED, HashGuard::Unchecked)
-            .expect("an unchecked activation should apply");
-
-        assert_eq!(root.live().as_deref(), Some(UPDATED));
-    }
-
-    #[test]
     fn validate_failure_leaves_the_live_file_untouched() {
         let root = ingress_root(Some(PREVIOUS));
         let docker = FakeDocker::new().failing("validate", "all");
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Unchecked)
+        let error = run(&root, &docker, UPDATED, guard_on(PREVIOUS))
             .expect_err("a rejected config must not activate");
 
         assert!(matches!(
@@ -514,7 +528,7 @@ mod tests {
         // second, for the restored previous config, succeeds.
         let docker = FakeDocker::new().failing("reload", "1");
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Unchecked)
+        let error = run(&root, &docker, UPDATED, guard_on(PREVIOUS))
             .expect_err("a config the server refuses to load must not stay live");
 
         assert!(matches!(
@@ -553,7 +567,7 @@ mod tests {
         let root = ingress_root(Some(PREVIOUS));
         let docker = FakeDocker::new().failing("reload", "all");
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Unchecked)
+        let error = run(&root, &docker, UPDATED, guard_on(PREVIOUS))
             .expect_err("a config the server refuses to load must not stay live");
 
         // Both halves are reported: the original reload failure and the
@@ -575,23 +589,57 @@ mod tests {
         assert_eq!(docker.calls("reload").len(), 2);
     }
 
+    /// Re-submitting the current contents skips the write, the backup and
+    /// the rename - but *not* the reload. "The file already says X" does
+    /// not imply "the server is already running X"; see the next test for
+    /// the sequence that produces exactly that divergence.
     #[test]
-    fn identical_content_is_a_no_op_that_touches_nothing() {
+    fn identical_content_skips_the_write_but_still_reloads() {
         let root = ingress_root(Some(PREVIOUS));
         let docker = FakeDocker::new();
 
-        let activation = run(
-            &root,
-            &docker,
-            PREVIOUS,
-            HashGuard::Sha256(ConfigHash::of(PREVIOUS.as_bytes())),
-        )
-        .expect("re-submitting the current contents should succeed");
+        let activation = run(&root, &docker, PREVIOUS, guard_on(PREVIOUS))
+            .expect("re-submitting the current contents should succeed");
 
         assert_eq!(activation, Activation { activated: false });
         assert_eq!(root.live().as_deref(), Some(PREVIOUS));
+        assert!(
+            docker.calls("validate").is_empty(),
+            "unchanged content needs no revalidation"
+        );
+        assert_eq!(
+            docker.calls("reload").len(),
+            1,
+            "the running server must still be converged onto the file"
+        );
+    }
+
+    /// The regression this reload exists to prevent. A previous attempt
+    /// can leave the live *file* holding the new content while the running
+    /// server is still on the old one: rename in, reload fails, restore
+    /// fails too. Standing in for that state directly - the file already
+    /// holds the requested content, the server does not - a re-submission
+    /// must not report success just because the bytes match.
+    #[test]
+    fn a_converge_reload_failure_is_reported_instead_of_a_false_success() {
+        let root = ingress_root(Some(UPDATED));
+        let docker = FakeDocker::new().failing("reload", "all");
+
+        let error = run(&root, &docker, UPDATED, guard_on(UPDATED))
+            .expect_err("a server that will not load the current file is not a success");
+
+        assert!(
+            matches!(
+                error,
+                Error::ReloadFailedUnchanged(ComposeFailure::Rejected(_))
+            ),
+            "unexpected error: {error:?}"
+        );
+        // Nothing on disk was touched: this call only tried to converge
+        // the server onto what was already there.
+        assert_eq!(root.live().as_deref(), Some(UPDATED));
+        assert_eq!(root.entries(), vec![ROUTE.to_owned()]);
         assert!(docker.calls("validate").is_empty());
-        assert!(docker.calls("reload").is_empty());
     }
 
     /// The guard is checked before the no-op short-circuit, so a caller
@@ -625,7 +673,7 @@ mod tests {
             &root.trusted,
             &domain(),
             UPDATED,
-            &HashGuard::Unchecked,
+            &guard_on(PREVIOUS),
             SUFFIX,
             &access,
         )
@@ -657,7 +705,7 @@ mod tests {
         symlink(&target, root.dir.path().join(ROUTE)).expect("symlink should be created");
         let docker = FakeDocker::new();
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Unchecked)
+        let error = run(&root, &docker, UPDATED, HashGuard::Absent)
             .expect_err("a route escaping the root must not be activated");
 
         assert!(matches!(error, Error::Io(_)), "unexpected error: {error:?}");
