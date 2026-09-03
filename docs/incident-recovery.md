@@ -16,6 +16,25 @@
    dropped connection returns the original outcome rather than
    double-applying.
 
+Two properties make step 1 dependable, and both matter because the
+automation user's sudo policy permits nothing but `ops-engine` itself
+(`docs/site-model.md`), so a `/usr/local/bin/ops-engine` that cannot run
+would leave no recovery path over the control plane's connection:
+
+- **A binary that cannot run here is never activated.** `engine install`
+  runs the staged copy's own `version` command before switching
+  `/usr/local/bin/ops-engine`. If it does not start, or reports a version
+  other than the one requested, the install fails with
+  `ARTIFACT_NOT_RUNNABLE`/`ARTIFACT_VERIFICATION_FAILED` and the running
+  binary is left untouched.
+- **The first install on a host retains what it replaces.** On a server
+  with no prior managed install, the binary already at
+  `/usr/local/bin/ops-engine` is copied into the engine's `versions/`
+  directory before it is overwritten — under the version it reports for
+  itself, or as `pre-managed` if it cannot say. So `engine rollback` works
+  on the first upgrade too, and reports `pre-managed` as the version it
+  restored.
+
 ## Opt-in rollout to test servers
 
 There is no separate "rollout channel" mechanism — `engine install`
