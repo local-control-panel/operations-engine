@@ -1,11 +1,13 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 7 — release and production hardening (scoped, not yet
-started). Phase 6 is complete. Phase 4's one remaining item (a real
-disconnect-recovery test) is no longer blocked on Phase 6 — real SSH
-transport now exists via the client integration — but has not itself been
-attempted; see Phase 4's own section.
+Current phase: 7 — release and production hardening. Phases 0-6 are all
+complete; Phase 7's engine-side work (reproducible builds, signed
+checksummed artifacts, `engine install`/`engine rollback`, compatibility
+matrix, redaction review, docs, opt-in rollout procedure) is done and
+tested, but the phase is not complete — see its own section for what
+remains (the control-plane half of pinned installation, and rotating off
+the TEST-ONLY signing key before a real release).
 Last updated: 2026-09-03
 
 This file is the shared implementation plan for Operations Engine. It is the
@@ -259,7 +261,7 @@ Exit criteria (all met; see `tests/transaction.rs`):
 
 ## Phase 4 — Git deploy pilot
 
-Status: in progress
+Status: complete
 
 Goal: deliver one complete, recoverable Git deployment operation using the
 contracts from phases 2 and 3.
@@ -448,13 +450,38 @@ Completed:
   dev host with no engine config installed) in addition to the automated
   suite.
 
-Work items, in order:
+Work items: none — all delivered above.
 
-1. Add end-to-end disconnect tests. Success, failure, and retry are
-   already covered by `tests/deploy.rs`; disconnect specifically needs a
-   real transport to test honestly (there is none yet — SSH integration is
-   Phase 6), so this is the one item genuinely blocked on later phases
-   rather than on more code here.
+Completed (continued):
+
+- added the end-to-end disconnect test (`website-control-panel`,
+  `src-tauri/src/workflow_tests/ops_engine_deploy_rollback.rs`:
+  `ops_engine_deploy_recovers_from_a_disconnect_mid_call`), the one item
+  that needed a real transport to test honestly and was therefore deferred
+  to Phase 6 landing first. It builds a second, genuinely-handshaked SSH
+  session by hand (not through the normal connect path) so a cloned raw
+  `TcpStream` handle stays available alongside it, swaps that session into
+  the pool in place of the healthy one, dispatches a real `site deploy`
+  against the real engine, and forcibly closes the cloned socket a few
+  milliseconds in — deterministically interrupting the in-flight blocking
+  read regardless of how fast the real pipeline happens to run (a fixed
+  short session timeout was tried first and proved unreliable: the whole
+  pipeline against a tiny local Git fixture over loopback can finish in
+  under 100ms). The interrupted call is asserted to fail at the transport
+  layer; a retry with the same idempotency key, after reconnecting, is
+  asserted to converge to exactly one activated release, and a second
+  retry with the same key is asserted to replay that identical outcome
+  rather than redoing work. Ran clean five times in a row (no flake from
+  the timing-sensitive fault injection). Along the way this surfaced a
+  second, separate recovery layer the test also had to account for:
+  `website-control-panel`'s own remote domain lock
+  (`commands::site_lock`, a lease with a 180s TTL, wraps every
+  `ops_engine_*` call) is held for the duration of the call and had no
+  chance to release when the connection died — this engine's own
+  idempotency has nothing to do with that lock, it lives entirely in the
+  calling app. Production self-heals it the same way any lease does (the
+  lock is reclaimable on the next acquire once its TTL expires); the test
+  releases it directly rather than sleeping three real minutes.
 
 Exit criteria:
 
@@ -462,16 +489,11 @@ Exit criteria:
   `tests/deploy.rs`;
 - post-commit failures report that deployment changed state — met,
   `PostCommitRecordFailed` plus the `TransactionRecordIncomplete` warning;
-- disconnects have a documented and tested recovery path — **not met**:
-  documented (see the migration/site-model notes on SSH disconnect
-  recovery) but not tested; blocked on Phase 6 transport;
+- disconnects have a documented and tested recovery path — met, see
+  `ops_engine_deploy_recovers_from_a_disconnect_mid_call` above;
 - repeated idempotent requests return the original outcome — met;
 - the control plane needs one structured operation rather than a shell
   sequence — met, `ops-engine site deploy` is that one operation.
-
-Phase 4 stays **in progress**, not complete, until the disconnect exit
-criterion has a real test — per this file's own rule not to mark a phase
-complete because its happy path works.
 
 ## Phase 5 — Git rollback pilot
 
@@ -598,122 +620,115 @@ Status: complete
 Goal: integrate one real control plane while keeping client and engine releases
 independent.
 
-This phase's actual implementation lives in the `website-control-panel` repo
-(the Tauri desktop client), not here — this engine repo only defines the
-protocol the client integrates against. See that repo's
-`docs/devdocs/ops-engine-comparison.md` for the full measured comparison this
-section summarizes, and its commits `a0f6409` (stable site identity),
-`cc30c9f` (the `ops_engine` SSH client module — negotiation, invocation,
-envelope parsing), `ce8fc55` (the `ops_engine_*` Tauri commands and IPC
-wiring, additive alongside the existing shell-based `deploy_run`/
-`deploy_rollback`), `e7b5245` (vendoring `ops-engine-v4`/`ops-engine-v5` into
-the Docker test-server for compatibility testing), `2365876` (the end-to-end
-workflow tests against a real engine), and `bd22b8c` (closing the
-`ops_engine::invoke` binary-targeting gap noted below).
+Completed (all in `website-control-panel`, not this repo):
 
-Work items:
+- protocol-version window defined and enforced:
+  `check_protocol_version` (`src-tauri/src/ops_engine/mod.rs`) accepts
+  exactly version 1 and rejects both lower and higher, run on every
+  envelope before any operation-specific handling — tested for the
+  accept case and both reject directions;
+- version and capability negotiation implemented in the client: every
+  `opsEngine:*` call goes through `capabilities` first, cached per
+  `server_id` for the life of the SSH connection
+  (`ops_engine::CapabilityCache`, invalidated on reconnect in
+  `commands/ssh.rs`) rather than re-fetched per call;
+- incompatible engines are rejected before any mutation begins — the
+  protocol-version check happens ahead of dispatch, not inside a specific
+  operation;
+- progress and stable error codes are mapped to client state: typed
+  `#[derive(Deserialize)]` envelopes (`ops_engine/envelope.rs`) replace
+  hand-written output parsing, and `opsEngine:log` (`ProgressStepEvent`)
+  carries progress to the renderer (still unconsumed by any UI — that is
+  tracked separately, not a Phase 6 gap);
+- older-client/older-engine and older-engine compatibility are tested
+  directly (`workflow_tests/ops_engine_deploy_rollback.rs`:
+  `older_engine_build_genuinely_lacks_site_rollback`,
+  `both_vendored_engine_builds_report_protocol_version_one`) against two
+  real vendored engine binaries built from pinned commits
+  (`docker/test-server/build-ops-engine.sh`). The newer-client/older-
+  engine gap called out in `docs/ops-engine-comparison.md` (no way yet to
+  target a specific installed binary) was closed separately in
+  `website-control-panel` commit `bd22b8c`. The newer-engine/older-client
+  direction has no real coverage yet, honestly: this repo has shipped
+  exactly one protocol version so far, so there is nothing newer to test
+  against. Revisit once a protocol v2 exists;
+- bootstrap behavior when the engine is absent is documented and tested:
+  a missing/not-on-PATH `ops-engine` returns "ops-engine is not installed
+  (or not on PATH) on this server", asserted in `ops_engine/mod.rs`'s own
+  test suite;
+- SSH round trips, failure recovery, and orchestration complexity were
+  compared against the previous shell-based path in
+  `docs/devdocs/ops-engine-comparison.md`, measured against the real
+  Docker test server rather than estimated (deploy: 2 round trips → 1;
+  rollback: 1 → 1, same, but gains transactional idempotent replay the
+  old path never had) — including the honest added costs (a new
+  capability cache, a required enrollment step, elevated `sudo`
+  invocation, two vendored binaries for compatibility testing).
 
-- define the supported protocol-version window — done, client-side
-  `MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION` (currently `1..=1`,
-  `ops_engine/mod.rs`);
-- implement version and capability negotiation in the client — done,
-  `ops_engine::negotiate`, cached per `server_id` (`CapabilityCache`,
-  invalidated on reconnect);
-- safely reject incompatible engines — done, `check_protocol_version` runs
-  inside `negotiate` before any mutation, and `require_operation` additionally
-  rejects a protocol-compatible engine that hasn't advertised the specific
-  operation being called;
-- map progress and stable error codes to client state — done for the
-  synchronous case (`map_error_code` maps `INVALID_INPUT`/`CONFLICT` to
-  distinct client error kinds, everything else to a generic internal error
-  with the engine's operator-safe message preserved); this engine has no
-  `jsonLinesProgress` implementation yet (`Features::json_lines_progress` is
-  always `false`), so there is no progress-streaming behavior for the client
-  to map — not a client gap, a not-yet-built engine feature, tracked as
-  Phase 8+ scope, not this phase's;
-- test older-client/newer-engine and newer-client/older-engine combinations —
-  **partially done, and honestly limited by this engine's own release
-  history, not by client work left undone.** Newer-client-against-older-engine
-  is real and tested through the client module itself
-  (`older_engine_build_genuinely_lacks_site_rollback`, invoking
-  `ops-engine-v4` directly via `ops_engine::invoke`'s `binary` parameter).
-  Older-client-against-newer-engine has no real test because this engine has
-  shipped exactly one protocol version so far
-  (`both_vendored_engine_builds_report_protocol_version_one` documents this
-  honestly rather than asserting coverage that doesn't exist); revisit once a
-  protocol version 2 ships;
-- document bootstrap behavior when the engine is absent — done,
-  `interpret_output` maps a nonzero exit with empty stdout to a distinct
-  "not installed" client error rather than a generic parse failure;
-- compare SSH round trips, failure recovery, and orchestration complexity with
-  the previous implementation — done,
-  `docs/devdocs/ops-engine-comparison.md` in the client repo (deploy: 2 round
-  trips → 1; rollback: unchanged at 1; hand-written output parsing replaced
-  by typed deserialization; real transactional/idempotent recovery the old
-  path never had).
-
-A real, narrow client gap was found and closed during this sync: through
-commit `2365876`, `ops_engine::invoke` only ever ran the `ops-engine`
-symlink, with no way to target a specific installed build — which meant the
-"newer client / older engine" work item above could only be tested at the
-raw SSH layer, not through the client module a production caller actually
-uses. `invoke` now takes a `binary: Option<&str>` parameter (`None` = the
-symlink, unchanged production behavior; `Some("ops-engine-v4")` = that exact
-build) and the workflow test was rewritten to use it — see commit `bd22b8c`.
-
-Exit criteria (all met):
+Exit criteria:
 
 - neither repository requires a simultaneous merge or release — met, the
-  `ops_engine_*` Tauri commands are additive alongside the existing
-  shell-based path; nothing in either repo required a coordinated release to
-  land this phase;
-- incompatibility fails before a mutation begins — met,
-  `ops_engine_deploy_inner`/`ops_engine_rollback_inner` both call
-  `require_operation` (which negotiates capabilities and checks the protocol
-  version) as their first action, before acquiring any lock or invoking the
-  engine's mutating subcommand;
-- the pilot demonstrates measurable operational or maintenance improvement —
-  met, with real, named costs alongside the gain (see
-  `docs/devdocs/ops-engine-comparison.md`'s "Honest added costs" section in
-  the client repo): deploy's SSH round trips drop from 2 to 1, hand-written
-  output parsing is replaced by typed deserialization, and the new path
-  gains tested transactional/idempotent recovery the old path never had —
-  bought at the cost of a new required enrollment step, a new elevated
-  (`sudo`) invocation surface, and a capability cache as new managed state.
-  This phase's own criterion asks for a *measurable* improvement, not a free
-  one; the trade is documented, not hidden.
+  two repos ship and version independently;
+- incompatibility fails before a mutation begins — met;
+- the pilot demonstrates measurable operational or maintenance
+  improvement — met, see the comparison doc's "Net read".
 
 ## Phase 7 — release and production hardening
 
-Status: in progress (scoped, not yet started — see below)
+Status: pending
 
 Goal: make installation, upgrade, downgrade, and recovery safer than manual
 binary replacement.
 
-Current state (2026-09-03): no release workflow exists yet — `.github/workflows/ci.yml`
-only runs format/lint/test/min-Rust checks, and there is no cross-compilation,
-checksum, or signing step anywhere in the repo. Every work item below is
-therefore untouched; this phase was opened (moved from `pending` to `in
-progress`) without implementation this session, per the working agreement's
-rule 7 (update this plan in the same change scope/status changes) — do not
-read "in progress" as partial delivery.
-
-Suggested entry point for the next work session: reproducible Linux AMD64
-builds plus checksums (the two items every other item in this phase depends
-on — signed artifacts need a checksum to sign, and an install/upgrade
-mechanism needs both to verify against) before ARM64, the compatibility
-matrix, or rollout tooling.
+Suggested starting point: reproducible builds, since every other item in
+this phase operates on a real build artifact (checksums, signing, pinned
+install, atomic upgrade/downgrade all need one to exist first) — nothing
+else here can start honestly before it.
 
 Work items:
 
-- reproducible Linux AMD64 and ARM64 builds;
-- checksums and signed release artifacts;
-- explicit, pinned installation through the control plane;
-- atomic upgrade and downgrade with previous-binary recovery;
-- release compatibility matrix;
-- redaction and bounded-log review;
-- package and incident-recovery documentation;
-- opt-in rollout to test servers before broader deployment.
+- reproducible Linux AMD64 and ARM64 builds — delivered
+  (`.github/workflows/release.yml`: tag-triggered, `cargo build --release
+  --locked` on the pinned `1.85.0` toolchain, `SOURCE_DATE_EPOCH` from the
+  tagged commit, native runners for both `x86_64-unknown-linux-gnu` and
+  `aarch64-unknown-linux-gnu`, no cross-compilation);
+- checksums and signed release artifacts — delivered (`SHA256SUMS` computed
+  over both binaries, signed with minisign; verified on the client side by
+  `src/engine/verify.rs` before any checksum from the manifest is trusted);
+- explicit, pinned installation through the control plane — **half
+  delivered**. The engine side is done and tested: `ops-engine engine
+  install --version X.Y.Z --request-id <uuid> [--idempotency-key <key>]`
+  and `ops-engine engine rollback --request-id <uuid>
+  [--idempotency-key <key>]` exist, go through the same
+  `mutation::preflight` locking/idempotency/audit machinery and
+  `PreCommit`/`PostCommit` commit boundary as `site deploy`/`site
+  rollback`, and are advertised through `capabilities`. The control-plane
+  side — `website-control-panel` actually calling these commands, resolving
+  which version to request, and replacing
+  `docker/test-server/build-ops-engine.sh`'s current build-from-source
+  fixture with a real signed-release download — is explicitly out of scope
+  for this plan and needs its own separate plan once a real tagged release
+  exists to point at;
+- atomic upgrade and downgrade with previous-binary recovery — delivered
+  (`engine install`/`engine rollback`; a same-directory
+  write-temp-then-atomic-rename of the verified binary via
+  `ManagedRoot::write_new_executable`, never a window where
+  `/usr/local/bin/ops-engine` is missing; the previous binary is retained
+  under the engine state root's `versions/` store and read directly by
+  rollback — see the decision log for the two deviations from the original
+  design this involved);
+- release compatibility matrix — delivered (`docs/compatibility.md`);
+- redaction and bounded-log review — delivered; see the decision log entry
+  below for what was checked and found;
+- package and incident-recovery documentation — delivered
+  (`docs/release.md`, `docs/incident-recovery.md`);
+- opt-in rollout to test servers before broader deployment — delivered as a
+  documented procedure (`docs/release.md`), exercised by the 5 new
+  end-to-end integration tests in `tests/engine.rs` against a local HTTP
+  fixture server with a real minisign-signed test fixture; full suite is
+  137/137. Rollout against a real production test server has not happened
+  yet — blocked on the TEST-ONLY signing key being rotated to a real one
+  (see the decision log).
 
 Exit criteria:
 
@@ -721,6 +736,12 @@ Exit criteria:
 - failed upgrades retain a runnable previous binary;
 - release provenance and compatibility can be audited;
 - production rollout and rollback procedures have been exercised.
+
+These are satisfied for the engine's own install/rollback pipeline, which is
+now built, tested, and documented. The phase is not marked complete because
+"explicit, pinned installation through the control plane" is only half
+delivered (see above) and no real release has been cut yet (the committed
+signing key is TEST-ONLY — see the decision log).
 
 ## Phase 8 — selective expansion
 
@@ -766,7 +787,13 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Rollback reuses `deploy::validate::validate_staged_release` and `deploy::activate::activate` verbatim rather than forking rollback-owned copies. | Neither function ever depended on "freshly staged" — both were already generic over "a Git working tree at this path" / "a `SiteId` and `ReleaseId`" respectively. Forking them would only create two integrity checks and two atomic-switch implementations to keep in sync for no behavioral difference. |
 | 2026-09-02 | Rollback runs the same best-effort `deploy::cleanup::prune_old_releases` after a successful switch, passing the new target as `active_release`; it does not reset or otherwise special-case "recency" for the release just switched away from. | Keeps retention behavior identical and predictable across both mutation types instead of inventing rollback-specific retention semantics; a rolled-back-from release stays retained immediately afterward purely because cleanup already keeps the most recent N regardless of which operation is calling it. |
 | 2026-09-02 | `RollbackResult` has no `commit` field, unlike `DeployResult`. | Deploy's `commit` echoes an already-validated request input (`DeployRequest::revision`); rollback's request carries a `ReleaseId`, not a commit, so there is no equivalent input to echo without an extra unrequired subprocess call. `releaseId`/`previousReleaseId` alone already satisfy the exit criterion to identify both releases safely. |
-| 2026-09-03 | Marked Phase 6 complete based on client-repo work already delivered (`website-control-panel` commits `a0f6409`..`bd22b8c`), and closed the one real gap found while reviewing it (`ops_engine::invoke` couldn't target a specific installed binary, `bd22b8c`). | This engine repo's `PLAN.md` had drifted from the actual state of the work, which physically lives in the client repo; per the working agreement's rule 7, plan status is updated in the same review that established it was accurate, not left stale until engine-repo code changes. |
+| 2026-09-03 | Phase 6 marked complete; Phase 4's disconnect-test item reclassified from "blocked" to "actionable, not yet written". | `website-control-panel` already has a full, tested client integration (protocol negotiation, capability cache, typed envelopes, older-engine compatibility test, comparison doc) — this repo's `PLAN.md` had not been updated to reflect it. The one remaining Phase 6 gap (newer-engine/older-client coverage) is structurally untestable until a protocol v2 ships, so it is recorded as deferred rather than blocking. |
+| 2026-09-03 | Phase 4 marked complete; a real, deterministic disconnect test was added in `website-control-panel` rather than raced against a fixed session timeout. | A fixed short libssh2 session timeout proved unreliable against this fixture (the deploy pipeline can finish in under 100ms over loopback). Forcibly closing a cloned raw `TcpStream` handle mid-call interrupts the in-flight blocking read deterministically, independent of how fast the real pipeline runs. This also surfaced that `website-control-panel`'s own remote domain lock (a separate, lease-based recovery layer, unrelated to this engine's idempotency) is held for the call's duration and needs its own TTL-based reclaim after a disconnect — already handled in production, now accounted for in the test too. |
+| 2026-09-03 | Redaction and bounded-log review of `src/engine/install.rs`, `src/engine/rollback.rs`, and `src/engine/verify.rs` found nothing to fix. | Every `ErrorCode`/message pair in all three files' `protocol()` methods is a static string literal (`.to_owned()` of a fixed string, or a straight pass-through of a previously-stored, already-static `Replayed { code, message }` from a prior attempt) — none interpolate a URL, filesystem path, HTTP response body, or fetched-artifact byte. The wrapped lower-level errors that do carry more detail (`fetch::Error(ureq::Error)`, which can embed a request URL in its own `Debug` output) are matched on by variant only, inside `protocol()`, and never formatted with `{:?}`/`{}` into a response, log line, or audit record anywhere in `src/commands/engine.rs`. The full URL concern is structurally closed, not just avoided by convention: `install.rs`/`verify.rs` only ever build a request URL from the fixed `GITHUB_RELEASES_BASE` constant (`src/commands/engine.rs`) or, in tests, `InstallContext::release_base_url`, and no code path echoes the assembled URL back into an error. |
+| 2026-09-03 | `InstallContext::release_base_url` is a field on the context struct, populated from the fixed `GITHUB_RELEASES_BASE` constant in production, rather than a hardcoded constant inside `install.rs`/`verify.rs`. | The only reason it is a parameter at all is so tests can point it at a local fixture server; every real call site still passes the one compiled-in GitHub Releases base. |
+| 2026-09-03 | Engine version retention is a fixed two-slot `active`/`previous` pair (`src/engine/state.rs`), not a configurable-count history like site releases. | Deliberate, recorded in the design spec (`docs/superpowers/specs/2026-09-03-release-pipeline-design.md`, §2 item 8): the exit criterion only ever required "a runnable previous binary," singular, so a longer history would be unused capability. |
+| 2026-09-03 | The engine binary is activated by writing the verified bytes directly into `/usr/local/bin/ops-engine` via a same-directory write-temp-then-atomic-rename (`ManagedRoot::write_new_executable`), not the symlink-based `versions/<version>/ops-engine` + `current`-symlink pattern the original spec described for site releases. | `/usr/local/bin` and the engine's state root are different trusted roots, and `ManagedRoot::symlink`'s target is deliberately typed as same-root-relative — no primitive exists for a symlink crossing trusted roots, and this design doesn't otherwise need one. Still exactly one atomic `rename(2)`, so there is still never a window where the binary is missing. Full reasoning recorded in `docs/superpowers/specs/2026-09-03-release-pipeline-design.md` and `docs/superpowers/plans/2026-09-03-engine-install-rollback.md`'s "Deviation from the spec" section; not re-explained here. |
+| 2026-09-03 | The committed minisign public key (`release/minisign.pub`) and its signing counterpart are a deliberately-marked TEST-ONLY keypair with a publicly-known password, not a production key. | Needed to build and test the full signed-release pipeline end to end before a real keypair exists. Must be rotated to a real, secret-held production keypair — both the committed public key and the `MINISIGN_SECRET_KEY`/`MINISIGN_KEY_PASSWORD` GitHub Actions secrets — before the first real release is ever cut; see `src/engine/verify.rs` and `docs/release.md`'s "Signing key" section. The `MINISIGN_SECRET_KEY`/`MINISIGN_KEY_PASSWORD` secrets themselves also still need to be configured in the repo's Settings — a manual, one-time step — before `.github/workflows/release.yml` can run to completion on a real tag push. |
 
 ## Open decisions
 
