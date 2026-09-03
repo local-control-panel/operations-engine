@@ -26,10 +26,13 @@ use operations_engine::{
 
 const REQUEST_ID_1: &str = "123e4567-e89b-12d3-a456-426614174000";
 const REQUEST_ID_2: &str = "9b2f1c34-5678-4abc-9def-0123456789ab";
-/// The publishable fixture versions, newest first — every one of
+const REQUEST_ID_3: &str = "3f0d5a71-2c48-4f6b-8b21-7d5e9c1a4b60";
+const REQUEST_ID_4: &str = "c41a8e02-9d37-4a55-b8f2-6e0c73d91af8";
+/// The three publishable fixture versions, newest first — every one of
 /// them a real, correctly signed release in `tests/fixtures/engine`.
 const VERSION: &str = "9.9.9";
 const PREVIOUS_VERSION: &str = "9.9.8";
+const OLDEST_VERSION: &str = "9.9.7";
 /// Published and signed exactly like the others, but not a runnable
 /// program — the "verifies but will not start on this host" case.
 const BROKEN_VERSION: &str = "9.9.6";
@@ -488,5 +491,85 @@ fn an_unmanaged_binary_that_cannot_be_identified_is_retained_under_a_sentinel() 
     assert_eq!(
         std::fs::read(bin_dir.path().join("ops-engine")).unwrap(),
         unmanaged
+    );
+}
+
+#[test]
+fn successive_installs_retain_one_previous_version_prune_the_rest_and_stay_rollback_able() {
+    // The upgrade path the spec calls for, end to end: three real
+    // HTTP-backed installs in sequence, then a rollback. This is the only
+    // coverage `prune_superseded_version` has — including its guard
+    // against deleting a version that is still the active or previous
+    // one.
+    let server = start_fixture_server(fixture_routes(&[OLDEST_VERSION, PREVIOUS_VERSION, VERSION]));
+    let (bin_dir, state_dir, bin_root, state_root, engine_state) = roots();
+    let context = InstallContext {
+        bin_root: &bin_root,
+        engine_state: &engine_state,
+        state_root: &state_root,
+        release_base_url: &server.base_url,
+    };
+    let install = |version: &str, request_id: &str| {
+        let request =
+            EngineInstallRequest::parse(version, request_id, None).expect("request should parse");
+        execute_install(&context, &request, &CancellationToken::default())
+            .unwrap_or_else(|error| panic!("installing {version} should succeed: {error:?}"))
+    };
+    let retained = |version: &str| {
+        state_dir
+            .path()
+            .join("engine/versions")
+            .join(version)
+            .join("ops-engine")
+    };
+
+    let first = install(OLDEST_VERSION, REQUEST_ID_1);
+    assert_eq!(first.previous_version, None);
+
+    // Upgrade: the version just replaced becomes `previous`, and both
+    // stay on disk so a rollback has something to restore.
+    let second = install(PREVIOUS_VERSION, REQUEST_ID_2);
+    assert_eq!(second.previous_version, Some(OLDEST_VERSION.to_owned()));
+    let saved = state::load(&scoped_state(&engine_state))
+        .unwrap()
+        .expect("install state should be recorded");
+    assert_eq!(saved.active_version, PREVIOUS_VERSION);
+    assert_eq!(saved.previous_version, Some(OLDEST_VERSION.to_owned()));
+    assert!(retained(OLDEST_VERSION).exists());
+    assert!(retained(PREVIOUS_VERSION).exists());
+
+    // A third install pushes the oldest out of the two-slot retention.
+    let third = install(VERSION, REQUEST_ID_3);
+    assert_eq!(third.previous_version, Some(PREVIOUS_VERSION.to_owned()));
+    assert!(
+        !retained(OLDEST_VERSION).exists(),
+        "the superseded version should have been pruned"
+    );
+    assert!(retained(PREVIOUS_VERSION).exists());
+    assert!(retained(VERSION).exists());
+    assert_eq!(
+        std::fs::read(bin_dir.path().join("ops-engine")).unwrap(),
+        fixture_bytes(VERSION)
+    );
+
+    // And what install wrote under `versions/` is exactly what rollback
+    // reads back out of it.
+    let rollback_context = RollbackContext {
+        bin_root: &bin_root,
+        engine_state: &engine_state,
+    };
+    let rollback_request =
+        EngineRollbackRequest::parse(REQUEST_ID_4, None).expect("request should parse");
+    let rolled_back = execute_rollback(
+        &rollback_context,
+        &rollback_request,
+        &CancellationToken::default(),
+    )
+    .expect("rollback should succeed");
+
+    assert_eq!(rolled_back.version, PREVIOUS_VERSION);
+    assert_eq!(
+        std::fs::read(bin_dir.path().join("ops-engine")).unwrap(),
+        fixture_bytes(PREVIOUS_VERSION)
     );
 }
