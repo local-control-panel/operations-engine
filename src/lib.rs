@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod deploy;
+pub mod engine;
 pub mod error;
 pub mod filesystem;
 pub mod mutation;
