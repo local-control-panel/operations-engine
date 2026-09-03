@@ -31,6 +31,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SiteCommand,
     },
+
+    /// Engine binary install/rollback operations.
+    Engine {
+        #[command(subcommand)]
+        command: EngineCommand,
+    },
 }
 
 impl Command {
@@ -40,6 +46,7 @@ impl Command {
             Self::Capabilities => "capabilities",
             Self::Doctor => "doctor",
             Self::Site { command } => command.operation(),
+            Self::Engine { command } => command.operation(),
         }
     }
 }
@@ -95,6 +102,45 @@ impl SiteCommand {
         match self {
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EngineCommand {
+    /// Fetch, verify, and atomically activate a specific published
+    /// engine version.
+    Install {
+        #[arg(long)]
+        version: String,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the
+        /// original outcome instead of installing twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
+    /// Atomically switch back to the one retained previous engine
+    /// version, without a network call.
+    Rollback {
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl EngineCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Install { .. } => "engine.install",
+            Self::Rollback { .. } => "engine.rollback",
         }
     }
 }
