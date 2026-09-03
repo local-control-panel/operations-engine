@@ -23,6 +23,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Capabilities => commands::capabilities::run(),
         Command::Doctor => commands::doctor::run(),
         Command::Site { command } => commands::site::run(command),
+        Command::Engine { command } => commands::engine::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))
