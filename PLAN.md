@@ -1,9 +1,12 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 6 — client integration and compatibility (Phase 4's one
-remaining item is itself blocked on this phase; see its own section below)
-Last updated: 2026-09-02
+Current phase: 7 — release and production hardening (scoped, not yet
+started). Phase 6 is complete. Phase 4's one remaining item (a real
+disconnect-recovery test) is no longer blocked on Phase 6 — real SSH
+transport now exists via the client integration — but has not itself been
+attempted; see Phase 4's own section.
+Last updated: 2026-09-03
 
 This file is the shared implementation plan for Operations Engine. It is the
 authoritative source for what we build next, in what order, and what must be
@@ -590,34 +593,116 @@ validation code.
 
 ## Phase 6 — client integration and compatibility
 
-Status: pending
+Status: complete
 
 Goal: integrate one real control plane while keeping client and engine releases
 independent.
 
+This phase's actual implementation lives in the `website-control-panel` repo
+(the Tauri desktop client), not here — this engine repo only defines the
+protocol the client integrates against. See that repo's
+`docs/devdocs/ops-engine-comparison.md` for the full measured comparison this
+section summarizes, and its commits `a0f6409` (stable site identity),
+`cc30c9f` (the `ops_engine` SSH client module — negotiation, invocation,
+envelope parsing), `ce8fc55` (the `ops_engine_*` Tauri commands and IPC
+wiring, additive alongside the existing shell-based `deploy_run`/
+`deploy_rollback`), `e7b5245` (vendoring `ops-engine-v4`/`ops-engine-v5` into
+the Docker test-server for compatibility testing), `2365876` (the end-to-end
+workflow tests against a real engine), and `bd22b8c` (closing the
+`ops_engine::invoke` binary-targeting gap noted below).
+
 Work items:
 
-- define the supported protocol-version window;
-- implement version and capability negotiation in the client;
-- safely reject incompatible engines;
-- map progress and stable error codes to client state;
-- test older-client/newer-engine and newer-client/older-engine combinations;
-- document bootstrap behavior when the engine is absent;
+- define the supported protocol-version window — done, client-side
+  `MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION` (currently `1..=1`,
+  `ops_engine/mod.rs`);
+- implement version and capability negotiation in the client — done,
+  `ops_engine::negotiate`, cached per `server_id` (`CapabilityCache`,
+  invalidated on reconnect);
+- safely reject incompatible engines — done, `check_protocol_version` runs
+  inside `negotiate` before any mutation, and `require_operation` additionally
+  rejects a protocol-compatible engine that hasn't advertised the specific
+  operation being called;
+- map progress and stable error codes to client state — done for the
+  synchronous case (`map_error_code` maps `INVALID_INPUT`/`CONFLICT` to
+  distinct client error kinds, everything else to a generic internal error
+  with the engine's operator-safe message preserved); this engine has no
+  `jsonLinesProgress` implementation yet (`Features::json_lines_progress` is
+  always `false`), so there is no progress-streaming behavior for the client
+  to map — not a client gap, a not-yet-built engine feature, tracked as
+  Phase 8+ scope, not this phase's;
+- test older-client/newer-engine and newer-client/older-engine combinations —
+  **partially done, and honestly limited by this engine's own release
+  history, not by client work left undone.** Newer-client-against-older-engine
+  is real and tested through the client module itself
+  (`older_engine_build_genuinely_lacks_site_rollback`, invoking
+  `ops-engine-v4` directly via `ops_engine::invoke`'s `binary` parameter).
+  Older-client-against-newer-engine has no real test because this engine has
+  shipped exactly one protocol version so far
+  (`both_vendored_engine_builds_report_protocol_version_one` documents this
+  honestly rather than asserting coverage that doesn't exist); revisit once a
+  protocol version 2 ships;
+- document bootstrap behavior when the engine is absent — done,
+  `interpret_output` maps a nonzero exit with empty stdout to a distinct
+  "not installed" client error rather than a generic parse failure;
 - compare SSH round trips, failure recovery, and orchestration complexity with
-  the previous implementation.
+  the previous implementation — done,
+  `docs/devdocs/ops-engine-comparison.md` in the client repo (deploy: 2 round
+  trips → 1; rollback: unchanged at 1; hand-written output parsing replaced
+  by typed deserialization; real transactional/idempotent recovery the old
+  path never had).
 
-Exit criteria:
+A real, narrow client gap was found and closed during this sync: through
+commit `2365876`, `ops_engine::invoke` only ever ran the `ops-engine`
+symlink, with no way to target a specific installed build — which meant the
+"newer client / older engine" work item above could only be tested at the
+raw SSH layer, not through the client module a production caller actually
+uses. `invoke` now takes a `binary: Option<&str>` parameter (`None` = the
+symlink, unchanged production behavior; `Some("ops-engine-v4")` = that exact
+build) and the workflow test was rewritten to use it — see commit `bd22b8c`.
 
-- neither repository requires a simultaneous merge or release;
-- incompatibility fails before a mutation begins;
-- the pilot demonstrates measurable operational or maintenance improvement.
+Exit criteria (all met):
+
+- neither repository requires a simultaneous merge or release — met, the
+  `ops_engine_*` Tauri commands are additive alongside the existing
+  shell-based path; nothing in either repo required a coordinated release to
+  land this phase;
+- incompatibility fails before a mutation begins — met,
+  `ops_engine_deploy_inner`/`ops_engine_rollback_inner` both call
+  `require_operation` (which negotiates capabilities and checks the protocol
+  version) as their first action, before acquiring any lock or invoking the
+  engine's mutating subcommand;
+- the pilot demonstrates measurable operational or maintenance improvement —
+  met, with real, named costs alongside the gain (see
+  `docs/devdocs/ops-engine-comparison.md`'s "Honest added costs" section in
+  the client repo): deploy's SSH round trips drop from 2 to 1, hand-written
+  output parsing is replaced by typed deserialization, and the new path
+  gains tested transactional/idempotent recovery the old path never had —
+  bought at the cost of a new required enrollment step, a new elevated
+  (`sudo`) invocation surface, and a capability cache as new managed state.
+  This phase's own criterion asks for a *measurable* improvement, not a free
+  one; the trade is documented, not hidden.
 
 ## Phase 7 — release and production hardening
 
-Status: pending
+Status: in progress (scoped, not yet started — see below)
 
 Goal: make installation, upgrade, downgrade, and recovery safer than manual
 binary replacement.
+
+Current state (2026-09-03): no release workflow exists yet — `.github/workflows/ci.yml`
+only runs format/lint/test/min-Rust checks, and there is no cross-compilation,
+checksum, or signing step anywhere in the repo. Every work item below is
+therefore untouched; this phase was opened (moved from `pending` to `in
+progress`) without implementation this session, per the working agreement's
+rule 7 (update this plan in the same change scope/status changes) — do not
+read "in progress" as partial delivery.
+
+Suggested entry point for the next work session: reproducible Linux AMD64
+builds plus checksums (the two items every other item in this phase depends
+on — signed artifacts need a checksum to sign, and an install/upgrade
+mechanism needs both to verify against) before ARM64, the compatibility
+matrix, or rollout tooling.
 
 Work items:
 
@@ -681,6 +766,7 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Rollback reuses `deploy::validate::validate_staged_release` and `deploy::activate::activate` verbatim rather than forking rollback-owned copies. | Neither function ever depended on "freshly staged" — both were already generic over "a Git working tree at this path" / "a `SiteId` and `ReleaseId`" respectively. Forking them would only create two integrity checks and two atomic-switch implementations to keep in sync for no behavioral difference. |
 | 2026-09-02 | Rollback runs the same best-effort `deploy::cleanup::prune_old_releases` after a successful switch, passing the new target as `active_release`; it does not reset or otherwise special-case "recency" for the release just switched away from. | Keeps retention behavior identical and predictable across both mutation types instead of inventing rollback-specific retention semantics; a rolled-back-from release stays retained immediately afterward purely because cleanup already keeps the most recent N regardless of which operation is calling it. |
 | 2026-09-02 | `RollbackResult` has no `commit` field, unlike `DeployResult`. | Deploy's `commit` echoes an already-validated request input (`DeployRequest::revision`); rollback's request carries a `ReleaseId`, not a commit, so there is no equivalent input to echo without an extra unrequired subprocess call. `releaseId`/`previousReleaseId` alone already satisfy the exit criterion to identify both releases safely. |
+| 2026-09-03 | Marked Phase 6 complete based on client-repo work already delivered (`website-control-panel` commits `a0f6409`..`bd22b8c`), and closed the one real gap found while reviewing it (`ops_engine::invoke` couldn't target a specific installed binary, `bd22b8c`). | This engine repo's `PLAN.md` had drifted from the actual state of the work, which physically lives in the client repo; per the working agreement's rule 7, plan status is updated in the same review that established it was accurate, not left stale until engine-repo code changes. |
 
 ## Open decisions
 
