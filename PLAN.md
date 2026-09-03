@@ -716,19 +716,29 @@ Work items:
   `/usr/local/bin/ops-engine` is missing; the previous binary is retained
   under the engine state root's `versions/` store and read directly by
   rollback — see the decision log for the two deviations from the original
-  design this involved);
+  design this involved). The final whole-branch review (see the decision
+  log) found this was not actually recoverable end to end: a newly
+  activated binary was never proven to run, and the first install on any
+  host retained nothing, so `engine rollback` — the only sudo-permitted
+  recovery path — could itself be the broken binary with no fallback. Both
+  gaps are now closed: `engine install` smoke-tests the staged binary
+  through the bounded process runner before activation and rejects it
+  (leaving the running binary untouched) if it won't run or reports the
+  wrong version, and the first install on an unmanaged host retains the
+  binary it replaces (self-reported version, or a `pre-managed` sentinel);
 - release compatibility matrix — delivered (`docs/compatibility.md`);
 - redaction and bounded-log review — delivered; see the decision log entry
   below for what was checked and found;
 - package and incident-recovery documentation — delivered
   (`docs/release.md`, `docs/incident-recovery.md`);
 - opt-in rollout to test servers before broader deployment — delivered as a
-  documented procedure (`docs/release.md`), exercised by the 5 new
+  documented procedure (`docs/incident-recovery.md`), exercised by 10
   end-to-end integration tests in `tests/engine.rs` against a local HTTP
-  fixture server with a real minisign-signed test fixture; full suite is
-  137/137. Rollout against a real production test server has not happened
-  yet — blocked on the TEST-ONLY signing key being rotated to a real one
-  (see the decision log).
+  fixture server with a real minisign-signed test fixture (including a
+  three-version install-then-install-then-rollback sequence that exercises
+  `prune_superseded_version`); full suite is 149/149. Rollout against a
+  real production test server has not happened yet — blocked on the
+  TEST-ONLY signing key being rotated to a real one (see the decision log).
 
 Exit criteria:
 
@@ -738,10 +748,46 @@ Exit criteria:
 - production rollout and rollback procedures have been exercised.
 
 These are satisfied for the engine's own install/rollback pipeline, which is
-now built, tested, and documented. The phase is not marked complete because
-"explicit, pinned installation through the control plane" is only half
-delivered (see above) and no real release has been cut yet (the committed
-signing key is TEST-ONLY — see the decision log).
+now built, tested, and documented — including, after the final-review fix
+round above, "failed upgrades retain a *reachable* previous binary," not
+just a retained one. The phase is not marked complete because "explicit,
+pinned installation through the control plane" is only half delivered (see
+above) and no real release has been cut yet (the committed signing key is
+TEST-ONLY — see the decision log).
+
+### Known follow-ups (non-blocking)
+
+Raised by the final whole-branch review and its fix-round re-review;
+none are load-bearing for this phase's exit criteria, all deliberately
+deferred rather than fixed here:
+
+- `docs/protocol.md`'s stable-error-code table is missing
+  `ARTIFACT_NOT_RUNNABLE`/`ARTIFACT_FETCH_FAILED`/`ARTIFACT_VERIFICATION_FAILED`
+  and the two new warning codes;
+- no minimum-glibc / tested-distribution floor is recorded anywhere
+  (`docs/compatibility.md`), despite being the most likely real trigger of
+  `ARTIFACT_NOT_RUNNABLE` in production;
+- a staged `versions/<version>/` directory is not cleaned up on a
+  post-staging failure (pre-existing, now has one more path reaching it:
+  a rejected smoke test);
+- `previous_version` can now surface the literal string `pre-managed` over
+  the wire — `website-control-panel`'s parser needs to tolerate it, not
+  just semver strings;
+- `tests/fixtures/engine/regenerate.sh` couples fixture regeneration to
+  whichever minisign key is currently committed — regenerating fixtures
+  after the production key rotation will require the production secret key,
+  which must never be used for this;
+- the `https_only` loopback exemption in `src/engine/fetch.rs` (added so
+  the real-HTTP test fixture server still works) has one narrow gap: a URL
+  of the form `http://127.0.0.1:80@evil.test/...` passes the exemption via
+  userinfo-with-port. Unreachable from production (`release_base_url` is a
+  compiled-in `https://github.com/...` constant), defense-in-depth only;
+- a handful of smaller items (dead `ExpectedArtifact::filename`, cancellation
+  during the smoke probe reporting as `ARTIFACT_NOT_RUNNABLE` rather than
+  `CANCELLED`, `rollback.rs`'s `.expect()` on an `install.state` value) —
+  full detail was in this plan's now-deleted SDD workspace
+  (`final-review-report.md`, `fix-round-1-report.md`, `re-review-report.md`);
+  git history on the fix-round commits (`b0576ba..6287726`) has the rest.
 
 ## Phase 8 — selective expansion
 
@@ -794,6 +840,7 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-03 | Engine version retention is a fixed two-slot `active`/`previous` pair (`src/engine/state.rs`), not a configurable-count history like site releases. | Deliberate, recorded in the design spec (`docs/superpowers/specs/2026-09-03-release-pipeline-design.md`, §2 item 8): the exit criterion only ever required "a runnable previous binary," singular, so a longer history would be unused capability. |
 | 2026-09-03 | The engine binary is activated by writing the verified bytes directly into `/usr/local/bin/ops-engine` via a same-directory write-temp-then-atomic-rename (`ManagedRoot::write_new_executable`), not the symlink-based `versions/<version>/ops-engine` + `current`-symlink pattern the original spec described for site releases. | `/usr/local/bin` and the engine's state root are different trusted roots, and `ManagedRoot::symlink`'s target is deliberately typed as same-root-relative — no primitive exists for a symlink crossing trusted roots, and this design doesn't otherwise need one. Still exactly one atomic `rename(2)`, so there is still never a window where the binary is missing. Full reasoning recorded in `docs/superpowers/specs/2026-09-03-release-pipeline-design.md` and `docs/superpowers/plans/2026-09-03-engine-install-rollback.md`'s "Deviation from the spec" section; not re-explained here. |
 | 2026-09-03 | The committed minisign public key (`release/minisign.pub`) and its signing counterpart are a deliberately-marked TEST-ONLY keypair with a publicly-known password, not a production key. | Needed to build and test the full signed-release pipeline end to end before a real keypair exists. Must be rotated to a real, secret-held production keypair — both the committed public key and the `MINISIGN_SECRET_KEY`/`MINISIGN_KEY_PASSWORD` GitHub Actions secrets — before the first real release is ever cut; see `src/engine/verify.rs` and `docs/release.md`'s "Signing key" section. The `MINISIGN_SECRET_KEY`/`MINISIGN_KEY_PASSWORD` secrets themselves also still need to be configured in the repo's Settings — a manual, one-time step — before `.github/workflows/release.yml` can run to completion on a real tag push. |
+| 2026-09-03 | Final whole-branch review of Phase 7 (commits `95ec377..b0576ba`) found 2 Critical + 7 Important issues — a clippy lint failing the pinned toolchain's CI gate, and, more substantively, that a newly activated binary was never proven runnable while `engine rollback` (the only sudo-permitted recovery path) ran through that same binary, plus no retention on a host's first install, unbounded HTTP fetch under the engine-global lock, ambient proxy/HTTP fallback, a state-write race and silent failure, zero test coverage of the upgrade/prune path, and a release workflow that both leaked the signing secret into a rendered script and accepted malformed/mismatched tags. All 9 were fixed in one fix round (commits `b0576ba..6287726`) and independently re-verified clean by a second reviewer (149/149 tests, up from 138). | The whole-branch pass is what caught these — each was invisible from any single task's own diff (the lock/state-write ordering spans three tasks; the missing recovery path only appears when the code, `docs/site-model.md`, and `docs/incident-recovery.md` are read together). Fixing the signing key's secret-handling gap and the tag-validation gap before any real tag is ever pushed, and fixing the recovery-path gap before any real server is ever upgraded, converts each from a design promise into a checked property. The fix round also required regenerating the TEST-ONLY minisign keypair (`release/minisign.pub`) — the secret half was never available outside the machine that originally built it — with the same publicly-documented password; nothing was ever released under the old key. Ten Minor findings from the review and thirteen more from the re-review were deliberately left unfixed (see Phase 7's "Known follow-ups" list); none are load-bearing for this phase's exit criteria. |
 
 ## Open decisions
 
