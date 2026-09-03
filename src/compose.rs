@@ -165,6 +165,50 @@ pub fn exec(service: &str, args: &[&str], cwd: Option<&Path>) -> Result<ProcessO
     exec_inner(service, args, cwd, None)
 }
 
+/// How one caller reaches the Compose stack, as a value it can hold and
+/// pass down instead of threading two optional parameters through every
+/// intermediate function. `Access::default()` is the production
+/// configuration in every case: the stack directory resolved from
+/// `COMPOSE_BASE_DIR` against the invoking user's home, and `docker`
+/// resolved against this process's own real `PATH`.
+///
+/// The two overrides exist for the same reason `exec_inner`'s parameters
+/// do, and carry the same warning: `stack_dir` names a Compose project
+/// checkout other than the resolved default, and `docker_path` replaces
+/// `PATH` for the spawned child only (never this process's own
+/// environment, so it is safe under parallel test execution). Tests use
+/// them to drive `caddy validate`/`caddy reload` outcomes through a fake
+/// `docker` fixture without a real Compose stack; nothing in production
+/// should set either.
+#[derive(Clone, Debug, Default)]
+pub struct Access {
+    stack_dir: Option<PathBuf>,
+    docker_path: Option<OsString>,
+}
+
+impl Access {
+    pub fn stack_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.stack_dir = Some(dir.into());
+        self
+    }
+
+    pub fn docker_path(mut self, path: impl Into<OsString>) -> Self {
+        self.docker_path = Some(path.into());
+        self
+    }
+
+    /// Runs one `docker compose exec -T <service> <args...>` against this
+    /// access's stack, exactly as the free `exec` function above does.
+    pub fn exec(&self, service: &str, args: &[&str]) -> Result<ProcessOutput, Error> {
+        exec_inner(
+            service,
+            args,
+            self.stack_dir.as_deref(),
+            self.docker_path.as_deref(),
+        )
+    }
+}
+
 /// Shared implementation behind `exec`. `path_override`, when set,
 /// replaces `PATH` for this one child only (`ProcessRequest::env`, which
 /// merges into — rather than mutating — this *process's* own inherited
@@ -222,39 +266,52 @@ fn exec_inner(
     run(&request, &limits, &CancellationToken::default()).map_err(Error::Run)
 }
 
+/// Writes a fake `docker` executable (`script` is its body, after the
+/// `#!/bin/sh` shebang line) into `directory`, which callers then point
+/// `Access::docker_path`/`exec_inner`'s `path_override` at so
+/// `Command::new("docker")` resolves to the fixture instead of any real
+/// `docker` on this machine.
+///
+/// A per-child `PATH` (`ProcessRequest::env`), never a mutation of the
+/// test process's own environment, so this is safe under Cargo's default
+/// parallel test execution: every test gets its own directory and its own
+/// unshared override, and nothing here can race another test's fake binary
+/// or starve an unrelated bareword-resolved subprocess (`git`, `id`,
+/// `printf`, ...) spawned concurrently elsewhere in this binary. Same
+/// fixture-script technique `tests/cli.rs`'s
+/// `doctor_is_deterministic_with_controlled_dependencies` and
+/// `tests/engine.rs` use to exercise the real subprocess path without a
+/// real target binary.
+///
+/// `pub(crate)` rather than private to this module's tests because
+/// `ingress::activate`'s tests drive `caddy validate`/`caddy reload`
+/// outcomes through exactly this fixture.
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) fn write_fake_docker(directory: &std::path::Path, script: &str) {
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    use super::{COMPOSE_PROJECT, Error, exec_inner};
+    let path = directory.join("docker");
+    fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("fake docker should be written");
+    let mut permissions = fs::metadata(&path)
+        .expect("fake docker metadata should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("fake docker should be executable");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{COMPOSE_PROJECT, Error, exec_inner, write_fake_docker};
     use crate::process::{ProcessRunError, ProcessTermination};
 
-    /// Writes a fake `docker` executable (`script` is its body, after the
-    /// `#!/bin/sh` shebang line) into a fresh, dedicated temp directory
-    /// and returns that directory. `exec_inner`'s `path_override` then
-    /// points the literal `docker` argv entry at exactly this directory —
-    /// a per-child `PATH` (`ProcessRequest::env`), never a mutation of
-    /// this whole test process's own environment — so `Command::new
-    /// ("docker")` resolves to the fixture instead of any real `docker` on
-    /// this machine. Unlike mutating `std::env::set_var("PATH", ..)`
-    /// directly, this is safe under Cargo's default parallel test
-    /// execution: every test gets its own directory and its own
-    /// unshared override, so nothing here can race another test's fake
-    /// binary or starve an unrelated bareword-resolved subprocess (`git`,
-    /// `id`, `printf`, ...) spawned concurrently elsewhere in this binary.
-    /// Same fixture-script technique `tests/cli.rs`'s
-    /// `doctor_is_deterministic_with_controlled_dependencies` and
-    /// `tests/engine.rs` use to exercise the real subprocess path without a
-    /// real target binary.
+    /// `write_fake_docker` into a fresh, dedicated temp directory, which
+    /// is returned. `exec_inner`'s `path_override` then points the literal
+    /// `docker` argv entry at exactly this directory, so
+    /// `Command::new("docker")` resolves to the fixture instead of any
+    /// real `docker` on this machine.
     fn fake_docker_dir(script: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("temp directory should be created");
-        let path = dir.path().join("docker");
-        fs::write(&path, format!("#!/bin/sh\n{script}\n")).expect("fake docker should be written");
-        let mut permissions = fs::metadata(&path)
-            .expect("fake docker metadata should exist")
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&path, permissions).expect("fake docker should be executable");
+        write_fake_docker(dir.path(), script);
         dir
     }
 
