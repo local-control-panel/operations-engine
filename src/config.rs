@@ -47,7 +47,9 @@ impl EngineConfig {
             roots_overlap(content, &state_root)
                 || roots_overlap(content, &credential_root)
                 || roots_overlap(content, &ingress_root)
-        }) {
+        }) || roots_overlap(&ingress_root, &state_root)
+            || roots_overlap(&ingress_root, &credential_root)
+        {
             return Err(ConfigError::PrivilegedRootOverlapsContent);
         }
 
@@ -333,6 +335,30 @@ mod tests {
         let overlapping = config_json().replace(
             "\"/var/lib/operations-engine-ingress\"",
             "\"/var/www/engine-ingress\"",
+        );
+        assert_eq!(
+            EngineConfig::from_json(&overlapping).unwrap_err(),
+            ConfigError::PrivilegedRootOverlapsContent
+        );
+    }
+
+    #[test]
+    fn ingress_root_must_not_overlap_state_root() {
+        let overlapping = config_json().replace(
+            "\"/var/lib/operations-engine-ingress\"",
+            "\"/var/lib/operations-engine\"",
+        );
+        assert_eq!(
+            EngineConfig::from_json(&overlapping).unwrap_err(),
+            ConfigError::PrivilegedRootOverlapsContent
+        );
+    }
+
+    #[test]
+    fn ingress_root_must_not_overlap_credential_root() {
+        let overlapping = config_json().replace(
+            "\"/var/lib/operations-engine-ingress\"",
+            "\"/var/lib/operations-engine-credentials\"",
         );
         assert_eq!(
             EngineConfig::from_json(&overlapping).unwrap_err(),
