@@ -2,7 +2,7 @@ use std::{fs::File, io::Read, path::Path};
 
 use serde::Deserialize;
 
-use crate::site::{SiteId, SiteRelativePath, TrustedRoot, ValidationError};
+use crate::site::{Domain, SiteId, SiteRelativePath, TrustedRoot, ValidationError};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 2;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -178,24 +178,14 @@ fn roots_overlap(left: &TrustedRoot, right: &TrustedRoot) -> bool {
     left.as_path().starts_with(right.as_path()) || right.as_path().starts_with(left.as_path())
 }
 
+/// Delegates to `site::Domain`, which owns these rules now that
+/// `ingress::activate_config` needs the same ones for the domain its
+/// request names. Kept as a thin wrapper so the manifest keeps reporting
+/// its own `ConfigError` variant.
 fn validate_domain(value: &str) -> Result<(), ConfigError> {
-    if value.is_empty()
-        || value.len() > 253
-        || value.starts_with('.')
-        || value.ends_with('.')
-        || value.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
-    {
-        return Err(ConfigError::InvalidDomain);
-    }
-    Ok(())
+    Domain::parse(value)
+        .map(|_| ())
+        .map_err(|_| ConfigError::InvalidDomain)
 }
 
 #[cfg(unix)]

@@ -17,6 +17,30 @@ pub enum ErrorCode {
     /// A verified artifact could not be proven to run on this host, so it
     /// was rejected before anything was activated.
     ArtifactNotRunnable,
+    /// The file the caller intended to replace no longer hashes to the
+    /// value it supplied as `expectedPriorHash` — something else wrote to
+    /// it between the caller's read and this request. Nothing was written.
+    /// Distinct from `CONFIG_VALIDATION_FAILED` on purpose: the client's
+    /// response is to re-read, re-apply its edit, and retry, not to fix
+    /// the config it sent.
+    ConfigHashMismatch,
+    /// The submitted configuration was rejected by the service that has to
+    /// run it (`caddy validate`), before anything reached the live path.
+    /// The live configuration is untouched.
+    ConfigValidationFailed,
+    /// The submitted configuration passed standalone validation but the
+    /// live reload that followed failed — typically a conflict with some
+    /// other already-live config file that standalone validation cannot
+    /// see. The previous file was restored and successfully reloaded, so
+    /// what is live now is exactly what was live before this request.
+    ConfigReloadFailed,
+    /// A reload failed *and* the recovery that follows it did not
+    /// complete: either the previous file could not be put back or, once
+    /// back, it could not be reloaded either. Unlike every other code
+    /// here, this one means the live configuration may be neither what the
+    /// caller asked for nor what was there before — it needs an operator,
+    /// not a retry.
+    ConfigRecoveryFailed,
 }
 
 impl ErrorCode {
@@ -34,6 +58,10 @@ impl ErrorCode {
             Self::ArtifactFetchFailed => "ARTIFACT_FETCH_FAILED",
             Self::ArtifactVerificationFailed => "ARTIFACT_VERIFICATION_FAILED",
             Self::ArtifactNotRunnable => "ARTIFACT_NOT_RUNNABLE",
+            Self::ConfigHashMismatch => "CONFIG_HASH_MISMATCH",
+            Self::ConfigValidationFailed => "CONFIG_VALIDATION_FAILED",
+            Self::ConfigReloadFailed => "CONFIG_RELOAD_FAILED",
+            Self::ConfigRecoveryFailed => "CONFIG_RECOVERY_FAILED",
         }
     }
 }
@@ -104,5 +132,28 @@ mod tests {
             ErrorCode::ArtifactNotRunnable.as_str(),
             "ARTIFACT_NOT_RUNNABLE"
         );
+    }
+
+    /// The four ingress-activation codes exist to be told apart by a
+    /// client, so assert every one of them separately rather than
+    /// spot-checking one.
+    #[test]
+    fn new_config_activation_error_codes_have_stable_distinct_protocol_values() {
+        let codes = [
+            (ErrorCode::ConfigHashMismatch, "CONFIG_HASH_MISMATCH"),
+            (
+                ErrorCode::ConfigValidationFailed,
+                "CONFIG_VALIDATION_FAILED",
+            ),
+            (ErrorCode::ConfigReloadFailed, "CONFIG_RELOAD_FAILED"),
+            (ErrorCode::ConfigRecoveryFailed, "CONFIG_RECOVERY_FAILED"),
+        ];
+        for (code, expected) in codes {
+            assert_eq!(code.as_str(), expected);
+            assert_eq!(
+                serde_json::to_string(&code).expect("code should serialize"),
+                format!("\"{expected}\"")
+            );
+        }
     }
 }

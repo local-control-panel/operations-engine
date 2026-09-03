@@ -35,6 +35,55 @@ impl FromStr for SiteId {
     }
 }
 
+/// A validated DNS hostname. The rules are exactly the ones `config.rs`
+/// already applied to a site manifest's `domain` field (which now parses
+/// through this type, so the two cannot drift apart): 1-253 bytes, no
+/// leading or trailing dot, and every dot-separated label 1-63 bytes of
+/// lowercase ASCII letters, digits, or hyphens, never starting or ending
+/// with a hyphen.
+///
+/// That character set is also what makes a `Domain` safe to interpolate
+/// into a single path segment — `<domain>.caddyfile` for the ingress route
+/// file named after it. `/`, `\0`, `.`-only segments, and every other
+/// component-splitting or traversal byte are already excluded above, so
+/// the resulting name is always one `Component::Normal`. `SiteRelativePath`
+/// still re-checks it; this only means that check can never be the thing
+/// standing between a request and a path escape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Domain(String);
+
+impl Domain {
+    pub fn parse(value: &str) -> Result<Self, ValidationError> {
+        if value.is_empty()
+            || value.len() > 253
+            || value.starts_with('.')
+            || value.ends_with('.')
+            || value.split('.').any(|label| {
+                label.is_empty()
+                    || label.len() > 63
+                    || label.starts_with('-')
+                    || label.ends_with('-')
+                    || !label.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+                    })
+            })
+        {
+            return Err(ValidationError::InvalidDomain);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Domain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustedRoot(PathBuf);
 
@@ -157,6 +206,7 @@ fn has_forbidden_raw_segment(path: &Path) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationError {
     InvalidSiteId,
+    InvalidDomain,
     InvalidTrustedRoot,
     RootFilesystemNotAllowed,
     InvalidRelativePath,
@@ -169,7 +219,54 @@ pub enum ValidationError {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{GitCommitSha, SiteId, SiteRelativePath, TrustedRoot, ValidationError};
+    use super::{Domain, GitCommitSha, SiteId, SiteRelativePath, TrustedRoot, ValidationError};
+
+    #[test]
+    fn domain_accepts_only_lowercase_label_syntax() {
+        assert_eq!(
+            Domain::parse("example.com")
+                .expect("a plain hostname should parse")
+                .as_str(),
+            "example.com"
+        );
+        assert!(Domain::parse("a-b.sub.example.com").is_ok());
+        assert!(Domain::parse("").is_err());
+        assert!(Domain::parse("Example.com").is_err());
+        assert!(Domain::parse(".example.com").is_err());
+        assert!(Domain::parse("example.com.").is_err());
+        assert!(Domain::parse("example..com").is_err());
+        assert!(Domain::parse("-example.com").is_err());
+        assert!(Domain::parse("example-.com").is_err());
+        assert!(Domain::parse(&"a".repeat(254)).is_err());
+        assert_eq!(
+            Domain::parse("ex ample.com").unwrap_err(),
+            ValidationError::InvalidDomain
+        );
+    }
+
+    /// The property the ingress route file name depends on: nothing a
+    /// `Domain` can hold makes `<domain>.caddyfile` anything other than one
+    /// ordinary path component.
+    #[test]
+    fn domain_never_contains_a_path_separator_or_traversal_segment() {
+        for hostile in [
+            "../etc/passwd",
+            "a/b.com",
+            "..",
+            ".",
+            "a\0b.com",
+            "/absolute.com",
+        ] {
+            assert!(
+                Domain::parse(hostile).is_err(),
+                "{hostile} must not parse as a domain"
+            );
+        }
+        let domain = Domain::parse("example.com").expect("domain should parse");
+        let relative = SiteRelativePath::parse(format!("{domain}.caddyfile"))
+            .expect("a domain-derived route name should always be a valid relative path");
+        assert_eq!(relative.as_path().components().count(), 1);
+    }
 
     #[test]
     fn site_id_requires_canonical_lowercase_hyphenated_uuid() {
