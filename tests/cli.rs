@@ -41,7 +41,9 @@ fn capabilities_describe_only_implemented_operations() {
             "capabilities",
             "doctor",
             "site.deploy",
-            "site.rollback"
+            "site.rollback",
+            "engine.install",
+            "engine.rollback"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
