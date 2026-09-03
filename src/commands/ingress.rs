@@ -7,6 +7,8 @@ use crate::{
     },
     process::CancellationToken,
     protocol::{Response, ResponseBuildError, Warning},
+    site::Domain,
+    transaction::{IdempotencyKey, RequestId},
 };
 
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
@@ -36,6 +38,13 @@ fn activate_config(
     request_id: &str,
     idempotency_key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
+    // Validate every field that does not require reading `content_file`
+    // first, so a request with e.g. an invalid domain is rejected before
+    // this root-privileged process ever touches the filesystem for the
+    // content path. `ActivateConfigRequest::parse` below re-validates these
+    // same fields (it is the single authoritative constructor for the
+    // request), but by then they are already known-good, so that is cheap
+    // string work, not new I/O.
     let guard = match ActivateConfigRequest::guard_from_expected_hash(expected_hash) {
         Ok(guard) => guard,
         Err(error) => {
@@ -46,6 +55,13 @@ fn activate_config(
             ));
         }
     };
+    if let Err(error) = validate_cheap_fields(domain, request_id, idempotency_key) {
+        return Ok(Response::failure(
+            ACTIVATE_OPERATION,
+            ErrorCode::InvalidInput,
+            activate_config_request_error_message(error),
+        ));
+    }
 
     let content = match std::fs::read_to_string(content_file) {
         Ok(content) => content,
@@ -135,6 +151,24 @@ fn run_activate_config(request: &ActivateConfigRequest) -> Result<Response, Resp
             Ok(Response::failure(ACTIVATE_OPERATION, code, &message))
         }
     }
+}
+
+/// Validates `domain`, `request_id`, and `idempotency_key` — every field
+/// `ActivateConfigRequest::parse` checks that does not depend on the
+/// content file's bytes — using the same underlying parsers it uses, so a
+/// malformed request is rejected before `content_file` is ever read.
+fn validate_cheap_fields(
+    domain: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<(), ActivateConfigRequestError> {
+    Domain::parse(domain).map_err(|_| ActivateConfigRequestError::InvalidDomain)?;
+    RequestId::parse(request_id).map_err(|_| ActivateConfigRequestError::InvalidRequestId)?;
+    if let Some(key) = idempotency_key {
+        IdempotencyKey::parse(key)
+            .map_err(|_| ActivateConfigRequestError::InvalidIdempotencyKey)?;
+    }
+    Ok(())
 }
 
 fn activate_config_request_error_message(error: ActivateConfigRequestError) -> &'static str {

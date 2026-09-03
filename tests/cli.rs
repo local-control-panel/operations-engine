@@ -167,4 +167,12 @@ fn ingress_activate_config_rejects_an_invalid_domain_before_touching_the_filesys
     assert_eq!(response["operation"], "ingress.activateConfig");
     assert_eq!(response["ok"], false);
     assert_eq!(response["error"]["code"], "INVALID_INPUT");
+    // `content-file` also produces `INVALID_INPUT` when it cannot be read,
+    // so pin the message too: this must be a domain-validation rejection,
+    // not the file-read failure it would be if the content file were read
+    // before the cheap fields were validated.
+    assert_eq!(
+        response["error"]["message"],
+        "domain is not a valid domain name"
+    );
 }
