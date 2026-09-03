@@ -1,9 +1,9 @@
 # Operations Engine implementation plan
 
 Status: active  
-Current phase: 4 — Phase 6 (client integration) is now complete, which
-unblocks Phase 4's one remaining item (an end-to-end disconnect test); it
-just hasn't been written yet. See both phases' sections below.
+Current phase: 7 — release and production hardening. Phases 0-6 are all
+complete; Phase 7 has not been started yet (see its own section for a
+suggested starting point).
 Last updated: 2026-09-03
 
 This file is the shared implementation plan for Operations Engine. It is the
@@ -257,7 +257,7 @@ Exit criteria (all met; see `tests/transaction.rs`):
 
 ## Phase 4 — Git deploy pilot
 
-Status: in progress
+Status: complete
 
 Goal: deliver one complete, recoverable Git deployment operation using the
 contracts from phases 2 and 3.
@@ -446,19 +446,38 @@ Completed:
   dev host with no engine config installed) in addition to the automated
   suite.
 
-Work items, in order:
+Work items: none — all delivered above.
 
-1. Add end-to-end disconnect tests. Success, failure, and retry are
-   already covered by `tests/deploy.rs`; disconnect specifically needs a
-   real transport to test honestly. That transport now exists — Phase 6
-   landed a real SSH-connected client (`website-control-panel`) driving
-   this engine against a real Docker test server — so this item is no
-   longer blocked on a later phase not existing, it is simply not written
-   yet. It belongs in `website-control-panel`'s own workflow test suite
-   (`src-tauri/src/workflow_tests/ops_engine_deploy_rollback.rs`), which
-   already owns the real SSH connection, not in this repo's `tests/`
-   (those exercise the engine against a local Git "remote" with no real
-   transport to disconnect).
+Completed (continued):
+
+- added the end-to-end disconnect test (`website-control-panel`,
+  `src-tauri/src/workflow_tests/ops_engine_deploy_rollback.rs`:
+  `ops_engine_deploy_recovers_from_a_disconnect_mid_call`), the one item
+  that needed a real transport to test honestly and was therefore deferred
+  to Phase 6 landing first. It builds a second, genuinely-handshaked SSH
+  session by hand (not through the normal connect path) so a cloned raw
+  `TcpStream` handle stays available alongside it, swaps that session into
+  the pool in place of the healthy one, dispatches a real `site deploy`
+  against the real engine, and forcibly closes the cloned socket a few
+  milliseconds in — deterministically interrupting the in-flight blocking
+  read regardless of how fast the real pipeline happens to run (a fixed
+  short session timeout was tried first and proved unreliable: the whole
+  pipeline against a tiny local Git fixture over loopback can finish in
+  under 100ms). The interrupted call is asserted to fail at the transport
+  layer; a retry with the same idempotency key, after reconnecting, is
+  asserted to converge to exactly one activated release, and a second
+  retry with the same key is asserted to replay that identical outcome
+  rather than redoing work. Ran clean five times in a row (no flake from
+  the timing-sensitive fault injection). Along the way this surfaced a
+  second, separate recovery layer the test also had to account for:
+  `website-control-panel`'s own remote domain lock
+  (`commands::site_lock`, a lease with a 180s TTL, wraps every
+  `ops_engine_*` call) is held for the duration of the call and had no
+  chance to release when the connection died — this engine's own
+  idempotency has nothing to do with that lock, it lives entirely in the
+  calling app. Production self-heals it the same way any lease does (the
+  lock is reclaimable on the next acquire once its TTL expires); the test
+  releases it directly rather than sleeping three real minutes.
 
 Exit criteria:
 
@@ -466,17 +485,11 @@ Exit criteria:
   `tests/deploy.rs`;
 - post-commit failures report that deployment changed state — met,
   `PostCommitRecordFailed` plus the `TransactionRecordIncomplete` warning;
-- disconnects have a documented and tested recovery path — **not met**:
-  documented (see the migration/site-model notes on SSH disconnect
-  recovery) but not tested; no longer blocked on Phase 6 (complete), just
-  not yet written;
+- disconnects have a documented and tested recovery path — met, see
+  `ops_engine_deploy_recovers_from_a_disconnect_mid_call` above;
 - repeated idempotent requests return the original outcome — met;
 - the control plane needs one structured operation rather than a shell
   sequence — met, `ops-engine site deploy` is that one operation.
-
-Phase 4 stays **in progress**, not complete, until the disconnect exit
-criterion has a real test — per this file's own rule not to mark a phase
-complete because its happy path works.
 
 ## Phase 5 — Git rollback pilot
 
@@ -663,6 +676,11 @@ Status: pending
 Goal: make installation, upgrade, downgrade, and recovery safer than manual
 binary replacement.
 
+Suggested starting point: reproducible builds, since every other item in
+this phase operates on a real build artifact (checksums, signing, pinned
+install, atomic upgrade/downgrade all need one to exist first) — nothing
+else here can start honestly before it.
+
 Work items:
 
 - reproducible Linux AMD64 and ARM64 builds;
@@ -726,6 +744,7 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Rollback runs the same best-effort `deploy::cleanup::prune_old_releases` after a successful switch, passing the new target as `active_release`; it does not reset or otherwise special-case "recency" for the release just switched away from. | Keeps retention behavior identical and predictable across both mutation types instead of inventing rollback-specific retention semantics; a rolled-back-from release stays retained immediately afterward purely because cleanup already keeps the most recent N regardless of which operation is calling it. |
 | 2026-09-02 | `RollbackResult` has no `commit` field, unlike `DeployResult`. | Deploy's `commit` echoes an already-validated request input (`DeployRequest::revision`); rollback's request carries a `ReleaseId`, not a commit, so there is no equivalent input to echo without an extra unrequired subprocess call. `releaseId`/`previousReleaseId` alone already satisfy the exit criterion to identify both releases safely. |
 | 2026-09-03 | Phase 6 marked complete; Phase 4's disconnect-test item reclassified from "blocked" to "actionable, not yet written". | `website-control-panel` already has a full, tested client integration (protocol negotiation, capability cache, typed envelopes, older-engine compatibility test, comparison doc) — this repo's `PLAN.md` had not been updated to reflect it. The one remaining Phase 6 gap (newer-engine/older-client coverage) is structurally untestable until a protocol v2 ships, so it is recorded as deferred rather than blocking. |
+| 2026-09-03 | Phase 4 marked complete; a real, deterministic disconnect test was added in `website-control-panel` rather than raced against a fixed session timeout. | A fixed short libssh2 session timeout proved unreliable against this fixture (the deploy pipeline can finish in under 100ms over loopback). Forcibly closing a cloned raw `TcpStream` handle mid-call interrupts the in-flight blocking read deterministically, independent of how fast the real pipeline runs. This also surfaced that `website-control-panel`'s own remote domain lock (a separate, lease-based recovery layer, unrelated to this engine's idempotency) is held for the call's duration and needs its own TTL-based reclaim after a disconnect — already handled in production, now accounted for in the test too. |
 
 ## Open decisions
 
