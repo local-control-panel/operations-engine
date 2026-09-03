@@ -62,6 +62,16 @@ pub enum InstallError {
         result: EngineInstallResult,
         cause: tx_state::StateError,
     },
+    /// The install itself succeeded, but `install.state` — the
+    /// authoritative record of which version is active and which one
+    /// `engine rollback` restores — could not be written afterward. Not a
+    /// failed install, but not an unqualified success either: the caller
+    /// must report it as success-with-warning (see
+    /// `WarningCode::InstallStateRecordIncomplete`).
+    PostCommitInstallStateFailed {
+        result: EngineInstallResult,
+        cause: state::Error,
+    },
     Replayed {
         code: ErrorCode,
         message: String,
@@ -117,7 +127,7 @@ impl InstallError {
                 ErrorCode::Cancelled,
                 "cancelled before the commit point".to_owned(),
             ),
-            Self::PostCommitRecordFailed { .. } => (
+            Self::PostCommitRecordFailed { .. } | Self::PostCommitInstallStateFailed { .. } => (
                 ErrorCode::Internal,
                 "internal engine install error".to_owned(),
             ),
@@ -303,7 +313,6 @@ pub fn execute(
         ));
     }
     let _post_commit = pre_commit.commit();
-    drop(lock);
 
     // The version that falls out of retention after this install: it
     // was `previous` *before* this call (not the new `previous`, which
@@ -317,13 +326,22 @@ pub fn execute(
         active_version: request.version.as_str().to_owned(),
         previous_version: previous_version.clone(),
     };
-    // Best-effort: the commit already happened (the binary at
-    // `/usr/local/bin/ops-engine` is already switched), so a failure to
-    // save `install.state` or prune the superseded version directory is
-    // a bookkeeping/disk-usage concern, not grounds for turning a
-    // successful install into a reported failure.
-    let _ = state::save(&engine_state, &new_state);
-    let _ = prune_superseded_version(&engine_state, superseded_version.as_deref(), &new_state);
+    // Still holding the lock: `install.state` is the authoritative
+    // active/previous record (unlike `site.rollback`, where the atomic
+    // `current` symlink is), so writing it after releasing the lock would
+    // let a concurrent install/rollback read a stale record and compute a
+    // `previous_version` whose retained directory this call is about to
+    // prune. The commit already happened, so two more writes under the
+    // lock cost nothing.
+    let install_state_saved = state::save(&engine_state, &new_state);
+    // Pruning is best-effort disk hygiene — but only once the new record
+    // is durable. If the record write failed, the on-disk state still
+    // names the superseded version as the rollback target, so deleting it
+    // would turn a bookkeeping problem into an unrecoverable one.
+    if install_state_saved.is_ok() {
+        let _ = prune_superseded_version(&engine_state, superseded_version.as_deref(), &new_state);
+    }
+    drop(lock);
 
     let result = EngineInstallResult {
         version: request.version.as_str().to_owned(),
@@ -343,6 +361,9 @@ pub fn execute(
         &audit_path,
         &AuditRecord::result(request.request_id, true, None),
     );
+    if let Err(cause) = install_state_saved {
+        return Err(InstallError::PostCommitInstallStateFailed { result, cause });
+    }
 
     Ok(result)
 }

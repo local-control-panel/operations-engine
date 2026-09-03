@@ -113,6 +113,17 @@ fn run_install(request: &EngineInstallRequest) -> Result<Response, ResponseBuild
                 }])
             })
         }
+        Err(InstallError::PostCommitInstallStateFailed { result, .. }) => {
+            Response::success(INSTALL_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::InstallStateRecordIncomplete,
+                    message: "the install completed but the installed-version record could not be \
+                              saved — engine rollback may target the wrong version until it is \
+                              repaired"
+                        .to_owned(),
+                }])
+            })
+        }
         Err(error) => {
             let (code, message) = error.protocol();
             Ok(Response::failure(INSTALL_OPERATION, code, &message))
@@ -200,6 +211,17 @@ fn run_rollback(request: &EngineRollbackRequest) -> Result<Response, ResponseBui
                 response.with_warnings(vec![Warning {
                     code: WarningCode::TransactionRecordIncomplete,
                     message: "the rollback completed but its transaction record could not be saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(RollbackError::PostCommitInstallStateFailed { result, .. }) => {
+            Response::success(ROLLBACK_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::InstallStateRecordIncomplete,
+                    message: "the rollback completed but the installed-version record could not \
+                              be saved — a further engine rollback may target the wrong version \
+                              until it is repaired"
                         .to_owned(),
                 }])
             })

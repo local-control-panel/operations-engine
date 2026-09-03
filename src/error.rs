@@ -43,6 +43,14 @@ pub enum WarningCode {
     /// its transaction record could not be persisted afterward. The
     /// result is genuine; only the durable bookkeeping is in question.
     TransactionRecordIncomplete,
+    /// An `engine.install`/`engine.rollback` completed — the binary at
+    /// `/usr/local/bin/ops-engine` really was switched — but the
+    /// `install.state` record naming the active and rollback-able
+    /// versions could not be written afterward. Unlike a missing
+    /// transaction record this is operationally significant: until it is
+    /// repaired, `engine rollback` would restore the version named by the
+    /// stale record rather than the one just replaced.
+    InstallStateRecordIncomplete,
 }
 
 #[cfg(test)]
@@ -65,6 +73,11 @@ mod tests {
             serde_json::to_string(&WarningCode::DependencyUnavailable)
                 .expect("code should serialize"),
             "\"DEPENDENCY_UNAVAILABLE\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WarningCode::InstallStateRecordIncomplete)
+                .expect("code should serialize"),
+            "\"INSTALL_STATE_RECORD_INCOMPLETE\""
         );
     }
 

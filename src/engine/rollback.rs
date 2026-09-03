@@ -38,6 +38,14 @@ pub enum RollbackError {
         result: EngineRollbackResult,
         cause: tx_state::StateError,
     },
+    /// The rollback itself succeeded, but `install.state` — the
+    /// authoritative record of which version is active and which one a
+    /// further `engine rollback` restores — could not be written
+    /// afterward. See `install::InstallError::PostCommitInstallStateFailed`.
+    PostCommitInstallStateFailed {
+        result: EngineRollbackResult,
+        cause: state::Error,
+    },
     Replayed {
         code: ErrorCode,
         message: String,
@@ -68,7 +76,7 @@ impl RollbackError {
                 ErrorCode::Cancelled,
                 "cancelled before the commit point".to_owned(),
             ),
-            Self::PostCommitRecordFailed { .. } => (
+            Self::PostCommitRecordFailed { .. } | Self::PostCommitInstallStateFailed { .. } => (
                 ErrorCode::Internal,
                 "internal engine rollback error".to_owned(),
             ),
@@ -186,7 +194,6 @@ pub fn execute(
         ));
     }
     let _post_commit = pre_commit.commit();
-    drop(lock);
 
     // Symmetric swap: a second `engine rollback` right after this one
     // would roll forward again, exactly like `site.rollback`'s
@@ -195,11 +202,12 @@ pub fn execute(
         active_version: previous.clone(),
         previous_version: Some(current.active_version.clone()),
     };
-    // Best-effort: the commit already happened (the binary at
-    // `/usr/local/bin/ops-engine` is already switched), so a failure to
-    // save `install.state` afterward is a bookkeeping concern, not
-    // grounds for reporting the rollback as failed.
-    let _ = state::save(&engine_state, &new_state);
+    // Still holding the lock, and the failure is surfaced rather than
+    // swallowed — see the matching comment in `install::execute` for why
+    // `install.state` is not the same kind of post-commit bookkeeping as
+    // the transaction record.
+    let install_state_saved = state::save(&engine_state, &new_state);
+    drop(lock);
 
     let result = EngineRollbackResult {
         version: previous,
@@ -219,6 +227,9 @@ pub fn execute(
         &audit_path,
         &AuditRecord::result(request.request_id, true, None),
     );
+    if let Err(cause) = install_state_saved {
+        return Err(RollbackError::PostCommitInstallStateFailed { result, cause });
+    }
 
     Ok(result)
 }
