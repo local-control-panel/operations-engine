@@ -5,14 +5,77 @@ on:
     tags:
       - "v*"
 
+# Read-only by default. Only `sign-and-release` publishes, so only it is
+# granted `contents: write`.
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate-tag:
+    name: Validate the release tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup show
+
+      # `engine install` accepts only strict MAJOR.MINOR.PATCH and always
+      # builds its URLs as `/v{version}/`, so a tag like `v1.2`,
+      # `v1.2.3-rc1`, or `1.2.3` would publish a complete, signed release
+      # that no engine can ever install — a failure that would otherwise
+      # surface only when an operator tried to install it. A tag that does
+      # not match the package version is worse: the published assets, the
+      # binary's own `version` output, and what `install.state` records
+      # would all disagree about what is installed.
+      - name: Check the tag is vMAJOR.MINOR.PATCH and matches Cargo.toml
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Release tag '$tag' is not vMAJOR.MINOR.PATCH; ops-engine could never install it."
+            exit 1
+          fi
+          tag_version="${tag#v}"
+          package_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "operations-engine") | .version')"
+          if [ "$tag_version" != "$package_version" ]; then
+            echo "::error::Release tag '$tag' does not match the package version '$package_version' in Cargo.toml."
+            exit 1
+          fi
+          echo "Releasing $package_version from tag $tag"
+
+  check:
+    name: Format, lint, and test
+    needs: validate-tag
+    runs-on: ubuntu-latest
+    env:
+      OPS_ENGINE_GIT_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
+
   build:
+    needs: check
     strategy:
       matrix:
         include:
@@ -54,6 +117,8 @@ jobs:
   sign-and-release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
@@ -72,11 +137,25 @@ jobs:
           cd dist
           sha256sum ops-engine-* > SHA256SUMS
 
+      # Both secrets are passed through `env:` rather than `${{ }}`. A
+      # `${{ }}` expansion is substituted when the runner *renders* the
+      # script file it is about to execute, which would leave the release
+      # signing key — the project's root of trust, whose compromise lets
+      # an attacker sign artifacts every deployed engine accepts — sitting
+      # in cleartext in that file on disk for every later step, including
+      # third-party actions, to read. `shred` cannot undo that: it scrubs
+      # the key file the script wrote, not the script itself.
       - name: Sign the checksum manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_KEY_PASSWORD }}
         run: |
-          echo "${{ secrets.MINISIGN_SECRET_KEY }}" > minisign.key
-          printf '%s\n' "${{ secrets.MINISIGN_KEY_PASSWORD }}" | minisign -S -s minisign.key -m dist/SHA256SUMS
-          shred -u minisign.key
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/minisign.key"
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file")
+          # The minisign CLI takes the key password on stdin only.
+          printf '%s\n' "$MINISIGN_PASSWORD" | minisign -S -s "$key_file" -m dist/SHA256SUMS
+          shred -u "$key_file"
 
       - name: Publish the GitHub Release
         uses: softprops/action-gh-release@v2
