@@ -791,15 +791,26 @@ deferred rather than fixed here:
 
 ## Phase 8 — selective expansion
 
-Status: pending
+Status: in progress — one pilot started
 
 Additional workflows are considered only after the Git pilot succeeds. Each
 workflow requires its own milestone document and measurable reason to move into
 Operations Engine.
 
+**"Atomic Caddy and site configuration changes" — pilot in progress.**
+Milestone doc:
+`docs/superpowers/plans/2026-09-03-ingress-config-activation-pilot.md`.
+Scope: one new `ingress.activateConfig` operation, wired to exactly one of
+`website-control-panel`'s ~28 `activate_caddyfile`/
+`activate_caddyfile_checked` call sites (`disable_basic_auth`) as proof,
+per an explicit decision to pilot on one caller rather than a big-bang
+rewire of all of them. The other ~27 call sites and `reconciliation.rs`'s
+overlapping remediation paths are explicitly out of scope for this pilot —
+see the milestone doc's "Out of scope" section.
+
 Potential candidates:
 
-- atomic Caddy and site configuration changes;
+- atomic Caddy and site configuration changes — **pilot in progress, see above**;
 - stack status and reconciliation;
 - backup and restore;
 - narrowly scoped scheduled jobs.
