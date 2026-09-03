@@ -6,6 +6,7 @@ pub mod deploy;
 pub mod engine;
 pub mod error;
 pub mod filesystem;
+pub mod ingress;
 pub mod mutation;
 pub mod process;
 pub mod protocol;
