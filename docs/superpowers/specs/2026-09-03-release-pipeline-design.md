@@ -113,8 +113,9 @@ ops-engine (on the managed server, privileged path)
      to get the expected binary filename and SHA256
   -> HTTPS GET that specific binary asset
   -> verify its SHA256 against the value just extracted
-  -> on success: atomically activate (symlink rename), retain the
-     previous binary; on any verification failure: no filesystem
+  -> on success: atomically activate (same-directory write-temp-then-
+     rename of /usr/local/bin/ops-engine's content — see §5), retain
+     the previous binary; on any verification failure: no filesystem
      change, no partial state
 ```
 
@@ -152,29 +153,42 @@ run the result, through the same privileged path already used for
 ## 5. On-disk layout and atomic activation
 
 ```
-/opt/ops-engine/
+/usr/local/bin/ops-engine                    (real file, root-owned, mode 0755 —
+                                               the name every SSH invocation and
+                                               the sudoers policy target; fixed by
+                                               docs/site-model.md, not configurable)
+
+<state root>/engine/                         (new subtree, parallel to sites/<siteId>/)
   versions/
-    0.4.0/ops-engine        (root-owned, mode 0755)
+    0.4.0/ops-engine        (retained copy, root-owned, mode 0755)
     0.5.0/ops-engine
-  ops-engine -> versions/0.5.0/ops-engine   (stable symlink; the name
-                                              every SSH invocation targets)
-  install.state                              ({"active":"0.5.0","previous":"0.4.0"})
+  install.state              ({"active":"0.5.0","previous":"0.4.0"})
+  locks/ transactions/ audit/
 ```
 
-This mirrors the Phase 2 site-release/`current`-symlink pattern
-directly: a new version is fetched and verified into
-`versions/<new>/ops-engine` (a fresh directory, not overwriting
-anything live), then activation is one same-directory rename of a
-freshly-created symlink over the stable `ops-engine` path — reusing the
-existing atomic-rename primitive, not a new one. There is never a
-window where `ops-engine` does not resolve to a valid, fully-verified
-executable.
+Revised during implementation planning from this section's original
+symlink-based design: `/usr/local/bin` and the engine's state root are
+different trusted roots, and `ManagedRoot::symlink`'s target is
+deliberately typed as a same-root-relative path — there is no existing
+primitive for a symlink crossing trusted roots, and adding one would be
+a new, security-relevant capability this design does not otherwise
+need. Activation instead writes the verified binary's bytes directly
+into `/usr/local/bin/ops-engine` via a same-directory
+write-temp-then-atomic-rename (the same commit-point discipline as the
+site `current` symlink swap — still exactly one atomic `rename(2)`,
+just of a regular file's content rather than a symlink target). There
+is still never a window where `ops-engine` does not resolve to a valid,
+fully-verified executable.
 
 `install.state` is written with the existing `write_atomic` primitive
 immediately after a successful activation rename. Cleanup after a
 successful install removes the version that is no longer `active` or
 `previous` (best-effort, same spirit as `deploy::cleanup::prune_old_releases`,
 but capped at retaining exactly these two — not a configurable N).
+`engine rollback` reads the retained previous version's bytes straight
+out of `versions/<previous>/ops-engine` and writes them into
+`/usr/local/bin/ops-engine` the same way — no symlink repointing, no
+network call.
 
 ## 6. `engine install`
 
@@ -198,10 +212,11 @@ ops-engine engine install --version X.Y.Z
   expected binary filename and its SHA256 → HTTPS GET that binary into
   a temp file under `versions/X.Y.Z/` (not yet at its final name) →
   hash it and compare to the value from the verified `SHA256SUMS` line
-  → rename into place at `versions/X.Y.Z/ops-engine`, `chmod 0755` →
-  atomic symlink-rename activation → update `install.state` →
-  best-effort prune of anything that is neither `active` nor
-  `previous`.
+  → rename into place at `versions/X.Y.Z/ops-engine`, `chmod 0755`
+  (retained copy) → write the same bytes into `/usr/local/bin/ops-engine`
+  via a same-directory write-temp-then-rename (the actual activation
+  commit point) → update `install.state` → best-effort prune of
+  anything that is neither `active` nor `previous`.
 - Any verification failure (missing/malformed `SHA256SUMS`, bad
   signature, no line for this architecture, checksum mismatch, HTTP
   error, already-installed version) leaves the filesystem untouched
@@ -231,11 +246,13 @@ ops-engine engine rollback
 - Same `mutation::preflight` machinery, operation name
   `"engine.rollback"`, same engine-global lock as `engine install` (the
   two must not race each other).
-- Swaps `active`/`previous` in `install.state`, atomically re-points
-  the `ops-engine` symlink at the previous version's real binary path.
-  No re-verification against a signature is needed — the previous
-  binary was already verified when it was installed and has sat
-  unmodified on a root-owned path since.
+- Swaps `active`/`previous` in `install.state`, reads the retained
+  previous version's bytes from `versions/<previous>/ops-engine`, and
+  writes them into `/usr/local/bin/ops-engine` via the same
+  write-temp-then-rename activation `engine install` uses. No
+  re-verification against a signature is needed — the previous binary
+  was already verified when it was installed and has sat unmodified on
+  a root-owned path since.
 
 ## 8. `capabilities` and protocol
 
