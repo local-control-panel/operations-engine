@@ -99,6 +99,7 @@ fn run_install(request: &EngineInstallRequest) -> Result<Response, ResponseBuild
     let context = InstallContext {
         bin_root: &bin_root,
         engine_state: &engine_state,
+        state_root: &engine_config.state_root,
         release_base_url: GITHUB_RELEASES_BASE,
     };
 

@@ -11,11 +11,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     engine::{
-        EngineInstallRequest, EngineInstallResult, INSTALL_OPERATION, fetch, release, state, verify,
+        EngineInstallRequest, EngineInstallResult, INSTALL_OPERATION, fetch, release, smoke, state,
+        verify,
     },
     error::ErrorCode,
     filesystem::ManagedRoot,
     mutation::preflight,
+    process::{CancellationToken, ProcessRunError},
     site::{SiteRelativePath, TrustedRoot},
     transaction::{
         RequestId,
@@ -35,6 +37,11 @@ pub struct InstallContext<'a> {
     /// `DeployContext::engine_state`). `execute` scopes it down to the
     /// `engine/` subtree via `state::open_engine_state`.
     pub engine_state: &'a ManagedRoot,
+    /// The same root `engine_state` was opened from, as a path. Needed
+    /// only to name the staged binary to the process runner for its
+    /// pre-activation smoke test — a `ManagedRoot` is a capability handle
+    /// and has no path to hand to `exec`. See `state::resolve_path`.
+    pub state_root: &'a TrustedRoot,
     /// The GitHub Releases base URL every asset is fetched relative to.
     /// A parameter (not a hardcoded constant in this file) purely so
     /// tests can point it at a local fixture server; every production
@@ -52,6 +59,15 @@ pub enum InstallError {
     Verify(verify::Error),
     Fetch(fetch::Error),
     ChecksumMismatch,
+    /// The staged binary matched its signed checksum but could not be
+    /// shown to run on this host. Raised before activation, so
+    /// `/usr/local/bin/ops-engine` is untouched.
+    NotRunnable(smoke::Error),
+    /// The staged binary ran, but reports a different version than the
+    /// one requested — the release was mis-tagged or mis-built. Activating
+    /// it would leave `install.state`, the compatibility matrix, and the
+    /// binary's own `version` output disagreeing about what is installed.
+    VersionMismatch,
     State(tx_state::StateError),
     InstallState(state::Error),
     Cancelled,
@@ -122,6 +138,25 @@ impl InstallError {
             Self::ChecksumMismatch => (
                 ErrorCode::ArtifactVerificationFailed,
                 "the downloaded binary did not match its verified checksum".to_owned(),
+            ),
+            // A child that could not be spawned at all is the "won't
+            // execute on this host" case this check exists to catch; a
+            // runner failure after that is our problem, not the
+            // artifact's.
+            Self::NotRunnable(smoke::Error::Run(ProcessRunError::Spawn(_)))
+            | Self::NotRunnable(smoke::Error::NotRunnable(_))
+            | Self::NotRunnable(smoke::Error::UnreadableVersion(_)) => (
+                ErrorCode::ArtifactNotRunnable,
+                "the downloaded binary did not run on this host and was not activated".to_owned(),
+            ),
+            Self::NotRunnable(smoke::Error::Run(_)) => (
+                ErrorCode::Internal,
+                "internal engine install error".to_owned(),
+            ),
+            Self::VersionMismatch => (
+                ErrorCode::ArtifactVerificationFailed,
+                "the downloaded binary reports a different version than the one requested"
+                    .to_owned(),
             ),
             Self::Cancelled => (
                 ErrorCode::Cancelled,
@@ -278,6 +313,46 @@ pub fn execute(
         ));
     }
 
+    // Prove the staged binary actually runs here *before* it becomes the
+    // only binary sudo will let the control plane execute. See
+    // `smoke`'s module comment: without this, an unrunnable upgrade takes
+    // `engine rollback` — the documented first response — down with it.
+    let staged_path = match state::resolve_path(context.state_root, &version_binary) {
+        Ok(path) => path,
+        Err(_) => {
+            return Err(fail(
+                &engine_state,
+                &state_path,
+                &audit_path,
+                tx,
+                InstallError::Io(std::io::Error::other(
+                    "the staged binary's path could not be resolved",
+                )),
+            ));
+        }
+    };
+    let reported_version = match smoke::probe_version(&staged_path, cancellation) {
+        Ok(version) => version,
+        Err(error) => {
+            return Err(fail(
+                &engine_state,
+                &state_path,
+                &audit_path,
+                tx,
+                InstallError::NotRunnable(error),
+            ));
+        }
+    };
+    if reported_version != request.version.as_str() {
+        return Err(fail(
+            &engine_state,
+            &state_path,
+            &audit_path,
+            tx,
+            InstallError::VersionMismatch,
+        ));
+    }
+
     if pre_commit.check().is_err() {
         return Err(fail(
             &engine_state,
@@ -300,6 +375,33 @@ pub fn execute(
             ));
         }
     };
+    // On a host this engine has never managed, whatever is already at
+    // `/usr/local/bin/ops-engine` is about to be overwritten with nothing
+    // retained — leaving the first, riskiest rollout step with no local
+    // rollback at all. Retain it first, under its own reported version
+    // where that can be established.
+    let retained_previous = if current.is_none() {
+        match retain_unmanaged_binary(
+            &bin_root,
+            context,
+            &engine_state,
+            &request.version,
+            cancellation,
+        ) {
+            Ok(retained) => retained,
+            Err(error) => {
+                return Err(fail(
+                    &engine_state,
+                    &state_path,
+                    &audit_path,
+                    tx,
+                    InstallError::Io(error),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     // Commit point: `/usr/local/bin/ops-engine` now contains the new,
     // already-verified binary. Nothing from here may be aborted by
     // cancellation — the switch already happened.
@@ -321,7 +423,11 @@ pub fn execute(
     let superseded_version = current
         .as_ref()
         .and_then(|previous| previous.previous_version.clone());
-    let previous_version = current.map(|previous| previous.active_version);
+    // `retained_previous` is only ever `Some` when `current` is `None`,
+    // so these two never compete.
+    let previous_version = current
+        .map(|previous| previous.active_version)
+        .or(retained_previous);
     let new_state = state::InstallState {
         active_version: request.version.as_str().to_owned(),
         previous_version: previous_version.clone(),
@@ -366,6 +472,70 @@ pub fn execute(
     }
 
     Ok(result)
+}
+
+/// The version label a pre-existing, unmanaged `/usr/local/bin/ops-engine`
+/// is retained under when it cannot say what version it is — because it
+/// will not run, because its answer is not a `MAJOR.MINOR.PATCH` version,
+/// or because that answer collides with the version being installed (in
+/// which case its retained directory would clobber the staged one).
+/// Deliberately not a parseable `EngineVersion`, so nothing can mistake
+/// it for a real release directory.
+const PRE_MANAGED_LABEL: &str = "pre-managed";
+
+/// Copies the binary already at `/usr/local/bin/ops-engine`, if any, into
+/// `versions/<label>/ops-engine` and returns `<label>` — the value the
+/// caller records as `previous_version` so `engine rollback` has
+/// something to restore on a host with no prior managed install.
+///
+/// A failure here fails the whole install: nothing has been activated at
+/// this point, and proceeding would deliver exactly the
+/// no-rollback-on-the-first-upgrade situation this exists to prevent.
+fn retain_unmanaged_binary(
+    bin_root: &ManagedRoot,
+    context: &InstallContext<'_>,
+    engine_state: &ManagedRoot,
+    installing: &release::EngineVersion,
+    cancellation: &CancellationToken,
+) -> std::io::Result<Option<String>> {
+    let binary = binary_path();
+    if !bin_root.exists(&binary) {
+        return Ok(None);
+    }
+    let bytes = bin_root.read_bytes(&binary)?;
+    let label = unmanaged_binary_label(context.bin_root, installing, cancellation);
+
+    let directory = SiteRelativePath::parse(format!("versions/{label}"))
+        .expect("a validated version or the literal sentinel is always a valid path segment");
+    let path = SiteRelativePath::parse(format!("versions/{label}/ops-engine"))
+        .expect("a validated version or the literal sentinel is always a valid path segment");
+    engine_state.create_dir_all(&directory)?;
+    engine_state.write_new_executable(&path, &bytes)?;
+    Ok(Some(label))
+}
+
+/// Best-effort: asks the binary about to be replaced what version it is,
+/// falling back to `PRE_MANAGED_LABEL` whenever the answer cannot be
+/// trusted as a directory name. `EngineVersion::parse` is what makes the
+/// returned label safe to interpolate into a path.
+fn unmanaged_binary_label(
+    bin_root: &TrustedRoot,
+    installing: &release::EngineVersion,
+    cancellation: &CancellationToken,
+) -> String {
+    let Ok(path) = bin_root.resolve_existing(&binary_path()) else {
+        return PRE_MANAGED_LABEL.to_owned();
+    };
+    let Ok(reported) = smoke::probe_version(&path, cancellation) else {
+        return PRE_MANAGED_LABEL.to_owned();
+    };
+    let Ok(version) = release::EngineVersion::parse(&reported) else {
+        return PRE_MANAGED_LABEL.to_owned();
+    };
+    if version.as_str() == installing.as_str() {
+        return PRE_MANAGED_LABEL.to_owned();
+    }
+    version.as_str().to_owned()
 }
 
 fn prune_superseded_version(

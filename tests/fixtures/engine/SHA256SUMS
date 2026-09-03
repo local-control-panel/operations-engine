@@ -1,3 +1,7 @@
+8ee81c9255aeba7a2101c2d73662fa54c78b240117b98826d1a63c578bcbf59b  ops-engine-9.9.5-aarch64-unknown-linux-gnu
+618fb7bfde2d39102b703c6399e30c67a29c6881ab57cdf3f0648235e7a341f4  ops-engine-9.9.5-x86_64-unknown-linux-gnu
+61c5f7e24efc24770f628362f19a44ad7524ffc76accdae9e856c5d092b459db  ops-engine-9.9.6-aarch64-unknown-linux-gnu
+2369ce191492c8dff7f6e5bfa05ddf20330687941695b9c21323d426750c2bdf  ops-engine-9.9.6-x86_64-unknown-linux-gnu
 fadfc00fa087d5d226eb2d9b3a2ed32fd791aafdfd7c37d06d737314d427c4f6  ops-engine-9.9.7-aarch64-unknown-linux-gnu
 6defedacd126f8ea2363532d04b6e717867cb4c228ecf6e265e75c19341f60ae  ops-engine-9.9.7-x86_64-unknown-linux-gnu
 c567fb0f57698cf473d0d427e5f51e91d6f8ec753c8565faa1ef29071b9e56d4  ops-engine-9.9.8-aarch64-unknown-linux-gnu

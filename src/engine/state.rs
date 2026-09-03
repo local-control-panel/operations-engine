@@ -5,11 +5,21 @@
 //! versions — the one active now and the one `engine rollback` can
 //! restore without a network call — never a longer history.
 
-use std::io;
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{filesystem::ManagedRoot, site::SiteRelativePath};
+use crate::{
+    filesystem::ManagedRoot,
+    site::{SiteRelativePath, TrustedRoot, ValidationError},
+};
+
+/// The single subdirectory of the engine-wide state root everything in
+/// this module lives under.
+const ENGINE_SUBTREE: &str = "engine";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,7 +64,7 @@ fn install_state_path() -> SiteRelativePath {
 /// already exist. Mirrors `mutation::preflight::open_site_state`, but
 /// there is only ever one of these per host — no per-ID scoping.
 pub fn open_engine_state(engine_state: &ManagedRoot) -> io::Result<ManagedRoot> {
-    let relative = SiteRelativePath::parse("engine").expect("literal path is valid");
+    let relative = SiteRelativePath::parse(ENGINE_SUBTREE).expect("literal path is valid");
     engine_state.create_dir_all(&relative)?;
     let scoped = engine_state.open_managed_dir(&relative)?;
     for sub in ["locks", "transactions", "audit", "versions"] {
@@ -63,9 +73,27 @@ pub fn open_engine_state(engine_state: &ManagedRoot) -> io::Result<ManagedRoot> 
     Ok(scoped)
 }
 
+/// Resolves `relative` — interpreted beneath the same `engine/` subtree
+/// `open_engine_state` scopes to — to an absolute path under
+/// `state_root`, verified (through `TrustedRoot::resolve_existing`) not to
+/// escape it. `ManagedRoot` is a capability handle with no path of its
+/// own, so this is the only way to name a file in the engine's state to
+/// something outside this process. The one caller is `install::execute`,
+/// which has to hand the staged binary's real path to the process runner
+/// to smoke-test it before activation.
+pub fn resolve_path(
+    state_root: &TrustedRoot,
+    relative: &SiteRelativePath,
+) -> Result<PathBuf, ValidationError> {
+    let beneath_engine =
+        SiteRelativePath::parse(Path::new(ENGINE_SUBTREE).join(relative.as_path()))
+            .map_err(|_| ValidationError::InvalidRelativePath)?;
+    state_root.resolve_existing(&beneath_engine)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{InstallState, load, open_engine_state, save};
+    use super::{InstallState, load, open_engine_state, resolve_path, save};
     use crate::{
         filesystem::ManagedRoot,
         site::{SiteRelativePath, TrustedRoot},
@@ -105,6 +133,25 @@ mod tests {
                 "engine/{sub} should exist"
             );
         }
+    }
+
+    #[test]
+    fn resolve_path_names_a_real_file_beneath_the_engine_subtree() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let state_root = ManagedRoot::open(&root).expect("root should open");
+        let scoped = open_engine_state(&state_root).expect("engine state should open");
+        let relative = SiteRelativePath::parse("versions/9.9.9").expect("path should be valid");
+        scoped
+            .create_dir_all(&relative)
+            .expect("version directory should be created");
+
+        let resolved = resolve_path(&root, &relative).expect("path should resolve");
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("engine/versions/9.9.9"));
+        // A path that does not exist yet has nothing to resolve.
+        let missing = SiteRelativePath::parse("versions/0.0.0").expect("path should be valid");
+        assert!(resolve_path(&root, &missing).is_err());
     }
 
     #[test]

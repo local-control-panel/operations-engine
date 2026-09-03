@@ -1,0 +1,6 @@
+#!/bin/sh
+# Pretend ops-engine 9.9.5 for x86_64-unknown-linux-gnu — a tests/fixtures/engine
+# stand-in, not a real build. Answers only the one subcommand
+# engine::smoke::probe_version invokes.
+[ "$1" = "version" ] || exit 64
+printf '%s\n' '{"protocolVersion":1,"operation":"version","ok":true,"result":{"engineVersion":"1.2.3","protocolVersion":1,"build":{"targetOs":"linux","targetArchitecture":"x86_64","gitCommit":null}},"warnings":[],"error":null}'

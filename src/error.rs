@@ -14,6 +14,9 @@ pub enum ErrorCode {
     SubprocessFailed,
     ArtifactFetchFailed,
     ArtifactVerificationFailed,
+    /// A verified artifact could not be proven to run on this host, so it
+    /// was rejected before anything was activated.
+    ArtifactNotRunnable,
 }
 
 impl ErrorCode {
@@ -30,6 +33,7 @@ impl ErrorCode {
             Self::SubprocessFailed => "SUBPROCESS_FAILED",
             Self::ArtifactFetchFailed => "ARTIFACT_FETCH_FAILED",
             Self::ArtifactVerificationFailed => "ARTIFACT_VERIFICATION_FAILED",
+            Self::ArtifactNotRunnable => "ARTIFACT_NOT_RUNNABLE",
         }
     }
 }
@@ -91,6 +95,14 @@ mod tests {
             serde_json::to_string(&ErrorCode::ArtifactVerificationFailed)
                 .expect("code should serialize"),
             "\"ARTIFACT_VERIFICATION_FAILED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ArtifactNotRunnable).expect("code should serialize"),
+            "\"ARTIFACT_NOT_RUNNABLE\""
+        );
+        assert_eq!(
+            ErrorCode::ArtifactNotRunnable.as_str(),
+            "ARTIFACT_NOT_RUNNABLE"
         );
     }
 }

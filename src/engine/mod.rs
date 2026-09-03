@@ -8,6 +8,7 @@ pub mod fetch;
 pub mod install;
 pub mod release;
 pub mod rollback;
+pub mod smoke;
 pub mod state;
 pub mod verify;
 
