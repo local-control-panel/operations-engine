@@ -38,4 +38,12 @@ in the same change that cuts the first release signed with the new key
 able to verify releases signed with a rotated key, so a key rotation is
 itself a compatibility event worth a `docs/compatibility.md` entry.
 
-As of this writing, `release/minisign.pub` is a TEST-ONLY key (see the comment in `src/engine/verify.rs`) — a real production keypair must be generated and rotated in, with both halves updated (the committed public key and the `MINISIGN_SECRET_KEY`/`MINISIGN_KEY_PASSWORD` GitHub Actions secrets), before cutting the first real release.
+As of this writing, `release/minisign.pub` is a TEST-ONLY key (see the comment in `src/engine/verify.rs`) — a real production keypair must be generated and rotated in, with both halves updated (the committed public key and the `MINISIGN_SECRET_KEY`/`MINISIGN_KEY_PASSWORD` GitHub Actions secrets), before cutting the first real release. When that rotation happens, delete (do not edit) the password line of that comment: it names a password that is only safe to write down because this key is deliberately public.
+
+The TEST-ONLY keypair was regenerated once, in the fix round following the
+Phase 7 review, because the secret half of the original was not retained
+anywhere and the test fixtures under `tests/fixtures/engine/` could no
+longer be re-signed. Nothing had ever been released under the original key.
+The password is unchanged (`test-only-do-not-use-in-production`), and
+`tests/fixtures/engine/regenerate.sh` regenerates and re-signs every fixture
+from it.
