@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache Cargo data
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compute SOURCE_DATE_EPOCH from the tagged commit
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          OPS_ENGINE_GIT_COMMIT: ${{ github.sha }}
+        run: cargo build --release --locked
+
+      - name: Rename the binary with its version and target triple
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp target/release/ops-engine "dist/ops-engine-${VERSION}-${{ matrix.target }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops-engine-${{ matrix.target }}
+          path: dist/*
+
+  sign-and-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+
+      - name: Compute checksums
+        run: |
+          cd dist
+          sha256sum ops-engine-* > SHA256SUMS
+
+      - name: Sign the checksum manifest
+        run: |
+          echo "${{ secrets.MINISIGN_SECRET_KEY }}" > minisign.key
+          printf '%s\n' "${{ secrets.MINISIGN_KEY_PASSWORD }}" | minisign -S -s minisign.key -m dist/SHA256SUMS
+          shred -u minisign.key
+
+      - name: Publish the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ops-engine-*
+            dist/SHA256SUMS
+            dist/SHA256SUMS.minisig
+          generate_release_notes: true

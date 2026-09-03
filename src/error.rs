@@ -12,6 +12,8 @@ pub enum ErrorCode {
     Timeout,
     Cancelled,
     SubprocessFailed,
+    ArtifactFetchFailed,
+    ArtifactVerificationFailed,
 }
 
 impl ErrorCode {
@@ -26,6 +28,8 @@ impl ErrorCode {
             Self::Timeout => "TIMEOUT",
             Self::Cancelled => "CANCELLED",
             Self::SubprocessFailed => "SUBPROCESS_FAILED",
+            Self::ArtifactFetchFailed => "ARTIFACT_FETCH_FAILED",
+            Self::ArtifactVerificationFailed => "ARTIFACT_VERIFICATION_FAILED",
         }
     }
 }
@@ -61,6 +65,19 @@ mod tests {
             serde_json::to_string(&WarningCode::DependencyUnavailable)
                 .expect("code should serialize"),
             "\"DEPENDENCY_UNAVAILABLE\""
+        );
+    }
+
+    #[test]
+    fn new_artifact_error_codes_have_stable_protocol_values() {
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ArtifactFetchFailed).expect("code should serialize"),
+            "\"ARTIFACT_FETCH_FAILED\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::ArtifactVerificationFailed)
+                .expect("code should serialize"),
+            "\"ARTIFACT_VERIFICATION_FAILED\""
         );
     }
 }

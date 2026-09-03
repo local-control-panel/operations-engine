@@ -2,6 +2,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod deploy;
+pub mod engine;
 pub mod error;
 pub mod filesystem;
 pub mod mutation;
@@ -22,6 +23,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Capabilities => commands::capabilities::run(),
         Command::Doctor => commands::doctor::run(),
         Command::Site { command } => commands::site::run(command),
+        Command::Engine { command } => commands::engine::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

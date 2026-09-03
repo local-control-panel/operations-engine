@@ -41,7 +41,9 @@ fn capabilities_describe_only_implemented_operations() {
             "capabilities",
             "doctor",
             "site.deploy",
-            "site.rollback"
+            "site.rollback",
+            "engine.install",
+            "engine.rollback"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
@@ -102,5 +104,20 @@ fn doctor_is_deterministic_with_controlled_dependencies() {
     assert_eq!(
         response["result"]["dependencies"][0]["version"],
         "git test 1.0"
+    );
+}
+
+#[test]
+fn engine_install_requires_a_version_and_request_id() {
+    let output = Command::cargo_bin("ops-engine")
+        .expect("binary should build")
+        .args(["engine", "install"])
+        .assert()
+        .failure();
+    let stderr =
+        String::from_utf8(output.get_output().stderr.clone()).expect("stderr should be UTF-8");
+    assert!(
+        stderr.contains("--version"),
+        "clap should report the missing --version flag"
     );
 }

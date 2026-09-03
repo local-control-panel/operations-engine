@@ -106,6 +106,36 @@ impl ManagedRoot {
             .rename(temp_path.as_path(), &self.directory, path.as_path())
     }
 
+    /// Reads `path` in full as raw bytes — the binary counterpart of
+    /// `read_to_string`, for content (a fetched engine executable) that
+    /// is not valid UTF-8.
+    pub fn read_bytes(&self, path: &SiteRelativePath) -> io::Result<Vec<u8>> {
+        self.directory.read(path.as_path())
+    }
+
+    /// Like `write_atomic`, but additionally marks the written file
+    /// executable (mode `0o755`) before the same same-directory atomic
+    /// rename makes it visible at `path`. The only writer of executable
+    /// content in this codebase — used to stage and activate a fetched,
+    /// checksum- and signature-verified `ops-engine` binary.
+    #[cfg(unix)]
+    pub fn write_new_executable(&self, path: &SiteRelativePath, contents: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_path = temp_sibling_path(path)?;
+        {
+            let mut file = self.directory.create(temp_path.as_path())?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+        }
+        self.directory.set_permissions(
+            temp_path.as_path(),
+            cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(0o755)),
+        )?;
+        self.directory
+            .rename(temp_path.as_path(), &self.directory, path.as_path())
+    }
+
     /// Creates `link` as a new relative symlink pointing at `target`,
     /// failing if `link` already exists (symlink creation is inherently
     /// exclusive — there is no "replace" mode). Pair with `rename` for an
@@ -301,5 +331,46 @@ mod tests {
         let secret = SiteRelativePath::parse(Path::new("escape/secret"))
             .expect("relative path should be valid");
         assert!(managed.read_to_string(&secret).is_err());
+    }
+
+    #[test]
+    fn read_bytes_reads_arbitrary_binary_content() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let path = SiteRelativePath::parse("blob").expect("path should be valid");
+        fs::write(directory.path().join("blob"), [0u8, 159, 255, 1])
+            .expect("blob should be written");
+
+        assert_eq!(managed.read_bytes(&path).unwrap(), vec![0u8, 159, 255, 1]);
+    }
+
+    #[test]
+    fn write_new_executable_replaces_content_and_sets_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let path = SiteRelativePath::parse("ops-engine").expect("path should be valid");
+
+        managed
+            .write_new_executable(&path, b"first binary")
+            .expect("first write should succeed");
+        let first_metadata = fs::metadata(directory.path().join("ops-engine")).unwrap();
+        assert_eq!(first_metadata.permissions().mode() & 0o777, 0o755);
+        assert_eq!(
+            fs::read(directory.path().join("ops-engine")).unwrap(),
+            b"first binary"
+        );
+
+        managed
+            .write_new_executable(&path, b"second binary, longer than the first")
+            .expect("overwrite should succeed");
+        assert_eq!(
+            fs::read(directory.path().join("ops-engine")).unwrap(),
+            b"second binary, longer than the first"
+        );
+        assert!(!directory.path().join("ops-engine.tmp").exists());
     }
 }
