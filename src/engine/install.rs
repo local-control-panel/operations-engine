@@ -263,6 +263,16 @@ pub fn execute(
         ));
     }
 
+    if pre_commit.check().is_err() {
+        return Err(fail(
+            &engine_state,
+            &state_path,
+            &audit_path,
+            tx,
+            InstallError::Cancelled,
+        ));
+    }
+
     let bin_root = match ManagedRoot::open(context.bin_root) {
         Ok(root) => root,
         Err(error) => {
@@ -302,6 +312,11 @@ pub fn execute(
         active_version: request.version.as_str().to_owned(),
         previous_version: previous_version.clone(),
     };
+    // Best-effort: the commit already happened (the binary at
+    // `/usr/local/bin/ops-engine` is already switched), so a failure to
+    // save `install.state` or prune the superseded version directory is
+    // a bookkeeping/disk-usage concern, not grounds for turning a
+    // successful install into a reported failure.
     let _ = state::save(&engine_state, &new_state);
     let _ = prune_superseded_version(&engine_state, superseded_version.as_deref(), &new_state);
 
