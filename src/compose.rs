@@ -9,6 +9,7 @@
 
 use std::{
     env,
+    ffi::OsString,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -78,8 +79,26 @@ pub enum Error {
 ///    available approximation to "the invoking user's actual home
 ///    directory" without assuming any particular account name.
 fn home_dir() -> Option<PathBuf> {
-    match env::var("HOME") {
-        Ok(home) if !home.is_empty() => Some(PathBuf::from(home)),
+    home_dir_inner(env::var_os("HOME"))
+}
+
+/// Core of `home_dir`, taking the `$HOME` value as an explicit parameter
+/// (`None` for "absent") instead of reading the environment itself.
+///
+/// This split exists so tests can exercise both the "`$HOME` present" and
+/// "`$HOME` absent/empty" branches by passing a value directly, rather
+/// than mutating this whole process's real `$HOME` via
+/// `std::env::set_var`/`remove_var` — both `unsafe` on this toolchain
+/// precisely because mutating them concurrently with *any other thread's*
+/// env reads is a data race, and Cargo runs every unit test in this
+/// binary on multiple threads by default, including tests elsewhere that
+/// read unrelated env vars (`PATH` in `process.rs`,
+/// `MINISIGN_TEST_KEY_PASSWORD` in `engine/verify.rs`). `exec_inner`'s
+/// `path_override` parameter (below) applies the same injection pattern
+/// to `PATH`.
+fn home_dir_inner(home: Option<OsString>) -> Option<PathBuf> {
+    match home {
+        Some(home) if !home.is_empty() => Some(PathBuf::from(home)),
         _ => passwd_home_dir(),
     }
 }
@@ -119,8 +138,15 @@ fn passwd_home_dir() -> Option<PathBuf> {
 
 /// Resolves `COMPOSE_BASE_DIR` to an absolute path using `home_dir`.
 pub fn compose_base_dir() -> Result<PathBuf, Error> {
-    home_dir()
-        .map(|home| home.join(COMPOSE_BASE_DIR_SUFFIX))
+    compose_base_dir_inner(home_dir())
+}
+
+/// Core of `compose_base_dir`, taking the already-resolved home directory
+/// as an explicit parameter — same injection pattern as `home_dir_inner`,
+/// so tests can exercise the join (and the `NoHomeDirectory` failure
+/// path) without going through real env state at all.
+fn compose_base_dir_inner(home: Option<PathBuf>) -> Result<PathBuf, Error> {
+    home.map(|home| home.join(COMPOSE_BASE_DIR_SUFFIX))
         .ok_or(Error::NoHomeDirectory)
 }
 
@@ -318,45 +344,17 @@ mod tests {
         assert!(matches!(result, Err(Error::Run(ProcessRunError::Spawn(_)))));
     }
 
-    /// Unlike the fake-`docker` tests above, `home_dir`/`compose_base_dir`
-    /// read `$HOME` (a resource nothing else in this crate touches — see
-    /// `grep -rn '"HOME"' src`), so mutating it is safe with respect to
-    /// every other test in this binary. It is still process-global state,
-    /// though, so calls to `with_home` below are serialized against each
-    /// other via this lock to avoid two of *these* tests racing.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_home<T>(home: Option<&std::ffi::OsStr>, body: impl FnOnce() -> T) -> T {
-        let _guard = HOME_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let original_home = std::env::var_os("HOME");
-        // SAFETY: serialized by `HOME_LOCK` above.
-        unsafe {
-            match home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-
-        let result = body();
-
-        // SAFETY: see above.
-        unsafe {
-            match &original_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-
-        result
-    }
-
+    /// `home_dir`/`compose_base_dir` are exercised through their `_inner`
+    /// cores below, passing the `$HOME` value (or resolved home
+    /// directory) as an explicit argument rather than mutating this
+    /// process's real environment — see `home_dir_inner`'s doc comment
+    /// for why. No lock, no `unsafe`, and no risk of racing any other
+    /// test in this binary.
     #[test]
     fn home_dir_prefers_a_nonempty_home_env_var() {
         let fake_home = tempfile::tempdir().expect("fake home should be created");
 
-        let resolved = with_home(Some(fake_home.path().as_os_str()), super::home_dir);
+        let resolved = super::home_dir_inner(Some(fake_home.path().as_os_str().to_owned()));
 
         assert_eq!(resolved, Some(fake_home.path().to_path_buf()));
     }
@@ -367,12 +365,12 @@ mod tests {
         // sandboxed test environment, but this process's own `getpwuid`
         // lookup must still succeed and agree with itself, proving the
         // fallback path (not just `$HOME`) actually runs.
-        let via_env_removed = with_home(None, super::home_dir);
-        let via_env_empty = with_home(Some(std::ffi::OsStr::new("")), super::home_dir);
+        let via_none = super::home_dir_inner(None);
+        let via_empty = super::home_dir_inner(Some(std::ffi::OsString::new()));
         let via_passwd_directly = super::passwd_home_dir();
 
-        assert_eq!(via_env_removed, via_passwd_directly);
-        assert_eq!(via_env_empty, via_passwd_directly);
+        assert_eq!(via_none, via_passwd_directly);
+        assert_eq!(via_empty, via_passwd_directly);
         assert!(
             via_passwd_directly.is_some(),
             "this process's own uid should resolve to a home directory via getpwuid"
@@ -383,9 +381,17 @@ mod tests {
     fn compose_base_dir_joins_the_resolved_home_with_the_expected_suffix() {
         let fake_home = tempfile::tempdir().expect("fake home should be created");
 
-        let resolved = with_home(Some(fake_home.path().as_os_str()), super::compose_base_dir)
+        let resolved = super::compose_base_dir_inner(Some(fake_home.path().to_path_buf()))
             .expect("a resolvable home should yield a compose base dir");
 
         assert_eq!(resolved, fake_home.path().join("compose/wp-stack"));
+    }
+
+    #[test]
+    fn compose_base_dir_fails_closed_when_no_home_is_resolvable() {
+        assert!(matches!(
+            super::compose_base_dir_inner(None),
+            Err(Error::NoHomeDirectory)
+        ));
     }
 }
