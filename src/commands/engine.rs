@@ -80,7 +80,7 @@ fn run_install(request: &EngineInstallRequest) -> Result<Response, ResponseBuild
             return Ok(Response::failure(
                 INSTALL_OPERATION,
                 ErrorCode::Internal,
-                "engine configuration is unavailable",
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
             ));
         }
     };
@@ -184,7 +184,7 @@ fn run_rollback(request: &EngineRollbackRequest) -> Result<Response, ResponseBui
             return Ok(Response::failure(
                 ROLLBACK_OPERATION,
                 ErrorCode::Internal,
-                "engine configuration is unavailable",
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
             ));
         }
     };

@@ -83,7 +83,7 @@ fn run_deploy(request: &DeployRequest) -> Result<Response, ResponseBuildError> {
             return Ok(Response::failure(
                 DEPLOY_OPERATION,
                 ErrorCode::Internal,
-                "engine configuration is unavailable",
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
             ));
         }
     };
@@ -200,7 +200,7 @@ fn run_rollback(request: &RollbackRequest) -> Result<Response, ResponseBuildErro
             return Ok(Response::failure(
                 ROLLBACK_OPERATION,
                 ErrorCode::Internal,
-                "engine configuration is unavailable",
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
             ));
         }
     };

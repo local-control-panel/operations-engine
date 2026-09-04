@@ -1,7 +1,7 @@
 # Site identity and filesystem model
 
 Status: Phase 2 contract  
-Last updated: 2026-09-02
+Last updated: 2026-09-04
 
 ## Stable identity
 
@@ -59,12 +59,21 @@ The initial configuration has an explicit allowlist, for example:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "contentRoots": ["/var/www"],
   "stateRoot": "/var/lib/operations-engine",
-  "credentialRoot": "/var/lib/operations-engine/credentials"
+  "credentialRoot": "/var/lib/operations-engine-credentials",
+  "ingressRoot": "/var/lib/operations-engine-ingress"
 }
 ```
+
+Every field above is required. `schemaVersion` must equal the engine's
+`CONFIG_SCHEMA_VERSION` exactly — an older or newer value is rejected outright
+rather than partially honored, so a config written for a different engine
+version can never be silently misread. `ingressRoot` arrived with schema
+version 2, for `ingress.activateConfig`; it is the one root outside a site's
+own content root that a mutation may write into, and it must not overlap any
+content root, the state root, or the credential root.
 
 Rules:
 
@@ -77,6 +86,18 @@ Rules:
 - creating a new path requires directory-relative operations that prevent
   symlink replacement races; lexical `join` plus a containment check is not
   sufficient for mutations.
+
+One documented exception to the second rule exists today: `ingress
+activate-config --content-file <path>` names a host path the engine reads the
+submitted route file from. It is read-only, never a write destination, and the
+read is bounded — the engine opens the path, refuses anything that is not a
+regular file (so a FIFO cannot block this root process and a directory or
+device node cannot be submitted), and reads at most `MAX_CONTENT_BYTES + 1`
+bytes so an oversized file is rejected during the read rather than after it is
+already in memory. The path is still not resolved through a trusted root, which
+is weaker than every other path this engine handles; requiring it to live under
+a root-owned staging root is a recorded follow-up (it needs a new configured
+root, so a schema bump, and coordinated client staging).
 
 The validation types implement lexical validation and safe resolution of
 existing paths. Capability-relative directory creation and reads are available;
