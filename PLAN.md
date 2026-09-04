@@ -791,22 +791,41 @@ deferred rather than fixed here:
 
 ## Phase 8 — selective expansion
 
-Status: in progress — one pilot started
+Status: in progress — first pilot shipped, a second migration batch planned
 
 Additional workflows are considered only after the Git pilot succeeds. Each
 workflow requires its own milestone document and measurable reason to move into
 Operations Engine.
 
-**"Atomic Caddy and site configuration changes" — pilot in progress.**
-Milestone doc:
-`docs/superpowers/plans/2026-09-03-ingress-config-activation-pilot.md`.
-Scope: one new `ingress.activateConfig` operation, wired to exactly one of
-`website-control-panel`'s ~28 `activate_caddyfile`/
+**"Atomic Caddy and site configuration changes" — pilot complete, one
+caller migrated; a second batch is planned.**
+Milestone doc: `docs/superpowers/plans/2026-09-03-ingress-config-activation-pilot.md`
+(all 6 tasks done, task-reviewed, and whole-branch reviewed in both
+repos — `operations-engine` `main` at `3a4bf86`, `website-control-panel`
+`master` at `914d6d2`, both pushed).
+Delivered: one new `ingress.activateConfig` operation, wired to exactly
+one of `website-control-panel`'s ~28 `activate_caddyfile`/
 `activate_caddyfile_checked` call sites (`disable_basic_auth`) as proof,
 per an explicit decision to pilot on one caller rather than a big-bang
-rewire of all of them. The other ~27 call sites and `reconciliation.rs`'s
-overlapping remediation paths are explicitly out of scope for this pilot —
-see the milestone doc's "Out of scope" section.
+rewire of all of them, plus a real Docker-backed end-to-end test and two
+integration bugs found and fixed along the way (engine config schema
+v1→v2 migration was write-once instead of reconverging; `sudo` reset
+`HOME` and broke Compose-stack resolution for every elevated call, not
+just this one).
+Next: `website-control-panel`'s own
+`docs/superpowers/plans/2026-09-04-ingress-config-migration-batch-2.md`
+covers a second batch — 5 more call sites confirmed structurally
+identical to `disable_basic_auth`'s pre-migration shape
+(`set_security_headers`, `set_redirects`, `set_ip_acl`,
+`enable_access_log`, `update_raw_ingress_route`) — via a shared
+client-side helper extracted from `disable_basic_auth`'s proven logic.
+No `operations-engine` changes needed; the operation and its contract
+are already shipped. The remaining call sites (`enable_basic_auth`,
+`activate_site_process_config_checked`, `set_maintenance`, `create_site`,
+`restore_deleted_site`, `migrate_site_runtime_impl`, `rename_site`,
+`rollback_rename_commit`) and `reconciliation.rs`'s overlapping
+remediation paths stay out of scope — see that plan's own "Out of
+scope" section for why each one specifically.
 
 Potential candidates:
 
