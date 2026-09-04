@@ -791,36 +791,37 @@ deferred rather than fixed here:
 
 ## Phase 8 — selective expansion
 
-Status: in progress — first pilot shipped, a second migration batch planned
+Status: in progress — 6 of ~28 ingress call sites migrated, rest deferred
 
 Additional workflows are considered only after the Git pilot succeeds. Each
 workflow requires its own milestone document and measurable reason to move into
 Operations Engine.
 
-**"Atomic Caddy and site configuration changes" — pilot complete, one
-caller migrated; a second batch is planned.**
-Milestone doc: `docs/superpowers/plans/2026-09-03-ingress-config-activation-pilot.md`
-(all 6 tasks done, task-reviewed, and whole-branch reviewed in both
-repos — `operations-engine` `main` at `3a4bf86`, `website-control-panel`
-`master` at `914d6d2`, both pushed).
-Delivered: one new `ingress.activateConfig` operation, wired to exactly
-one of `website-control-panel`'s ~28 `activate_caddyfile`/
-`activate_caddyfile_checked` call sites (`disable_basic_auth`) as proof,
-per an explicit decision to pilot on one caller rather than a big-bang
-rewire of all of them, plus a real Docker-backed end-to-end test and two
-integration bugs found and fixed along the way (engine config schema
-v1→v2 migration was write-once instead of reconverging; `sudo` reset
-`HOME` and broke Compose-stack resolution for every elevated call, not
-just this one).
-Next: `website-control-panel`'s own
+**"Atomic Caddy and site configuration changes" — pilot and a second
+migration batch both shipped; 6 of ~28 call sites migrated.**
+Milestone docs: `docs/superpowers/plans/2026-09-03-ingress-config-activation-pilot.md`
+(pilot, 6 tasks) and `website-control-panel`'s own
 `docs/superpowers/plans/2026-09-04-ingress-config-migration-batch-2.md`
-covers a second batch — 5 more call sites confirmed structurally
-identical to `disable_basic_auth`'s pre-migration shape
-(`set_security_headers`, `set_redirects`, `set_ip_acl`,
-`enable_access_log`, `update_raw_ingress_route`) — via a shared
-client-side helper extracted from `disable_basic_auth`'s proven logic.
-No `operations-engine` changes needed; the operation and its contract
-are already shipped. The remaining call sites (`enable_basic_auth`,
+(batch 2, 7 tasks) — both done, task-reviewed, and whole-branch
+reviewed. `operations-engine` `main` at `3a4bf86`, `website-control-panel`
+`master` at `ec38ba9`, both pushed.
+Delivered: one new `ingress.activateConfig` operation (pilot), wired to
+6 of `website-control-panel`'s ~28 `activate_caddyfile`/
+`activate_caddyfile_checked` call sites — `disable_basic_auth` (pilot,
+proof of concept) plus `update_raw_ingress_route` (2 callers),
+`enable_access_log`, `set_security_headers`, `set_redirects`,
+`set_ip_acl` (batch 2, via a shared client-side helper,
+`activate_ingress_route_via_engine_or`, extracted from the pilot's
+proven logic). No further `operations-engine` changes needed for
+either batch; the operation and its contract are unchanged since the
+pilot. Two integration bugs found and fixed during the pilot (engine
+config schema v1→v2 was write-once instead of reconverging; `sudo`
+reset `HOME` and broke Compose-stack resolution for every elevated
+call); one correctness bug found and fixed during batch 2's final
+review (`enable_access_log`'s transform silently dropped a validation
+its legacy sibling performed, so enrolled and non-enrolled sites
+disagreed on a malformed access-log block).
+The remaining call sites (`enable_basic_auth`,
 `activate_site_process_config_checked`, `set_maintenance`, `create_site`,
 `restore_deleted_site`, `migrate_site_runtime_impl`, `rename_site`,
 `rollback_rename_commit`) and `reconciliation.rs`'s overlapping
