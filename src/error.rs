@@ -28,11 +28,31 @@ pub enum ErrorCode {
     /// run it (`caddy validate`), before anything reached the live path.
     /// The live configuration is untouched.
     ConfigValidationFailed,
-    /// The submitted configuration passed standalone validation but the
-    /// live reload that followed failed — typically a conflict with some
-    /// other already-live config file that standalone validation cannot
-    /// see. The previous file was restored and successfully reloaded, so
-    /// what is live now is exactly what was live before this request.
+    /// A live reload failed — typically a conflict with some other
+    /// already-live config file that standalone validation cannot see. In
+    /// every case this code is used, *this request wrote nothing that
+    /// survived it*: nothing needs undoing and a retry is safe. What it
+    /// does **not** uniformly promise is what the running server is on,
+    /// because it has two producers with different guarantees:
+    ///
+    /// - `ReloadFailedAndRestored` — the submitted config was activated,
+    ///   its reload failed, and the previous file was then put back *and*
+    ///   successfully reloaded. Here what is live is exactly what was live
+    ///   before this request. (The one exception is a reload that timed
+    ///   out rather than returning a verdict: the engine stops waiting but
+    ///   cannot kill the command inside the container, so it says so in
+    ///   the message instead of claiming the restore is live.)
+    /// - `ReloadFailedUnchanged` — the file already held the submitted
+    ///   content, so nothing was written, and the reload that exists to
+    ///   converge the running server onto it failed. Nothing on disk
+    ///   changed, but the running server is on something the engine could
+    ///   not identify — quite possibly not this file, since that
+    ///   divergence is the reason the converging reload runs at all.
+    ///
+    /// So: safe to retry in both cases, but only the first lets a client
+    /// assume the live configuration is the previous one. The response
+    /// message distinguishes them; treat this code alone as "the reload
+    /// did not take", not as "the previous config is live".
     ConfigReloadFailed,
     /// A reload failed *and* the recovery that follows it did not
     /// complete: either the previous file could not be put back or, once

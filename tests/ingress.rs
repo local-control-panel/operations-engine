@@ -5,7 +5,7 @@
 //! `tests/rollback.rs`, and `tests/engine.rs` exercise their own
 //! operations from outside the crate.
 //!
-//! `src/ingress/activate.rs` and `execute.rs` already carry 80+ white-box
+//! `src/ingress/activate.rs` and `execute.rs` already carry ~28 white-box
 //! unit tests covering every branch of the activation sequence using
 //! `crate::ingress::fake_docker::FakeDocker`, a `pub(crate)` fixture that
 //! is unreachable from here — this file is not trying to rediscover those

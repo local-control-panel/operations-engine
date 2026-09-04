@@ -110,11 +110,30 @@ impl ActivateConfigError {
                 compose_failure_code(failure, ErrorCode::ConfigValidationFailed),
                 "the submitted configuration was rejected before it was activated".to_owned(),
             ),
+            // The message here is branched on whether the *first* reload
+            // timed out, because that is exactly the case where the
+            // restore's guarantee stops being one. `process::run` kills
+            // the local `docker` client on timeout; it does not kill the
+            // `caddy reload` that client already started inside the
+            // container. So a timed-out reload may still land — and if it
+            // lands after the restore reload, the live server ends up on
+            // the *new* config while the file on disk is the old one.
+            // Asserting "the previous configuration was restored and is
+            // live" in that case would be claiming a property this engine
+            // did not verify, in precisely the scenario the restore path
+            // exists to cover. A non-timeout failure has a real exit
+            // status, so the ordering is known and the assertion holds.
             Self::Activate(activate::Error::ReloadFailedAndRestored(failure)) => (
                 compose_failure_code(failure, ErrorCode::ConfigReloadFailed),
-                "the submitted configuration failed to load; the previous configuration was \
-                 restored and is live"
-                    .to_owned(),
+                if timed_out(failure) {
+                    "the submitted configuration timed out while loading; the previous \
+                     configuration was put back on disk, but whether the running server is on \
+                     it could not be confirmed - verify the live ingress configuration"
+                } else {
+                    "the submitted configuration failed to load; the previous configuration was \
+                     restored and is live"
+                }
+                .to_owned(),
             ),
             Self::Activate(activate::Error::ReloadFailedUnchanged(failure)) => (
                 compose_failure_code(failure, ErrorCode::ConfigReloadFailed),
@@ -153,9 +172,17 @@ impl ActivateConfigError {
     }
 }
 
-/// A Compose call that could not be *run* is a host/dependency problem,
-/// not a verdict on the submitted configuration — report it as such rather
-/// than telling the caller its config is invalid.
+/// A Compose call that could not be *run* — or that was never allowed to
+/// finish — is a host/dependency problem, not a verdict on the submitted
+/// configuration. Report it as such rather than telling the caller its
+/// config is invalid.
+///
+/// `timed_out` is checked before `cancelled` because a timeout is the more
+/// specific claim: the deadline is what ended the call, and the
+/// cancellation flag on the same diagnostics only says the token was also
+/// observed. `rejected` is reached only when the command really did run to
+/// completion and return a failing status — the one case where the
+/// container's verdict on the config is what the caller should hear.
 fn compose_failure_code(failure: &ComposeFailure, rejected: ErrorCode) -> ErrorCode {
     match failure {
         ComposeFailure::Run(compose::Error::NoHomeDirectory) => ErrorCode::Internal,
@@ -163,11 +190,21 @@ fn compose_failure_code(failure: &ComposeFailure, rejected: ErrorCode) -> ErrorC
         ComposeFailure::Rejected(diagnostics) => {
             if diagnostics.timed_out {
                 ErrorCode::Timeout
+            } else if diagnostics.cancelled {
+                ErrorCode::Cancelled
             } else {
                 rejected
             }
         }
     }
+}
+
+/// Whether this failure was a timeout — the one failure mode where the
+/// command may still be running inside the container after this engine has
+/// stopped waiting for it, so nothing observed afterward can be reported
+/// as settled. See the `ReloadFailedAndRestored` arm above.
+fn timed_out(failure: &ComposeFailure) -> bool {
+    matches!(failure, ComposeFailure::Rejected(diagnostics) if diagnostics.timed_out)
 }
 
 pub fn execute(
@@ -753,6 +790,71 @@ mod tests {
                 "a protocol message must not carry a path: {message}"
             );
         }
+    }
+
+    /// A cancelled Compose call is not a verdict on the submitted config
+    /// either: the command was stopped, not answered. Reporting it as
+    /// `CONFIG_VALIDATION_FAILED`/`CONFIG_RELOAD_FAILED` would tell a
+    /// client to fix a configuration that was never actually judged.
+    #[test]
+    fn a_cancelled_compose_call_reports_cancellation_not_a_rejected_config() {
+        use crate::ingress::activate;
+
+        let cancelled = || {
+            activate::ComposeFailure::Rejected(crate::process::SubprocessDiagnostics {
+                cancelled: true,
+                ..diagnostics(false)
+            })
+        };
+        for error in [
+            ActivateConfigError::Activate(activate::Error::ValidateFailed(cancelled())),
+            ActivateConfigError::Activate(activate::Error::ReloadFailedAndRestored(cancelled())),
+        ] {
+            assert_eq!(error.protocol().0, ErrorCode::Cancelled, "for {error:?}");
+        }
+    }
+
+    /// The safety claim this operation's restore path exists to make -
+    /// "the previous configuration was restored and is live" - is only
+    /// made when this engine actually saw the failing reload finish. On a
+    /// timeout it did not: `process::run` kills the local `docker` client,
+    /// not the `caddy reload` already running in the container, so that
+    /// reload can still land *after* the restore reload and leave the
+    /// server on the new config. The message must say so rather than
+    /// assert a guarantee nothing verified.
+    #[test]
+    fn a_timed_out_reload_does_not_claim_the_previous_config_is_live() {
+        use crate::ingress::activate;
+
+        let (settled_code, settled) =
+            ActivateConfigError::Activate(activate::Error::ReloadFailedAndRestored(
+                activate::ComposeFailure::Rejected(diagnostics(false)),
+            ))
+            .protocol();
+        assert_eq!(settled_code, ErrorCode::ConfigReloadFailed);
+        assert!(
+            settled.contains("restored and is live"),
+            "a reload that really failed still restores and reloads: {settled}"
+        );
+
+        let (timeout_code, timed_out) =
+            ActivateConfigError::Activate(activate::Error::ReloadFailedAndRestored(
+                activate::ComposeFailure::Rejected(diagnostics(true)),
+            ))
+            .protocol();
+        assert_eq!(timeout_code, ErrorCode::Timeout);
+        assert!(
+            !timed_out.contains("is live"),
+            "a timed-out reload must not assert what is live: {timed_out}"
+        );
+        assert!(
+            timed_out.contains("could not be confirmed"),
+            "a timed-out reload must say the outcome is unconfirmed: {timed_out}"
+        );
+        assert!(
+            !timed_out.contains('/'),
+            "a protocol message must not carry a path: {timed_out}"
+        );
     }
 
     fn diagnostics(timed_out: bool) -> crate::process::SubprocessDiagnostics {

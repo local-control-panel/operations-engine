@@ -107,7 +107,19 @@ pub enum Error {
 /// otherwise tell "already in the requested state" from "changed", and
 /// re-running a converged mutation is the common case
 /// (`disable_basic_auth` on a site that already has no basic auth).
-pub fn activate(
+///
+/// `pub(crate)`, not `pub`, and deliberately so. `backup_suffix` is the one
+/// parameter here with no validating type behind it: a suffix containing a
+/// `/` would make `RoutePaths::new`'s `SiteRelativePath::parse` fail, and
+/// that call is an `expect()` — i.e. a panic in a root process, reachable
+/// from an argument. Inside this crate the only caller is
+/// `execute::execute`, which passes an already-validated canonical
+/// `RequestId`, so no such value exists. Keeping the function crate-private
+/// is what makes that a closed argument rather than a promise: the
+/// out-of-crate surface (`ComposeFailure`, `RestoreFailure`, `Error`,
+/// `Activation`) stays public, but nothing outside can hand this an
+/// unvalidated suffix.
+pub(crate) fn activate(
     ingress_root: &TrustedRoot,
     domain: &Domain,
     content: &str,
