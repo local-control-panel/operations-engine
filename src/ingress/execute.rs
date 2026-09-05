@@ -256,6 +256,7 @@ pub fn execute(
         &request.domain,
         &request.content,
         &request.guard,
+        request.target,
         &request.request_id.to_string(),
         context.compose,
     );
@@ -406,7 +407,9 @@ mod tests {
     use crate::{
         error::ErrorCode,
         filesystem::ManagedRoot,
-        ingress::{ActivateConfigRequest, ConfigHash, HashGuard, fake_docker::FakeDocker},
+        ingress::{
+            ActivateConfigRequest, ConfigHash, HashGuard, RouteTarget, fake_docker::FakeDocker,
+        },
         process::CancellationToken,
         site::TrustedRoot,
         transaction::{
@@ -478,7 +481,7 @@ mod tests {
     }
 
     fn request(guard: HashGuard, request_id: &str, key: Option<&str>) -> ActivateConfigRequest {
-        ActivateConfigRequest::parse(DOMAIN, UPDATED, guard, request_id, key)
+        ActivateConfigRequest::parse(DOMAIN, UPDATED, guard, RouteTarget::Live, request_id, key)
             .expect("request should parse")
     }
 

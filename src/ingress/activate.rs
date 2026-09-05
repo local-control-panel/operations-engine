@@ -14,7 +14,7 @@ use std::io;
 use crate::{
     compose,
     filesystem::ManagedRoot,
-    ingress::{HashGuard, INGRESS_SERVICE, LIVE_CONFIG_PATH},
+    ingress::{HashGuard, INGRESS_SERVICE, LIVE_CONFIG_PATH, RouteTarget},
     process::{ProcessOutput, ProcessTermination, SubprocessDiagnostics},
     site::{Domain, SiteRelativePath, TrustedRoot, ValidationError},
 };
@@ -120,6 +120,25 @@ pub enum Error {
 /// `Activation`) stays public, but nothing outside can hand this an
 /// unvalidated suffix.
 pub(crate) fn activate(
+    ingress_root: &TrustedRoot,
+    domain: &Domain,
+    content: &str,
+    guard: &HashGuard,
+    target: RouteTarget,
+    backup_suffix: &str,
+    compose: &compose::Access,
+) -> Result<Activation, Error> {
+    match target {
+        RouteTarget::Live => {
+            activate_live(ingress_root, domain, content, guard, backup_suffix, compose)
+        }
+        RouteTarget::Backup => activate_backup(ingress_root, domain, content, guard),
+    }
+}
+
+/// `RouteTarget::Live`: today's exact validate/write/rename/reload/rollback
+/// sequence, unchanged.
+fn activate_live(
     ingress_root: &TrustedRoot,
     domain: &Domain,
     content: &str,
@@ -230,6 +249,35 @@ pub(crate) fn activate(
     Err(Error::ReloadFailedAndRestored(reload_failure))
 }
 
+/// `RouteTarget::Backup`: a plain hash-guarded atomic write to
+/// `<domain>.maintenance-backup`. No `.tmp` staging, no `.rollback-*`
+/// backup-of-a-backup, no `caddy validate`, no reload — those all exist to
+/// protect the *live*, Caddy-imported file across a container reload, which
+/// is meaningless for a file Caddy never reads.
+fn activate_backup(
+    ingress_root: &TrustedRoot,
+    domain: &Domain,
+    content: &str,
+    guard: &HashGuard,
+) -> Result<Activation, Error> {
+    let root = ManagedRoot::open(ingress_root).map_err(Error::Io)?;
+    let path = super::backup_route_path(domain);
+
+    let current = read_optional(&root, &path)?;
+    if !guard.is_satisfied_by(current.as_deref()) {
+        return Err(Error::HashGuardMismatch);
+    }
+    if current.as_deref() == Some(content.as_bytes()) {
+        // Unlike the `Live` no-op case, there is no reload to converge
+        // here: nothing left to do.
+        return Ok(Activation { activated: false });
+    }
+
+    root.write_atomic(&path, content.as_bytes())
+        .map_err(Error::Io)?;
+    Ok(Activation { activated: true })
+}
+
 /// The three files one activation touches, all siblings under
 /// `ingress_root`.
 struct RoutePaths {
@@ -329,12 +377,13 @@ mod tests {
     use super::{Activation, ComposeFailure, Error, RestoreFailure, activate};
     use crate::{
         compose,
-        ingress::{ConfigHash, HashGuard, fake_docker::FakeDocker},
+        ingress::{ConfigHash, HashGuard, RouteTarget, fake_docker::FakeDocker},
         site::{Domain, TrustedRoot},
     };
 
     const DOMAIN: &str = "example.com";
     const ROUTE: &str = "example.com.caddyfile";
+    const BACKUP_ROUTE: &str = "example.com.maintenance-backup";
     const SUFFIX: &str = "123e4567-e89b-12d3-a456-426614174000";
     const PREVIOUS: &str = "example.com {\n  respond \"old\"\n}\n";
     const UPDATED: &str = "example.com {\n  respond \"new\"\n}\n";
@@ -356,6 +405,10 @@ mod tests {
     impl Root {
         fn live(&self) -> Option<String> {
             fs::read_to_string(self.dir.path().join(ROUTE)).ok()
+        }
+
+        fn backup(&self) -> Option<String> {
+            fs::read_to_string(self.dir.path().join(BACKUP_ROUTE)).ok()
         }
 
         /// Every entry in the root, so a test can assert that no `.tmp` or
@@ -390,12 +443,14 @@ mod tests {
         docker: &FakeDocker,
         content: &str,
         guard: HashGuard,
+        target: RouteTarget,
     ) -> Result<Activation, Error> {
         activate(
             &root.trusted,
             &domain(),
             content,
             &guard,
+            target,
             SUFFIX,
             &docker.access(),
         )
@@ -406,8 +461,14 @@ mod tests {
         let root = ingress_root(None);
         let docker = FakeDocker::new();
 
-        let activation =
-            run(&root, &docker, UPDATED, HashGuard::Absent).expect("fresh activation should apply");
+        let activation = run(
+            &root,
+            &docker,
+            UPDATED,
+            HashGuard::Absent,
+            RouteTarget::Live,
+        )
+        .expect("fresh activation should apply");
 
         assert_eq!(activation, Activation { activated: true });
         assert_eq!(root.live().as_deref(), Some(UPDATED));
@@ -425,7 +486,14 @@ mod tests {
         let root = ingress_root(None);
         let docker = FakeDocker::new();
 
-        run(&root, &docker, UPDATED, HashGuard::Absent).expect("activation should apply");
+        run(
+            &root,
+            &docker,
+            UPDATED,
+            HashGuard::Absent,
+            RouteTarget::Live,
+        )
+        .expect("activation should apply");
 
         let expected = root
             .dir
@@ -459,6 +527,7 @@ mod tests {
             &docker,
             UPDATED,
             HashGuard::Sha256(ConfigHash::of(PREVIOUS.as_bytes())),
+            RouteTarget::Live,
         )
         .expect("an activation whose guard matches should apply");
 
@@ -477,6 +546,7 @@ mod tests {
             &docker,
             UPDATED,
             HashGuard::Sha256(ConfigHash::of(b"what the caller thought was there")),
+            RouteTarget::Live,
         )
         .expect_err("a stale guard must not activate");
 
@@ -494,8 +564,14 @@ mod tests {
         let root = ingress_root(Some(PREVIOUS));
         let docker = FakeDocker::new();
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Absent)
-            .expect_err("a first-activation guard must not overwrite an existing file");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            HashGuard::Absent,
+            RouteTarget::Live,
+        )
+        .expect_err("a first-activation guard must not overwrite an existing file");
 
         assert!(matches!(error, Error::HashGuardMismatch));
         assert_eq!(root.live().as_deref(), Some(PREVIOUS));
@@ -506,8 +582,14 @@ mod tests {
         let root = ingress_root(Some(PREVIOUS));
         let docker = FakeDocker::new().failing("validate", "all");
 
-        let error = run(&root, &docker, UPDATED, guard_on(PREVIOUS))
-            .expect_err("a rejected config must not activate");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            guard_on(PREVIOUS),
+            RouteTarget::Live,
+        )
+        .expect_err("a rejected config must not activate");
 
         assert!(matches!(
             error,
@@ -525,8 +607,14 @@ mod tests {
         let root = ingress_root(None);
         let docker = FakeDocker::new().failing("validate", "all");
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Absent)
-            .expect_err("a rejected config must not activate");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            HashGuard::Absent,
+            RouteTarget::Live,
+        )
+        .expect_err("a rejected config must not activate");
 
         assert!(matches!(error, Error::ValidateFailed(_)));
         assert_eq!(root.live(), None);
@@ -540,8 +628,14 @@ mod tests {
         // second, for the restored previous config, succeeds.
         let docker = FakeDocker::new().failing("reload", "1");
 
-        let error = run(&root, &docker, UPDATED, guard_on(PREVIOUS))
-            .expect_err("a config the server refuses to load must not stay live");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            guard_on(PREVIOUS),
+            RouteTarget::Live,
+        )
+        .expect_err("a config the server refuses to load must not stay live");
 
         assert!(matches!(
             error,
@@ -565,8 +659,14 @@ mod tests {
         let root = ingress_root(None);
         let docker = FakeDocker::new().failing("reload", "1");
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Absent)
-            .expect_err("a config the server refuses to load must not stay live");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            HashGuard::Absent,
+            RouteTarget::Live,
+        )
+        .expect_err("a config the server refuses to load must not stay live");
 
         assert!(matches!(error, Error::ReloadFailedAndRestored(_)));
         assert_eq!(root.live(), None, "there was no previous file to restore");
@@ -579,8 +679,14 @@ mod tests {
         let root = ingress_root(Some(PREVIOUS));
         let docker = FakeDocker::new().failing("reload", "all");
 
-        let error = run(&root, &docker, UPDATED, guard_on(PREVIOUS))
-            .expect_err("a config the server refuses to load must not stay live");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            guard_on(PREVIOUS),
+            RouteTarget::Live,
+        )
+        .expect_err("a config the server refuses to load must not stay live");
 
         // Both halves are reported: the original reload failure and the
         // fact that reloading the restored file failed too. Reporting only
@@ -610,8 +716,14 @@ mod tests {
         let root = ingress_root(Some(PREVIOUS));
         let docker = FakeDocker::new();
 
-        let activation = run(&root, &docker, PREVIOUS, guard_on(PREVIOUS))
-            .expect("re-submitting the current contents should succeed");
+        let activation = run(
+            &root,
+            &docker,
+            PREVIOUS,
+            guard_on(PREVIOUS),
+            RouteTarget::Live,
+        )
+        .expect("re-submitting the current contents should succeed");
 
         assert_eq!(activation, Activation { activated: false });
         assert_eq!(root.live().as_deref(), Some(PREVIOUS));
@@ -637,8 +749,14 @@ mod tests {
         let root = ingress_root(Some(UPDATED));
         let docker = FakeDocker::new().failing("reload", "all");
 
-        let error = run(&root, &docker, UPDATED, guard_on(UPDATED))
-            .expect_err("a server that will not load the current file is not a success");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            guard_on(UPDATED),
+            RouteTarget::Live,
+        )
+        .expect_err("a server that will not load the current file is not a success");
 
         assert!(
             matches!(
@@ -667,6 +785,7 @@ mod tests {
             &docker,
             PREVIOUS,
             HashGuard::Sha256(ConfigHash::of(b"stale")),
+            RouteTarget::Live,
         )
         .expect_err("a stale guard must be reported");
 
@@ -686,6 +805,7 @@ mod tests {
             &domain(),
             UPDATED,
             &guard_on(PREVIOUS),
+            RouteTarget::Live,
             SUFFIX,
             &access,
         )
@@ -717,8 +837,14 @@ mod tests {
         symlink(&target, root.dir.path().join(ROUTE)).expect("symlink should be created");
         let docker = FakeDocker::new();
 
-        let error = run(&root, &docker, UPDATED, HashGuard::Absent)
-            .expect_err("a route escaping the root must not be activated");
+        let error = run(
+            &root,
+            &docker,
+            UPDATED,
+            HashGuard::Absent,
+            RouteTarget::Live,
+        )
+        .expect_err("a route escaping the root must not be activated");
 
         assert!(matches!(error, Error::Io(_)), "unexpected error: {error:?}");
         assert_eq!(
@@ -747,7 +873,14 @@ mod tests {
             .expect("symlink should be created");
         let docker = FakeDocker::new();
 
-        run(&root, &docker, UPDATED, HashGuard::Absent).expect("activation should apply");
+        run(
+            &root,
+            &docker,
+            UPDATED,
+            HashGuard::Absent,
+            RouteTarget::Live,
+        )
+        .expect("activation should apply");
 
         assert_eq!(root.live().as_deref(), Some(UPDATED));
         assert_eq!(
@@ -755,5 +888,92 @@ mod tests {
             "not managed by this engine"
         );
         assert_eq!(root.entries(), vec![ROUTE.to_owned()]);
+    }
+
+    #[test]
+    fn a_fresh_backup_write_needs_no_validate_or_reload() {
+        let root = ingress_root(None);
+        let docker = FakeDocker::new();
+
+        let activation = activate(
+            &root.trusted,
+            &domain(),
+            UPDATED,
+            &HashGuard::Absent,
+            RouteTarget::Backup,
+            SUFFIX,
+            &docker.access(),
+        )
+        .expect("a fresh backup write should apply");
+
+        assert_eq!(activation, Activation { activated: true });
+        assert_eq!(root.backup().as_deref(), Some(UPDATED));
+        assert!(docker.calls("validate").is_empty());
+        assert!(docker.calls("reload").is_empty());
+    }
+
+    #[test]
+    fn a_stale_backup_guard_is_rejected_before_any_write() {
+        let root = ingress_root(None);
+        fs::write(root.dir.path().join(BACKUP_ROUTE), PREVIOUS)
+            .expect("existing backup should be written");
+        let docker = FakeDocker::new();
+
+        let error = activate(
+            &root.trusted,
+            &domain(),
+            UPDATED,
+            &HashGuard::Sha256(ConfigHash::of(b"what the caller thought was there")),
+            RouteTarget::Backup,
+            SUFFIX,
+            &docker.access(),
+        )
+        .expect_err("a stale guard must not activate");
+
+        assert!(matches!(error, Error::HashGuardMismatch));
+        assert_eq!(root.backup().as_deref(), Some(PREVIOUS));
+    }
+
+    #[test]
+    fn identical_backup_content_reports_unactivated_and_writes_nothing() {
+        let root = ingress_root(None);
+        fs::write(root.dir.path().join(BACKUP_ROUTE), UPDATED)
+            .expect("existing backup should be written");
+        let docker = FakeDocker::new();
+
+        let activation = activate(
+            &root.trusted,
+            &domain(),
+            UPDATED,
+            &guard_on(UPDATED),
+            RouteTarget::Backup,
+            SUFFIX,
+            &docker.access(),
+        )
+        .expect("re-submitting the current backup contents should succeed");
+
+        assert_eq!(activation, Activation { activated: false });
+        assert_eq!(root.backup().as_deref(), Some(UPDATED));
+        assert!(docker.calls("validate").is_empty());
+        assert!(docker.calls("reload").is_empty());
+    }
+
+    #[test]
+    fn a_backup_write_never_touches_the_live_route_file() {
+        let root = ingress_root(None);
+        let docker = FakeDocker::new();
+
+        activate(
+            &root.trusted,
+            &domain(),
+            UPDATED,
+            &HashGuard::Absent,
+            RouteTarget::Backup,
+            SUFFIX,
+            &docker.access(),
+        )
+        .expect("a fresh backup write should apply");
+
+        assert_eq!(root.live(), None);
     }
 }
