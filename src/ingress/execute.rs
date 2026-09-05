@@ -480,8 +480,13 @@ mod tests {
         }
     }
 
-    fn request(guard: HashGuard, request_id: &str, key: Option<&str>) -> ActivateConfigRequest {
-        ActivateConfigRequest::parse(DOMAIN, UPDATED, guard, RouteTarget::Live, request_id, key)
+    fn request(
+        guard: HashGuard,
+        target: RouteTarget,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> ActivateConfigRequest {
+        ActivateConfigRequest::parse(DOMAIN, UPDATED, guard, target, request_id, key)
             .expect("request should parse")
     }
 
@@ -507,7 +512,7 @@ mod tests {
         let result = run(
             &host,
             &docker,
-            &request(HashGuard::Absent, REQUEST_ID, None),
+            &request(HashGuard::Absent, RouteTarget::Live, REQUEST_ID, None),
         )
         .expect("a fresh activation should succeed");
 
@@ -534,8 +539,12 @@ mod tests {
         let docker = FakeDocker::new();
         let key = Some("basic-auth-off-1");
 
-        let first = run(&host, &docker, &request(HashGuard::Absent, REQUEST_ID, key))
-            .expect("the first attempt should activate");
+        let first = run(
+            &host,
+            &docker,
+            &request(HashGuard::Absent, RouteTarget::Live, REQUEST_ID, key),
+        )
+        .expect("the first attempt should activate");
         let reloads_after_first = docker.calls("reload").len();
 
         // The retry's guard would now be *wrong* (the file exists), which
@@ -544,7 +553,7 @@ mod tests {
         let replayed = run(
             &host,
             &docker,
-            &request(HashGuard::Absent, RETRY_REQUEST_ID, key),
+            &request(HashGuard::Absent, RouteTarget::Live, RETRY_REQUEST_ID, key),
         )
         .expect("the retry should replay the original outcome");
 
@@ -572,8 +581,12 @@ mod tests {
         let key = Some("basic-auth-off-2");
         let stale = HashGuard::Sha256(ConfigHash::of(b"read before someone else wrote"));
 
-        let error = run(&host, &docker, &request(stale.clone(), REQUEST_ID, key))
-            .expect_err("a stale guard must fail");
+        let error = run(
+            &host,
+            &docker,
+            &request(stale.clone(), RouteTarget::Live, REQUEST_ID, key),
+        )
+        .expect_err("a stale guard must fail");
 
         assert_eq!(error.protocol().0, ErrorCode::ConfigHashMismatch);
         assert_eq!(host.live().as_deref(), Some(PREVIOUS));
@@ -586,8 +599,12 @@ mod tests {
 
         // A retry under the same key reports the original failure rather
         // than quietly re-running it.
-        let replayed = run(&host, &docker, &request(stale, RETRY_REQUEST_ID, key))
-            .expect_err("the retry should replay the original failure");
+        let replayed = run(
+            &host,
+            &docker,
+            &request(stale, RouteTarget::Live, RETRY_REQUEST_ID, key),
+        )
+        .expect_err("the retry should replay the original failure");
         let ActivateConfigError::Replayed { code, message } = &replayed else {
             panic!("expected a replayed failure, got {replayed:?}")
         };
@@ -605,6 +622,7 @@ mod tests {
             &docker,
             &request(
                 HashGuard::Sha256(ConfigHash::of(PREVIOUS.as_bytes())),
+                RouteTarget::Live,
                 REQUEST_ID,
                 None,
             ),
@@ -629,6 +647,7 @@ mod tests {
             &docker,
             &request(
                 HashGuard::Sha256(ConfigHash::of(PREVIOUS.as_bytes())),
+                RouteTarget::Live,
                 REQUEST_ID,
                 None,
             ),
@@ -659,6 +678,7 @@ mod tests {
             &docker,
             &request(
                 HashGuard::Sha256(ConfigHash::of(UPDATED.as_bytes())),
+                RouteTarget::Live,
                 REQUEST_ID,
                 None,
             ),
@@ -692,7 +712,7 @@ mod tests {
         let error = run(
             &host,
             &docker,
-            &request(HashGuard::Absent, REQUEST_ID, None),
+            &request(HashGuard::Absent, RouteTarget::Live, REQUEST_ID, None),
         )
         .expect_err("a held lock must block a second activation");
 
@@ -715,7 +735,7 @@ mod tests {
         };
         let error = execute(
             &context,
-            &request(HashGuard::Absent, REQUEST_ID, None),
+            &request(HashGuard::Absent, RouteTarget::Live, REQUEST_ID, None),
             &cancellation,
         )
         .expect_err("a cancelled request must not activate");
