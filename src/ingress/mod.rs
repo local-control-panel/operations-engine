@@ -58,6 +58,12 @@ pub const LIVE_CONFIG_PATH: &str = "/etc/caddy/Caddyfile";
 /// the running server.
 pub const ROUTE_EXTENSION: &str = "caddyfile";
 
+/// The extension a domain's maintenance-mode backup route file carries.
+/// Never imported by the ingress container's Caddyfile (which only imports
+/// `*.caddyfile`), so a file with this extension is inert as far as the
+/// live server is concerned regardless of its contents.
+pub const BACKUP_ROUTE_EXTENSION: &str = "maintenance-backup";
+
 /// Upper bound on a submitted route file, so a single request cannot ask
 /// this root-privileged process to write an unbounded amount into
 /// `ingress_root`. Real route files are a few hundred bytes; the largest
@@ -155,6 +161,24 @@ impl HashGuard {
     }
 }
 
+/// Which of a domain's route files an activation writes to.
+///
+/// `Live` is the domain's `<domain>.caddyfile` — the file the ingress
+/// container's Caddyfile imports, so writing it requires validation inside
+/// the container and a reload before the call reports success. `Backup` is
+/// `<domain>.maintenance-backup`, which is never imported by the live
+/// Caddyfile: writing it is a plain file replacement with no validation and
+/// no reload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RouteTarget {
+    /// The domain's live `<domain>.caddyfile` — validated inside the
+    /// ingress container and reloaded before this call reports success.
+    Live,
+    /// The domain's `<domain>.maintenance-backup` — never imported by the
+    /// live Caddyfile, so writing it needs no validation and no reload.
+    Backup,
+}
+
 /// A validated `ingress.activateConfig` request.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ActivateConfigRequest {
@@ -169,6 +193,8 @@ pub struct ActivateConfigRequest {
     /// does today.
     pub content: String,
     pub guard: HashGuard,
+    /// Which of the domain's route files this request writes to.
+    pub target: RouteTarget,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -188,6 +214,7 @@ impl ActivateConfigRequest {
         domain: &str,
         content: impl Into<String>,
         guard: HashGuard,
+        target: RouteTarget,
         request_id: &str,
         idempotency_key: Option<&str>,
     ) -> Result<Self, ActivateConfigRequestError> {
@@ -199,6 +226,7 @@ impl ActivateConfigRequest {
             domain: Domain::parse(domain).map_err(|_| ActivateConfigRequestError::InvalidDomain)?,
             content,
             guard,
+            target,
             request_id: RequestId::parse(request_id)
                 .map_err(|_| ActivateConfigRequestError::InvalidRequestId)?,
             idempotency_key: idempotency_key
@@ -258,13 +286,20 @@ pub fn route_path(domain: &Domain) -> SiteRelativePath {
         .expect("a validated Domain always yields a single valid path component")
 }
 
+/// The route file one domain's maintenance-mode backup lives in, relative
+/// to `ingress_root`. Never imported by the live Caddyfile.
+pub fn backup_route_path(domain: &Domain) -> SiteRelativePath {
+    SiteRelativePath::parse(format!("{domain}.{BACKUP_ROUTE_EXTENSION}"))
+        .expect("a validated Domain always yields a single valid path component")
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{
         ActivateConfigRequest, ActivateConfigRequestError, ActivateConfigResult, ConfigHash,
-        HashGuard, MAX_CONTENT_BYTES, route_path,
+        HashGuard, MAX_CONTENT_BYTES, RouteTarget, backup_route_path, route_path,
     };
     use crate::site::Domain;
 
@@ -320,6 +355,7 @@ mod tests {
             "example.com",
             "example.com {\n}\n",
             guard,
+            RouteTarget::Live,
             REQUEST_ID,
             Some("basic-auth-off-1"),
         )
@@ -328,11 +364,31 @@ mod tests {
         assert_eq!(request.domain.as_str(), "example.com");
         assert_eq!(request.content, "example.com {\n}\n");
         assert_eq!(request.guard, HashGuard::Sha256(ConfigHash::of(b"prior")));
+        assert_eq!(request.target, RouteTarget::Live);
         assert_eq!(request.request_id.to_string(), REQUEST_ID);
         assert_eq!(
             request.idempotency_key.map(|key| key.as_str().to_owned()),
             Some("basic-auth-off-1".to_owned())
         );
+    }
+
+    #[test]
+    fn request_carries_the_backup_target_when_asked() {
+        let guard = ActivateConfigRequest::guard_from_expected_hash(Some(
+            ConfigHash::of(b"prior").as_str(),
+        ))
+        .expect("a well-formed digest should parse");
+        let request = ActivateConfigRequest::parse(
+            "example.com",
+            "example.com {\n}\n",
+            guard,
+            RouteTarget::Backup,
+            REQUEST_ID,
+            Some("basic-auth-off-1"),
+        )
+        .expect("request should parse");
+
+        assert_eq!(request.target, RouteTarget::Backup);
     }
 
     #[test]
@@ -343,6 +399,7 @@ mod tests {
                     "NOT A DOMAIN",
                     "",
                     HashGuard::Absent,
+                    RouteTarget::Live,
                     REQUEST_ID,
                     None,
                 ),
@@ -353,6 +410,7 @@ mod tests {
                     "example.com",
                     "x".repeat(MAX_CONTENT_BYTES + 1),
                     HashGuard::Absent,
+                    RouteTarget::Live,
                     REQUEST_ID,
                     None,
                 ),
@@ -363,6 +421,7 @@ mod tests {
                     "example.com",
                     "",
                     HashGuard::Absent,
+                    RouteTarget::Live,
                     "not-a-uuid",
                     None,
                 ),
@@ -373,6 +432,7 @@ mod tests {
                     "example.com",
                     "",
                     HashGuard::Absent,
+                    RouteTarget::Live,
                     REQUEST_ID,
                     Some("has space"),
                 ),
@@ -417,6 +477,7 @@ mod tests {
             "example.com",
             "x".repeat(MAX_CONTENT_BYTES),
             HashGuard::Absent,
+            RouteTarget::Live,
             REQUEST_ID,
             None,
         )
@@ -430,6 +491,15 @@ mod tests {
         assert_eq!(
             route_path(&domain).as_path().to_str(),
             Some("sub.example.com.caddyfile")
+        );
+    }
+
+    #[test]
+    fn backup_route_path_is_the_domains_maintenance_backup_file() {
+        let domain = Domain::parse("sub.example.com").expect("domain should parse");
+        assert_eq!(
+            backup_route_path(&domain).as_path().to_str(),
+            Some("sub.example.com.maintenance-backup")
         );
     }
 
