@@ -196,6 +196,46 @@ pub enum IngressCommand {
         #[arg(long, value_enum, default_value_t = IngressTarget::Live)]
         target: IngressTarget,
     },
+
+    /// Snapshots a domain's live route file to its maintenance-backup and
+    /// activates a maintenance page in its place.
+    Park {
+        #[arg(long)]
+        domain: String,
+
+        /// Path to a file holding the complete contents of the maintenance
+        /// page route file to put live in place of the domain's current
+        /// configuration.
+        #[arg(long = "content-file")]
+        content_file: PathBuf,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of parking twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
+    /// Restores a parked domain's route file from its maintenance-backup and
+    /// removes the backup.
+    Unpark {
+        #[arg(long)]
+        domain: String,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of unparking twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -208,6 +248,8 @@ impl IngressCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateConfig { .. } => "ingress.activateConfig",
+            Self::Park { .. } => "ingress.park",
+            Self::Unpark { .. } => "ingress.unpark",
         }
     }
 }

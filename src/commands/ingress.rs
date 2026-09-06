@@ -3,8 +3,11 @@ use crate::{
     error::{ErrorCode, WarningCode},
     ingress::{
         ActivateConfigRequest, ActivateConfigRequestError, MAX_CONTENT_BYTES,
-        OPERATION as ACTIVATE_OPERATION, RouteTarget,
+        OPERATION as ACTIVATE_OPERATION, PARK_OPERATION, ParkRequest, ParkRequestError,
+        RouteTarget, UNPARK_OPERATION, UnparkRequest, UnparkRequestError,
         execute::{ActivateConfigError, ActivateContext, execute as execute_activate_config},
+        park::{ParkError, execute as execute_park},
+        unpark::{UnparkError, execute as execute_unpark},
     },
     process::CancellationToken,
     protocol::{Response, ResponseBuildError, Warning},
@@ -31,6 +34,22 @@ pub fn run(command: IngressCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        IngressCommand::Park {
+            domain,
+            content_file,
+            request_id,
+            idempotency_key,
+        } => park(
+            &domain,
+            &content_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        IngressCommand::Unpark {
+            domain,
+            request_id,
+            idempotency_key,
+        } => unpark(&domain, &request_id, idempotency_key.as_deref()),
     }
 }
 
@@ -170,6 +189,208 @@ fn run_activate_config(request: &ActivateConfigRequest) -> Result<Response, Resp
     }
 }
 
+fn park(
+    domain: &str,
+    content_file: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    // Same ordering `activate_config` uses and for the same reason: reject
+    // a malformed domain/request-id/idempotency-key before this
+    // root-privileged process ever opens `content_file`. `ParkRequest::parse`
+    // below re-validates these same fields — cheap string work by then,
+    // not new I/O.
+    if let Err(error) = validate_park_cheap_fields(domain, request_id, idempotency_key) {
+        return Ok(Response::failure(
+            PARK_OPERATION,
+            ErrorCode::InvalidInput,
+            park_request_error_message(error),
+        ));
+    }
+
+    let maintenance_content = match read_content_file(content_file) {
+        Ok(content) => content,
+        Err(ContentFileError::TooLarge) => {
+            return Ok(Response::failure(
+                PARK_OPERATION,
+                ErrorCode::InvalidInput,
+                park_request_error_message(ParkRequestError::ContentTooLarge),
+            ));
+        }
+        Err(ContentFileError::Unreadable) => {
+            return Ok(Response::failure(
+                PARK_OPERATION,
+                ErrorCode::InvalidInput,
+                "content-file could not be read",
+            ));
+        }
+    };
+
+    let request = match ParkRequest::parse(domain, maintenance_content, request_id, idempotency_key)
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                PARK_OPERATION,
+                ErrorCode::InvalidInput,
+                park_request_error_message(error),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_park(&request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            PARK_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "ingress.park requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_park(request: &ParkRequest) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{compose, config::EngineConfig, filesystem::ManagedRoot};
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                PARK_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                PARK_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let compose_access = compose::Access::default();
+    let context = ActivateContext {
+        ingress_root: &engine_config.ingress_root,
+        engine_state: &engine_state,
+        compose: &compose_access,
+    };
+
+    match execute_park(&context, request, &CancellationToken::default()) {
+        Ok(result) => Response::success(PARK_OPERATION, result),
+        Err(ParkError::PostCommitRecordFailed { result, .. }) => {
+            Response::success(PARK_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the domain was parked but its transaction record could not be \
+                              saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(PARK_OPERATION, code, &message))
+        }
+    }
+}
+
+fn unpark(
+    domain: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    // `UnparkRequest` has no content field — nothing here reads an
+    // arbitrary host path, so there is no cheap-fields-first split to make:
+    // `UnparkRequest::parse` is the single validation pass.
+    let request = match UnparkRequest::parse(domain, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                UNPARK_OPERATION,
+                ErrorCode::InvalidInput,
+                unpark_request_error_message(error),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_unpark(&request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            UNPARK_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "ingress.unpark requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_unpark(request: &UnparkRequest) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{compose, config::EngineConfig, filesystem::ManagedRoot};
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                UNPARK_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                UNPARK_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let compose_access = compose::Access::default();
+    let context = ActivateContext {
+        ingress_root: &engine_config.ingress_root,
+        engine_state: &engine_state,
+        compose: &compose_access,
+    };
+
+    match execute_unpark(&context, request, &CancellationToken::default()) {
+        Ok(result) => Response::success(UNPARK_OPERATION, result),
+        Err(UnparkError::PostCommitRecordFailed { result, .. }) => {
+            Response::success(UNPARK_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the domain was unparked but its transaction record could not be \
+                              saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(UNPARK_OPERATION, code, &message))
+        }
+    }
+}
+
 /// Why `--content-file` could not be turned into submittable content.
 /// Deliberately coarse: the caller is told "unreadable" for a missing
 /// file, a FIFO, a directory, a device node, and a permission error alike,
@@ -280,6 +501,24 @@ fn validate_cheap_fields(
     Ok(())
 }
 
+/// Validates `domain`, `request_id`, and `idempotency_key` — every field
+/// `ParkRequest::parse` checks that does not depend on the content file's
+/// bytes — using the same underlying parsers it uses, so a malformed
+/// request is rejected before `content_file` is ever read. Mirrors
+/// `validate_cheap_fields` above, returning `ParkRequestError` instead.
+fn validate_park_cheap_fields(
+    domain: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<(), ParkRequestError> {
+    Domain::parse(domain).map_err(|_| ParkRequestError::InvalidDomain)?;
+    RequestId::parse(request_id).map_err(|_| ParkRequestError::InvalidRequestId)?;
+    if let Some(key) = idempotency_key {
+        IdempotencyKey::parse(key).map_err(|_| ParkRequestError::InvalidIdempotencyKey)?;
+    }
+    Ok(())
+}
+
 /// Maps the CLI-facing `--target` value to the domain `RouteTarget` it
 /// selects. Kept separate from `IngressTarget` itself the same way
 /// `guard_from_expected_hash` keeps the raw `Option<&str>` the CLI receives
@@ -303,6 +542,25 @@ fn activate_config_request_error_message(error: ActivateConfigRequestError) -> &
         }
         ActivateConfigRequestError::InvalidRequestId => "request-id is not a canonical UUID",
         ActivateConfigRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+fn park_request_error_message(error: ParkRequestError) -> &'static str {
+    match error {
+        ParkRequestError::InvalidDomain => "domain is not a valid domain name",
+        ParkRequestError::ContentTooLarge => {
+            "content-file exceeds the maximum allowed route file size"
+        }
+        ParkRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        ParkRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+fn unpark_request_error_message(error: UnparkRequestError) -> &'static str {
+    match error {
+        UnparkRequestError::InvalidDomain => "domain is not a valid domain name",
+        UnparkRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        UnparkRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }
 
