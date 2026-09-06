@@ -791,20 +791,26 @@ deferred rather than fixed here:
 
 ## Phase 8 — selective expansion
 
-Status: in progress — 6 of ~28 ingress call sites migrated, rest deferred
+Status: in progress — 7 of ~28 ingress call sites migrated, rest deferred
 
 Additional workflows are considered only after the Git pilot succeeds. Each
 workflow requires its own milestone document and measurable reason to move into
 Operations Engine.
 
-**"Atomic Caddy and site configuration changes" — pilot and a second
-migration batch both shipped; 6 of ~28 call sites migrated.**
+**"Atomic Caddy and site configuration changes" — pilot, a second
+migration batch, and engine-side maintenance-mode modeling all
+shipped; 7 of ~28 call sites migrated.**
 Milestone docs: `docs/superpowers/plans/2026-09-03-ingress-config-activation-pilot.md`
-(pilot, 6 tasks) and `website-control-panel`'s own
+(pilot, 6 tasks), `website-control-panel`'s own
 `docs/superpowers/plans/2026-09-04-ingress-config-migration-batch-2.md`
-(batch 2, 7 tasks) — both done, task-reviewed, and whole-branch
-reviewed. `operations-engine` `main` at `3a4bf86`, `website-control-panel`
-`master` at `ec38ba9`, both pushed.
+(batch 2, 7 tasks), and
+`docs/superpowers/plans/2026-09-05-ops-engine-maintenance-mode.md`
+(maintenance-mode park/unpark, 11 tasks spanning both repos) — all
+done and task-reviewed (pilot and batch 2 also got a separate
+whole-branch review pass). `operations-engine` `main` at `e3335e8`,
+pushed. `website-control-panel` `master` at `f9cdf73` as of this
+writing — not yet pushed; confirm push status in that repo before
+treating this sub-project as fully landed there.
 Delivered: one new `ingress.activateConfig` operation (pilot), wired to
 6 of `website-control-panel`'s ~28 `activate_caddyfile`/
 `activate_caddyfile_checked` call sites — `disable_basic_auth` (pilot,
@@ -813,16 +819,52 @@ proof of concept) plus `update_raw_ingress_route` (2 callers),
 `set_ip_acl` (batch 2, via a shared client-side helper,
 `activate_ingress_route_via_engine_or`, extracted from the pilot's
 proven logic). No further `operations-engine` changes needed for
-either batch; the operation and its contract are unchanged since the
-pilot. Two integration bugs found and fixed during the pilot (engine
-config schema v1→v2 was write-once instead of reconverging; `sudo`
-reset `HOME` and broke Compose-stack resolution for every elevated
-call); one correctness bug found and fixed during batch 2's final
-review (`enable_access_log`'s transform silently dropped a validation
-its legacy sibling performed, so enrolled and non-enrolled sites
-disagreed on a malformed access-log block).
+either batch; the operation and its contract were unchanged from the
+pilot through batch 2. Two integration bugs found and fixed during the
+pilot (engine config schema v1→v2 was write-once instead of
+reconverging; `sudo` reset `HOME` and broke Compose-stack resolution
+for every elevated call); one correctness bug found and fixed during
+batch 2's final review (`enable_access_log`'s transform silently
+dropped a validation its legacy sibling performed, so enrolled and
+non-enrolled sites disagreed on a malformed access-log block).
+The maintenance-mode sub-project then gave `ingress.activateConfig` a
+`target: live|backup` field, letting those same 6 call sites write to
+a parked domain's `.maintenance-backup` file — hash-guarded, atomic,
+no Caddy validate/reload, since that file is never imported by the
+live Caddyfile — instead of falling back to legacy while a site is
+parked. Two new operations, `ingress.park` (snapshots live to backup
+on first park, then activates a maintenance page onto live, one
+transaction) and `ingress.unpark` (restores backup to live and deletes
+the backup, one transaction), reuse the existing `activate::activate`/
+preflight/transaction/audit pipeline rather than duplicating it; a new
+`ErrorCode::IngressNotParked` covers unpark-when-not-parked. CLI
+(`ingress park`/`ingress unpark`) and `capabilities` wiring shipped for
+both. On the `website-control-panel` side, `set_maintenance` (the 7th
+call site) now dispatches through the engine's park/unpark when
+available, falling back to its exact previous raw-SSH behavior
+otherwise — mirroring how `disable_basic_auth` was migrated in the
+pilot — plus new Tauri commands wrapping `ingress.park`/
+`ingress.unpark`, and a Docker-backed workflow test proving the full
+park→mutate-while-parked→unpark cycle converges on the same final
+result as the pure-legacy path (a real byte-level comparison of both
+paths' final live route content, normalized for domain). The Docker
+test-server's vendored `ops-engine` binary pin was bumped from
+`28897b1` to `e3335e8` so the fixture actually advertises the new
+operations — necessary infrastructure work discovered mid-plan, not
+originally scoped. One correctness bug found and fixed during review
+before this shipped: `ingress.park`'s orphaned-backup cleanup was
+over-generalized and could have deleted a domain's last-good backup on
+a double-fault (the live write failed and its own rollback also failed
+to restore live), stranding the domain parked with no recovery path;
+narrowed to exclude that specific failure mode. None of this
+sub-project's own testing could be executed against real Docker in
+this session (no Docker daemon was available in the sandbox); every
+task was verified by rigorous inspection against the real,
+already-committed source instead — real Docker execution against the
+bumped fixture is deferred to whoever next runs the suite on a machine
+with Docker available.
 The remaining call sites (`enable_basic_auth`,
-`activate_site_process_config_checked`, `set_maintenance`, `create_site`,
+`activate_site_process_config_checked`, `create_site`,
 `restore_deleted_site`, `migrate_site_runtime_impl`, `rename_site`,
 `rollback_rename_commit`) and `reconciliation.rs`'s overlapping
 remediation paths stay out of scope — see that plan's own "Out of
