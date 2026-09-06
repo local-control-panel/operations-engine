@@ -172,6 +172,21 @@ impl ActivateConfigError {
     }
 }
 
+/// A shape every mutation error this module's `fail` handles has in
+/// common: a stable protocol code and a safe, generic message. Lets `fail`
+/// be written once, here, and reused by `park::execute` (`ParkError`
+/// implements it too) instead of duplicating the ~15-line
+/// mark-failed/save/audit sequence for a second error type.
+pub(crate) trait ProtocolError {
+    fn protocol(&self) -> (ErrorCode, String);
+}
+
+impl ProtocolError for ActivateConfigError {
+    fn protocol(&self) -> (ErrorCode, String) {
+        ActivateConfigError::protocol(self)
+    }
+}
+
 /// A Compose call that could not be *run* — or that was never allowed to
 /// finish — is a host/dependency problem, not a verdict on the submitted
 /// configuration. Report it as such rather than telling the caller its
@@ -183,7 +198,11 @@ impl ActivateConfigError {
 /// observed. `rejected` is reached only when the command really did run to
 /// completion and return a failing status — the one case where the
 /// container's verdict on the config is what the caller should hear.
-fn compose_failure_code(failure: &ComposeFailure, rejected: ErrorCode) -> ErrorCode {
+///
+/// `pub(crate)` so `ParkError::protocol` (`park.rs`) can map its own
+/// `activate::Error` variants the same way, rather than duplicating this
+/// mapping.
+pub(crate) fn compose_failure_code(failure: &ComposeFailure, rejected: ErrorCode) -> ErrorCode {
     match failure {
         ComposeFailure::Run(compose::Error::NoHomeDirectory) => ErrorCode::Internal,
         ComposeFailure::Run(compose::Error::Run(error)) => process::spawn_error_code(error),
@@ -203,7 +222,9 @@ fn compose_failure_code(failure: &ComposeFailure, rejected: ErrorCode) -> ErrorC
 /// command may still be running inside the container after this engine has
 /// stopped waiting for it, so nothing observed afterward can be reported
 /// as settled. See the `ReloadFailedAndRestored` arm above.
-fn timed_out(failure: &ComposeFailure) -> bool {
+///
+/// `pub(crate)` for the same reason as `compose_failure_code`.
+pub(crate) fn timed_out(failure: &ComposeFailure) -> bool {
     matches!(failure, ComposeFailure::Rejected(diagnostics) if diagnostics.timed_out)
 }
 
@@ -365,13 +386,18 @@ fn replay(
 /// `deploy::execute::fail` does — persistence failures here are swallowed
 /// because the original error is the actionable one and nothing was
 /// activated.
-fn fail(
+///
+/// Generic over `ProtocolError` (rather than `ActivateConfigError`
+/// specifically) and `pub(crate)` so `park::execute` calls this exact
+/// function for `ParkError` too, instead of a duplicated copy of this
+/// mark-failed/save/audit sequence.
+pub(crate) fn fail<E: ProtocolError>(
     ingress_state: &ManagedRoot,
     state_path: &SiteRelativePath,
     audit_path: &SiteRelativePath,
     mut state: TransactionState,
-    error: ActivateConfigError,
-) -> ActivateConfigError {
+    error: E,
+) -> E {
     let (code, message) = error.protocol();
     let _ = state.mark_failed(code, message);
     let _ = state::save(ingress_state, state_path, &state);
@@ -383,12 +409,16 @@ fn fail(
     error
 }
 
-fn state_path_for(request_id: RequestId) -> SiteRelativePath {
+/// `pub(crate)` so `park::execute` records its own transaction records
+/// under the same `transactions/<requestId>.json` layout.
+pub(crate) fn state_path_for(request_id: RequestId) -> SiteRelativePath {
     SiteRelativePath::parse(format!("transactions/{request_id}.json"))
         .expect("a canonical RequestId always yields a valid relative path")
 }
 
-fn audit_log_path() -> SiteRelativePath {
+/// `pub(crate)` so `park::execute` appends to the same shared
+/// `audit/events.jsonl`.
+pub(crate) fn audit_log_path() -> SiteRelativePath {
     SiteRelativePath::parse("audit/events.jsonl").expect("literal path is valid")
 }
 

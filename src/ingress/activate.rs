@@ -303,7 +303,15 @@ impl RoutePaths {
 
 /// Reads a file that may legitimately not exist yet (a domain's first
 /// activation).
-fn read_optional(root: &ManagedRoot, path: &SiteRelativePath) -> Result<Option<Vec<u8>>, Error> {
+///
+/// `pub(crate)`, not private, so `park::execute` can reuse the same
+/// file-optional-read rather than reimplementing it — it needs the same
+/// "missing is fine, anything else is `Error::Io`" behavior for both the
+/// live route file (step 3) and the backup file's existence check (step 5).
+pub(crate) fn read_optional(
+    root: &ManagedRoot,
+    path: &SiteRelativePath,
+) -> Result<Option<Vec<u8>>, Error> {
     match root.read_bytes(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),

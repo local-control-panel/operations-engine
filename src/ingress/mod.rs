@@ -21,6 +21,7 @@
 
 pub mod activate;
 pub mod execute;
+pub mod park;
 
 #[cfg(all(test, unix))]
 mod fake_docker;
@@ -38,6 +39,13 @@ use crate::{
 /// The stable protocol operation name, and the value recorded as
 /// `TransactionState::operation` for every activation attempt.
 pub const OPERATION: &str = "ingress.activateConfig";
+
+/// The stable protocol operation name, and the value recorded as
+/// `TransactionState::operation`, for every `ingress.park` attempt. Distinct
+/// from `OPERATION` — `park` is a separate operation with its own
+/// preflight/transaction/audit cycle, not a variant of `activateConfig`
+/// (see `park::execute`'s doc comment).
+pub const PARK_OPERATION: &str = "ingress.park";
 
 /// The Compose service running the shared ingress Caddy. Mirrors
 /// `website-control-panel`'s `INGRESS_CONTAINER`
@@ -276,6 +284,79 @@ pub struct ActivateConfigResult {
     /// The digest of what the route file now contains — the value to pass
     /// back as the next request's expected prior hash.
     pub content_sha256: ConfigHash,
+    pub activated_at_unix_secs: u64,
+}
+
+/// A validated `ingress.park` request.
+///
+/// Carries no `HashGuard`, unlike `ActivateConfigRequest`: `park` derives
+/// its own guard, internally, from whatever route file is live at the
+/// moment it reads it (see `park::execute` step 6) rather than trusting a
+/// value the caller read separately. That is safe specifically because
+/// `park` — like `activateConfig` — runs its whole sequence under the one
+/// host-wide ingress lock, so nothing else can change the live file between
+/// this request's own read and its own guarded write.
+#[derive(Debug, Eq, PartialEq)]
+pub struct ParkRequest {
+    /// The domain to park. The engine derives both the live route's file
+    /// name and its backup's from it, exactly as `ActivateConfigRequest`
+    /// does for the live route alone.
+    pub domain: Domain,
+    /// The complete contents of the maintenance page route file to put
+    /// live in place of the domain's current configuration.
+    pub maintenance_content: String,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParkRequestError {
+    InvalidDomain,
+    /// The submitted maintenance content exceeds `MAX_CONTENT_BYTES`.
+    ContentTooLarge,
+    InvalidRequestId,
+    InvalidIdempotencyKey,
+}
+
+impl ParkRequest {
+    pub fn parse(
+        domain: &str,
+        maintenance_content: impl Into<String>,
+        request_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Self, ParkRequestError> {
+        let maintenance_content = maintenance_content.into();
+        if maintenance_content.len() > MAX_CONTENT_BYTES {
+            return Err(ParkRequestError::ContentTooLarge);
+        }
+        Ok(Self {
+            domain: Domain::parse(domain).map_err(|_| ParkRequestError::InvalidDomain)?,
+            maintenance_content,
+            request_id: RequestId::parse(request_id)
+                .map_err(|_| ParkRequestError::InvalidRequestId)?,
+            idempotency_key: idempotency_key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| ParkRequestError::InvalidIdempotencyKey)?,
+        })
+    }
+}
+
+/// The `result` payload of a successful `ingress.park` response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParkResult {
+    pub domain: String,
+    /// `true` when a `.maintenance-backup` for this domain already existed
+    /// before this call — so this call only (re)activated the maintenance
+    /// page and left the earlier snapshot untouched. `false` when this call
+    /// took the snapshot itself, on a domain's first park.
+    pub already_parked: bool,
+    /// The digest of what the domain's `.maintenance-backup` file holds
+    /// after this call — the pre-maintenance configuration, whether this
+    /// call just wrote it or it already existed. The value a subsequent
+    /// `ingress.unpark` should send back as its own expected-prior-hash.
+    pub backup_sha256: ConfigHash,
     pub activated_at_unix_secs: u64,
 }
 
