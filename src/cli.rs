@@ -188,7 +188,20 @@ pub enum IngressCommand {
         /// outcome instead of activating twice.
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
+
+        /// Which of this domain's two route files to write: `live` (the
+        /// imported, Caddy-validated Caddyfile — today's only behavior) or
+        /// `backup` (the inert `.maintenance-backup` file a parked domain's
+        /// pre-maintenance config is kept in; no validation or reload).
+        #[arg(long, value_enum, default_value_t = IngressTarget::Live)]
+        target: IngressTarget,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum IngressTarget {
+    Live,
+    Backup,
 }
 
 impl IngressCommand {

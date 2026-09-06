@@ -34,7 +34,7 @@ use operations_engine::{
     error::ErrorCode,
     filesystem::ManagedRoot,
     ingress::{
-        ActivateConfigRequest, ActivateConfigResult, ConfigHash, HashGuard,
+        ActivateConfigRequest, ActivateConfigResult, ConfigHash, HashGuard, RouteTarget,
         activate::{ComposeFailure, RestoreFailure},
         execute::{ActivateConfigError, ActivateContext, execute},
     },
@@ -201,7 +201,11 @@ impl Host {
 }
 
 fn request(guard: HashGuard, request_id: &str) -> ActivateConfigRequest {
-    ActivateConfigRequest::parse(DOMAIN, UPDATED, guard, request_id, None)
+    // Every test in this file exercises the `Live` validate/reload
+    // pipeline (see the module doc comment) — `Backup` requests bypass
+    // `execute::execute` entirely (Task 3), so there is no `Backup` case
+    // for this helper to build here.
+    ActivateConfigRequest::parse(DOMAIN, UPDATED, guard, RouteTarget::Live, request_id, None)
         .expect("request should parse")
 }
 

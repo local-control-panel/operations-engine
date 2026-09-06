@@ -1,9 +1,9 @@
 use crate::{
-    cli::IngressCommand,
+    cli::{IngressCommand, IngressTarget},
     error::{ErrorCode, WarningCode},
     ingress::{
         ActivateConfigRequest, ActivateConfigRequestError, MAX_CONTENT_BYTES,
-        OPERATION as ACTIVATE_OPERATION,
+        OPERATION as ACTIVATE_OPERATION, RouteTarget,
         execute::{ActivateConfigError, ActivateContext, execute as execute_activate_config},
     },
     process::CancellationToken,
@@ -22,10 +22,12 @@ pub fn run(command: IngressCommand) -> Result<Response, ResponseBuildError> {
             expected_hash,
             request_id,
             idempotency_key,
+            target,
         } => activate_config(
             &domain,
             &content_file,
             expected_hash.as_deref(),
+            target,
             &request_id,
             idempotency_key.as_deref(),
         ),
@@ -36,6 +38,7 @@ fn activate_config(
     domain: &str,
     content_file: &std::path::Path,
     expected_hash: Option<&str>,
+    target: IngressTarget,
     request_id: &str,
     idempotency_key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
@@ -82,17 +85,23 @@ fn activate_config(
         }
     };
 
-    let request =
-        match ActivateConfigRequest::parse(domain, content, guard, request_id, idempotency_key) {
-            Ok(request) => request,
-            Err(error) => {
-                return Ok(Response::failure(
-                    ACTIVATE_OPERATION,
-                    ErrorCode::InvalidInput,
-                    activate_config_request_error_message(error),
-                ));
-            }
-        };
+    let request = match ActivateConfigRequest::parse(
+        domain,
+        content,
+        guard,
+        route_target(target),
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                ACTIVATE_OPERATION,
+                ErrorCode::InvalidInput,
+                activate_config_request_error_message(error),
+            ));
+        }
+    };
 
     #[cfg(unix)]
     {
@@ -271,6 +280,18 @@ fn validate_cheap_fields(
     Ok(())
 }
 
+/// Maps the CLI-facing `--target` value to the domain `RouteTarget` it
+/// selects. Kept separate from `IngressTarget` itself the same way
+/// `guard_from_expected_hash` keeps the raw `Option<&str>` the CLI receives
+/// apart from `HashGuard`, the domain type `ActivateConfigRequest::parse`
+/// actually consumes.
+const fn route_target(target: IngressTarget) -> RouteTarget {
+    match target {
+        IngressTarget::Live => RouteTarget::Live,
+        IngressTarget::Backup => RouteTarget::Backup,
+    }
+}
+
 fn activate_config_request_error_message(error: ActivateConfigRequestError) -> &'static str {
     match error {
         ActivateConfigRequestError::InvalidDomain => "domain is not a valid domain name",
@@ -287,8 +308,79 @@ fn activate_config_request_error_message(error: ActivateConfigRequestError) -> &
 
 #[cfg(test)]
 mod tests {
-    use super::{ContentFileError, read_content_file};
-    use crate::ingress::MAX_CONTENT_BYTES;
+    use clap::Parser as _;
+
+    use super::{ContentFileError, read_content_file, route_target};
+    use crate::{
+        cli::{Cli, Command, IngressCommand, IngressTarget},
+        ingress::{ActivateConfigRequest, HashGuard, MAX_CONTENT_BYTES, RouteTarget},
+    };
+
+    fn parse_activate_config_target(args: &[&str]) -> IngressTarget {
+        let mut full_args = vec!["ops-engine"];
+        full_args.extend_from_slice(args);
+        let cli = Cli::try_parse_from(full_args).expect("cli args should parse");
+        match cli.command {
+            Command::Ingress {
+                command: IngressCommand::ActivateConfig { target, .. },
+            } => target,
+            other => panic!("expected an ingress activate-config command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn target_backup_flag_parses_into_a_backup_route_target_on_the_request() {
+        let target = parse_activate_config_target(&[
+            "ingress",
+            "activate-config",
+            "--domain",
+            "example.com",
+            "--content-file",
+            "route.caddyfile",
+            "--request-id",
+            "123e4567-e89b-12d3-a456-426614174000",
+            "--target",
+            "backup",
+        ]);
+        assert_eq!(target, IngressTarget::Backup);
+
+        let request = ActivateConfigRequest::parse(
+            "example.com",
+            "example.com {\n}\n",
+            HashGuard::Absent,
+            route_target(target),
+            "123e4567-e89b-12d3-a456-426614174000",
+            None,
+        )
+        .expect("request should parse");
+        assert_eq!(request.target, RouteTarget::Backup);
+    }
+
+    #[test]
+    fn omitting_target_defaults_to_a_live_route_target_on_the_request() {
+        let target = parse_activate_config_target(&[
+            "ingress",
+            "activate-config",
+            "--domain",
+            "example.com",
+            "--content-file",
+            "route.caddyfile",
+            "--request-id",
+            "123e4567-e89b-12d3-a456-426614174000",
+        ]);
+        assert_eq!(target, IngressTarget::Live);
+
+        let request = ActivateConfigRequest::parse(
+            "example.com",
+            "example.com {\n}\n",
+            HashGuard::Absent,
+            route_target(target),
+            "123e4567-e89b-12d3-a456-426614174000",
+            None,
+        )
+        .expect("request should parse");
+        assert_eq!(request.target, RouteTarget::Live);
+    }
 
     #[test]
     fn a_regular_file_at_or_under_the_bound_is_read_verbatim() {
