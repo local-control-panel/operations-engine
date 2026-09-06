@@ -61,6 +61,13 @@ pub enum ErrorCode {
     /// caller asked for nor what was there before — it needs an operator,
     /// not a retry.
     ConfigRecoveryFailed,
+    /// An `ingress.unpark` was requested for a domain with no
+    /// `.maintenance-backup` file — there is nothing to restore. Distinct
+    /// from every `Config*` code above, since this is not a problem with
+    /// the shape or provenance of any submitted content; it is a claim
+    /// about the domain's current state (parked vs. not) that turned out to
+    /// be false.
+    IngressNotParked,
 }
 
 impl ErrorCode {
@@ -82,6 +89,7 @@ impl ErrorCode {
             Self::ConfigValidationFailed => "CONFIG_VALIDATION_FAILED",
             Self::ConfigReloadFailed => "CONFIG_RELOAD_FAILED",
             Self::ConfigRecoveryFailed => "CONFIG_RECOVERY_FAILED",
+            Self::IngressNotParked => "INGRESS_NOT_PARKED",
         }
     }
 }
@@ -175,5 +183,14 @@ mod tests {
                 format!("\"{expected}\"")
             );
         }
+    }
+
+    #[test]
+    fn ingress_not_parked_has_a_stable_protocol_value() {
+        assert_eq!(ErrorCode::IngressNotParked.as_str(), "INGRESS_NOT_PARKED");
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::IngressNotParked).expect("code should serialize"),
+            "\"INGRESS_NOT_PARKED\""
+        );
     }
 }

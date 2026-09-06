@@ -22,6 +22,7 @@
 pub mod activate;
 pub mod execute;
 pub mod park;
+pub mod unpark;
 
 #[cfg(all(test, unix))]
 mod fake_docker;
@@ -46,6 +47,13 @@ pub const OPERATION: &str = "ingress.activateConfig";
 /// preflight/transaction/audit cycle, not a variant of `activateConfig`
 /// (see `park::execute`'s doc comment).
 pub const PARK_OPERATION: &str = "ingress.park";
+
+/// The stable protocol operation name, and the value recorded as
+/// `TransactionState::operation`, for every `ingress.unpark` attempt.
+/// Distinct from both `OPERATION` and `PARK_OPERATION` for the same reason:
+/// its own preflight/transaction/audit cycle, not a variant of either (see
+/// `unpark::execute`'s doc comment).
+pub const UNPARK_OPERATION: &str = "ingress.unpark";
 
 /// The Compose service running the shared ingress Caddy. Mirrors
 /// `website-control-panel`'s `INGRESS_CONTAINER`
@@ -357,6 +365,58 @@ pub struct ParkResult {
     /// call just wrote it or it already existed. The value a subsequent
     /// `ingress.unpark` should send back as its own expected-prior-hash.
     pub backup_sha256: ConfigHash,
+    pub activated_at_unix_secs: u64,
+}
+
+/// A validated `ingress.unpark` request.
+///
+/// Carries no content field at all, unlike `ParkRequest`: unpark's content
+/// comes from the domain's own `.maintenance-backup` file — never from the
+/// caller — so there is nothing for a request to submit beyond which domain
+/// to unpark.
+#[derive(Debug, Eq, PartialEq)]
+pub struct UnparkRequest {
+    /// The domain to unpark. The engine derives both the live route's file
+    /// name and its backup's from it, exactly as `ParkRequest` does.
+    pub domain: Domain,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnparkRequestError {
+    InvalidDomain,
+    InvalidRequestId,
+    InvalidIdempotencyKey,
+}
+
+impl UnparkRequest {
+    pub fn parse(
+        domain: &str,
+        request_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Self, UnparkRequestError> {
+        Ok(Self {
+            domain: Domain::parse(domain).map_err(|_| UnparkRequestError::InvalidDomain)?,
+            request_id: RequestId::parse(request_id)
+                .map_err(|_| UnparkRequestError::InvalidRequestId)?,
+            idempotency_key: idempotency_key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| UnparkRequestError::InvalidIdempotencyKey)?,
+        })
+    }
+}
+
+/// The `result` payload of a successful `ingress.unpark` response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnparkResult {
+    pub domain: String,
+    /// The digest of what the domain's live route file holds after this
+    /// call — the restored pre-maintenance configuration, read from the
+    /// `.maintenance-backup` file this call just deleted.
+    pub content_sha256: ConfigHash,
     pub activated_at_unix_secs: u64,
 }
 
