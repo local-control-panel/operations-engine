@@ -24,7 +24,7 @@ use crate::{
     filesystem::ManagedRoot,
     ingress::{
         ConfigHash, HashGuard, PARK_OPERATION, ParkRequest, ParkResult, RouteTarget, activate,
-        activate::read_optional,
+        activate::{RestoreFailure, read_optional},
         backup_route_path,
         execute::{
             ActivateContext, ProtocolError, audit_log_path, compose_failure_code, fail,
@@ -329,30 +329,54 @@ pub fn execute(
         context.compose,
     ) {
         // Judgment call: a backup this call just wrote (a first-time park,
-        // `already_parked == false`) must not survive a failed live write,
-        // on *any* failure branch of that write - not just the reload
-        // failure this module's tests exercise. Left behind, its mere
-        // existence would make a later retry's "does a backup already
-        // exist" check (above) answer "yes" and report
-        // `already_parked: true` for a domain whose live route was never
-        // actually replaced, silently skipping the snapshot it still
-        // needs. `activate::activate`'s own rollback already restores the
-        // live *file* on this path (`ReloadFailedAndRestored`); this
-        // removes the one piece of state that rollback does not know
-        // about. A backup that already existed before this call
-        // (`already_parked == true`) is never touched here, on any path -
-        // it is not this call's to discard.
+        // `already_parked == false`) must not survive a failed live write
+        // that actually left the live route back on its pre-maintenance
+        // content - not just the reload failure this module's dedicated
+        // test exercises, but every `activate::Error` variant where the
+        // live file was genuinely restored (`HashGuardMismatch`,
+        // `ValidateFailed`, `ReloadFailedAndRestored`, `Io`, `Path`; also
+        // harmless for `ReloadFailedUnchanged`, which never touched the
+        // file). Left behind in those cases, the backup's mere existence
+        // would make a later retry's "does a backup already exist" check
+        // (above) answer "yes" and report `already_parked: true` for a
+        // domain whose live route was never actually replaced, silently
+        // skipping the snapshot it still needs.
         //
-        // Best-effort, like every other `discard` in this codebase's
-        // rollback paths: the error being returned is the actionable one,
-        // and a leftover `.maintenance-backup` matching the still-live
-        // content is (if this removal itself fails) a false "already
-        // parked" on the next attempt, not data loss - the next successful
-        // park attempt would just skip re-snapshotting a live config that
-        // was never replaced. That is a real, if narrow, follow-on risk;
-        // see this task's report for why it is accepted here rather than
-        // folded into `activate::activate`'s own atomic rollback.
-        if !already_parked {
+        // The one exception is `RecoveryFailed { restore:
+        // RestoreFailure::File(_), .. }`: there, `activate_live`'s own
+        // rename-back of the pre-maintenance content onto the live path
+        // failed (`activate.rs`'s `restored` step), so the live route
+        // *still holds the maintenance page* right now - the domain
+        // genuinely is parked, just with its recovery half-finished. In
+        // that one case the `.maintenance-backup` this call just wrote is
+        // the *only* remaining copy of the real pre-maintenance
+        // configuration (the live file itself no longer has it, and
+        // nothing reads the `.rollback-<id>` sibling `activate_live`
+        // leaves behind). Deleting it here would strand that
+        // configuration entirely and, worse, make a later successful park
+        // retry snapshot the maintenance page itself as "pre-maintenance"
+        // - exactly the corruption the step-4 "never overwrite an
+        // existing backup" rule exists to prevent. So this specific
+        // sub-case must not clear the backup, even though every other
+        // `RecoveryFailed` shape (`restore: RestoreFailure::Reload(_)`,
+        // where the file rename-back succeeded and only the confirming
+        // reload failed) does.
+        //
+        // Best-effort (`let _ =`), like every other `discard` in this
+        // codebase's rollback paths: the error being returned is the
+        // actionable one, and a leftover `.maintenance-backup` matching
+        // the still-live content is (if this removal itself fails) a
+        // false "already parked" on the next attempt, not data loss - the
+        // next successful park attempt would just skip re-snapshotting a
+        // live config that was never replaced.
+        let live_was_restored = !matches!(
+            error,
+            activate::Error::RecoveryFailed {
+                restore: RestoreFailure::File(_),
+                ..
+            }
+        );
+        if !already_parked && live_was_restored {
             let _ = root.remove_file(&backup_path);
         }
         return Err(fail(
