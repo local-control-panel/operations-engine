@@ -84,6 +84,50 @@ impl fmt::Display for Domain {
     }
 }
 
+/// A validated runtime-pool identifier (`website-control-panel`'s
+/// `runtime_id`, e.g. `fp1-php83`) — 1-64 bytes of lowercase ASCII letters,
+/// digits, or hyphens, never starting or ending with a hyphen. The same
+/// per-label character-class rule `Domain::parse` applies to each of its
+/// dot-separated labels, applied here to the whole string once, since a
+/// runtime id has no dots at all.
+///
+/// That character set is what makes a `RuntimeId` safe to interpolate into
+/// a single path segment (`runtime_config::route_path`'s `{runtime_id}/`
+/// prefix) exactly the way `Domain`'s own doc comment argues for
+/// `<domain>.caddyfile`: `/`, `\0`, and every other component-splitting or
+/// traversal byte are already excluded above, so the resulting segment is
+/// always one `Component::Normal`. `SiteRelativePath` still re-checks it;
+/// this only means that check can never be the thing standing between a
+/// request and a path escape.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeId(String);
+
+impl RuntimeId {
+    pub fn parse(value: &str) -> Result<Self, ValidationError> {
+        if value.is_empty()
+            || value.len() > 64
+            || value.starts_with('-')
+            || value.ends_with('-')
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(ValidationError::InvalidRuntimeId);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RuntimeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustedRoot(PathBuf);
 
@@ -207,6 +251,7 @@ fn has_forbidden_raw_segment(path: &Path) -> bool {
 pub enum ValidationError {
     InvalidSiteId,
     InvalidDomain,
+    InvalidRuntimeId,
     InvalidTrustedRoot,
     RootFilesystemNotAllowed,
     InvalidRelativePath,
@@ -219,7 +264,9 @@ pub enum ValidationError {
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{Domain, GitCommitSha, SiteId, SiteRelativePath, TrustedRoot, ValidationError};
+    use super::{
+        Domain, GitCommitSha, RuntimeId, SiteId, SiteRelativePath, TrustedRoot, ValidationError,
+    };
 
     #[test]
     fn domain_accepts_only_lowercase_label_syntax() {
@@ -266,6 +313,44 @@ mod tests {
         let relative = SiteRelativePath::parse(format!("{domain}.caddyfile"))
             .expect("a domain-derived route name should always be a valid relative path");
         assert_eq!(relative.as_path().components().count(), 1);
+    }
+
+    #[test]
+    fn runtime_id_accepts_only_lowercase_hyphenated_syntax() {
+        assert_eq!(
+            RuntimeId::parse("fp1-php83")
+                .expect("a plain runtime id should parse")
+                .as_str(),
+            "fp1-php83"
+        );
+        assert!(RuntimeId::parse("").is_err());
+        assert!(RuntimeId::parse("FP1-PHP83").is_err());
+        assert!(RuntimeId::parse("-fp1-php83").is_err());
+        assert!(RuntimeId::parse("fp1-php83-").is_err());
+        assert!(RuntimeId::parse("fp1_php83").is_err());
+        assert!(RuntimeId::parse(&"a".repeat(65)).is_err());
+        assert!(RuntimeId::parse(&"a".repeat(64)).is_ok());
+        assert_eq!(
+            RuntimeId::parse("fp1 php83").unwrap_err(),
+            ValidationError::InvalidRuntimeId
+        );
+    }
+
+    /// The property `runtime_config::route_path`'s `{runtime_id}/` prefix
+    /// depends on: nothing a `RuntimeId` can hold makes that path segment
+    /// anything other than one ordinary path component.
+    #[test]
+    fn runtime_id_never_contains_a_path_separator_or_traversal_segment() {
+        for hostile in ["../etc/passwd", "a/b", "..", ".", "a\0b", "/absolute"] {
+            assert!(
+                RuntimeId::parse(hostile).is_err(),
+                "{hostile} must not parse as a runtime id"
+            );
+        }
+        let runtime_id = RuntimeId::parse("fp1-php83").expect("runtime id should parse");
+        let relative = SiteRelativePath::parse(format!("{runtime_id}/example.com.caddyfile"))
+            .expect("a runtime-id-derived path should always be a valid relative path");
+        assert_eq!(relative.as_path().components().count(), 2);
     }
 
     #[test]

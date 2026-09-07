@@ -8,7 +8,7 @@ matrix, redaction review, docs, opt-in rollout procedure) is done and
 tested, but the phase is not complete — see its own section for what
 remains (the control-plane half of pinned installation, and rotating off
 the TEST-ONLY signing key before a real release).
-Last updated: 2026-09-04
+Last updated: 2026-09-07
 
 This file is the shared implementation plan for Operations Engine. It is the
 authoritative source for what we build next, in what order, and what must be
@@ -869,6 +869,25 @@ The remaining call sites (`enable_basic_auth`,
 `rollback_rename_commit`) and `reconciliation.rs`'s overlapping
 remediation paths stay out of scope — see that plan's own "Out of
 scope" section for why each one specifically.
+A second engine operation, `runtime.activateConfig`, now exists
+alongside `ingress.activateConfig`: `create_site`, `restore_deleted_site`,
+`migrate_site_runtime_impl`, `rename_site`, and `rollback_rename_commit`
+write a per-site runtime-service Caddyfile fragment
+(`website-control-panel`'s `RUNTIME_CONTAINER_CONFIG_DIR`), structurally
+outside `ingress_root`'s coverage — hence a new trusted root
+(`EngineConfig::runtime_root`, `CONFIG_SCHEMA_VERSION` bumped 2→3) and a
+new operation rather than a variant on the existing one, since the target
+container genuinely varies per request instead of choosing between two
+fixed files. Unlike `ingress.activateConfig`'s single host-wide lock,
+this one locks per `runtime_id` — two different runtime pools share
+nothing a reload could race on, so serializing across them would cost
+throughput for no correctness benefit; see `runtime_config::execute::
+open_runtime_config_state`'s doc comment. `operations-engine` side only
+(`src/runtime_config/`, `src/site.rs`'s new `RuntimeId`, CLI/capabilities
+wiring, 40 new tests, 281/281 passing, clippy and fmt clean) — wiring it
+into `website-control-panel`'s 6 call sites across those 5 functions
+(`migrate_site_runtime_impl` has two) is a separate, not yet
+started increment.
 
 Potential candidates:
 
@@ -917,6 +936,7 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-04 | `CONFIG_SCHEMA_VERSION` bumped 1 -> 2, adding a required `ingressRoot` to `/etc/operations-engine/config.json`; a v1 config is rejected outright rather than defaulted. | `ingress.activateConfig` writes into a directory that is not any site's content root, so it needed a fourth trusted root, and a root the engine only *sometimes* has is not a boundary — a defaulted or optional `ingressRoot` would mean the operation's containment guarantee depended on whether an operator had happened to set it. Rejecting a v1 config outright rather than accepting it with a guessed root is the same fail-closed rule the rest of the config applies. The cost is that every host and every client-side config writer must be updated together; `website-control-panel` absorbs that with a self-heal keyed on the `"engine configuration is unavailable"` message (see `commands::CONFIG_UNAVAILABLE_MESSAGE`, whose exact text is now a pinned cross-repo contract with a test). |
 | 2026-09-04 | `ingress.activateConfig` takes one host-wide lock (`ingress/locks/mutation.lock`), not a per-site or per-domain one. | The resource the operation actually mutates is shared: `caddy reload` reloads the whole imported config set, so two domains activating concurrently can each observe the other's half-applied file, and a reload failure caused by domain B can push domain A's activation down its rollback path and restore a file that was never the problem. `website-control-panel` locks per domain, which is finer than the thing being shared and therefore does not serialize the actual race. Ingress config changes are operator-paced, so the throughput a host-wide lock costs is worth the race it removes. Recorded here because it deliberately diverges from the client's existing lock granularity. |
 | 2026-09-04 | `HashGuard` has exactly two wire-reachable states — `Absent` and `Sha256` — and no unguarded/`Unchecked` overwrite path at all. Omitting `--expected-hash` means "assert no live file exists", not "skip the check". | The pilot's only real caller (`disable_basic_auth`) always has a prior file it just read, so it always has a genuine hash to send; nothing needed silent-overwrite semantics. Leaving an unchecked path on the wire would have shipped exactly the silent-overwrite default the hash guard exists to remove, and the ~27 unmigrated `activate_caddyfile` call sites in `website-control-panel` are precisely the population that would have reached for it by habit. Cost if this is ever wrong: a future caller that genuinely wants unguarded overwrite has to add that path back deliberately — cheap, reviewable, and safer than the reverse. |
+| 2026-09-07 | `runtime.activateConfig` locks per `runtime_id` (`runtime-config/<id>/locks/mutation.lock`), not host-wide like `ingress.activateConfig`. | The resource a reload actually shares is everything imported by *that one runtime-service container's* Caddyfile — every domain currently on that same runtime pool — the same "the lock must match what a reload really touches" reasoning behind `ingress`'s own host-wide lock. But unlike ingress's single shared container, two different runtime pools (`fp1-php83` vs `fp1-php84`) share nothing: serializing activations across them would cost throughput for a race that cannot occur. Per-`runtime_id` is coarser than per-domain (matches what a reload touches) and finer than host-wide (matches what it does not) — deliberately diverges from both `ingress.activateConfig`'s and the client's own granularity, recorded here for the same reason the ingress lock choice was. |
 
 ## Open decisions
 

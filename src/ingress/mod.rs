@@ -25,7 +25,7 @@ pub mod park;
 pub mod unpark;
 
 #[cfg(all(test, unix))]
-mod fake_docker;
+pub(crate) mod fake_docker;
 
 use std::fmt;
 

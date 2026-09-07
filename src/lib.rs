@@ -11,6 +11,7 @@ pub mod mutation;
 pub mod process;
 pub mod protocol;
 pub mod rollback;
+pub mod runtime_config;
 pub mod site;
 pub mod transaction;
 
@@ -27,6 +28,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Site { command } => commands::site::run(command),
         Command::Engine { command } => commands::engine::run(command),
         Command::Ingress { command } => commands::ingress::run(command),
+        Command::Runtime { command } => commands::runtime_config::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

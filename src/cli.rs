@@ -45,6 +45,12 @@ pub enum Command {
         #[command(subcommand)]
         command: IngressCommand,
     },
+
+    /// Per-site runtime-service configuration operations.
+    Runtime {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
 }
 
 impl Command {
@@ -56,6 +62,7 @@ impl Command {
             Self::Site { command } => command.operation(),
             Self::Engine { command } => command.operation(),
             Self::Ingress { command } => command.operation(),
+            Self::Runtime { command } => command.operation(),
         }
     }
 }
@@ -250,6 +257,58 @@ impl IngressCommand {
             Self::ActivateConfig { .. } => "ingress.activateConfig",
             Self::Park { .. } => "ingress.park",
             Self::Unpark { .. } => "ingress.unpark",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuntimeCommand {
+    /// Atomically replace one site's runtime-service Caddyfile fragment,
+    /// validating the new content before it can reach the live path and
+    /// restoring the previous content if the live reload rejects it.
+    ActivateConfig {
+        /// Which runtime pool's Caddyfile fragment is being replaced —
+        /// selects both the `runtime-<id>` Compose service the write
+        /// validates/reloads against and the `<id>/` subdirectory of the
+        /// configured runtime root it lives under.
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+
+        /// The site whose fragment this is. The engine derives the file
+        /// name from it (`<domain>.caddyfile`).
+        #[arg(long)]
+        domain: String,
+
+        /// Path to a file holding the complete new contents of the
+        /// fragment. Whole-file replacement, not a patch: read the current
+        /// file, transform it, and pass the result here.
+        #[arg(long = "content-file")]
+        content_file: PathBuf,
+
+        /// The SHA-256 digest of the fragment's current contents, as an
+        /// optimistic-concurrency precondition. Omit only when no fragment
+        /// is expected to exist yet for this site on this runtime pool
+        /// (asserts absence — fails if one is already there). To update an
+        /// existing fragment, pass its current content hash.
+        #[arg(long = "expected-hash")]
+        expected_hash: Option<String>,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of activating twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl RuntimeCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::ActivateConfig { .. } => "runtime.activateConfig",
         }
     }
 }

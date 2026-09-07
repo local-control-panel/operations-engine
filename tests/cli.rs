@@ -46,7 +46,8 @@ fn capabilities_describe_only_implemented_operations() {
             "engine.rollback",
             "ingress.activateConfig",
             "ingress.park",
-            "ingress.unpark"
+            "ingress.unpark",
+            "runtime.activateConfig"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
