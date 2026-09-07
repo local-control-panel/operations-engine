@@ -63,6 +63,12 @@ pub enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+
+    /// Docker Compose stack configuration operations.
+    Compose {
+        #[command(subcommand)]
+        command: ComposeCommand,
+    },
 }
 
 impl Command {
@@ -77,6 +83,7 @@ impl Command {
             Self::Runtime { command } => command.operation(),
             Self::Cron { command } => command.operation(),
             Self::Db { command } => command.operation(),
+            Self::Compose { command } => command.operation(),
         }
     }
 }
@@ -317,6 +324,49 @@ pub enum RuntimeCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ComposeCommand {
+    /// Atomically replace one Compose stack's `docker-compose.yml`,
+    /// validating the new content (`docker compose config`) before it can
+    /// reach the live path and bringing the stack up (`docker compose up
+    /// -d`) - restoring the previous file and bringing it back up if that
+    /// fails.
+    ActivateConfig {
+        /// Which stack's compose file is being replaced.
+        #[arg(long = "stack-name")]
+        stack_name: String,
+
+        /// Path to a file holding the complete new contents of the compose
+        /// file. Whole-file replacement, not a patch.
+        #[arg(long = "content-file")]
+        content_file: PathBuf,
+
+        /// The SHA-256 digest of the compose file's current contents, as an
+        /// optimistic-concurrency precondition. Omit only when no file is
+        /// expected to exist yet for this stack (asserts absence - fails if
+        /// one is already there).
+        #[arg(long = "expected-hash")]
+        expected_hash: Option<String>,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of activating twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl ComposeCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::ActivateConfig { .. } => "compose.activateConfig",
+        }
+    }
 }
 
 impl RuntimeCommand {

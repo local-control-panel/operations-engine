@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod compose_config;
 pub mod cron;
 pub mod db_restore;
 pub mod doctor;

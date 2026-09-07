@@ -49,7 +49,8 @@ fn capabilities_describe_only_implemented_operations() {
             "ingress.unpark",
             "runtime.activateConfig",
             "cron.installTab",
-            "db.restore"
+            "db.restore",
+            "compose.activateConfig"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

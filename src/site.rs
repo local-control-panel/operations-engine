@@ -128,6 +128,48 @@ impl fmt::Display for RuntimeId {
     }
 }
 
+/// A validated Docker Compose stack identifier (`website-control-panel`'s
+/// `stack_name`) — mirrors that client's own `is_valid_stack_name`: 1-64
+/// bytes, first byte ASCII alphanumeric, every subsequent byte ASCII
+/// alphanumeric or one of `_`, `.`, `-`, and never exactly `.` or `..`.
+/// Wider than `RuntimeId`'s charset (mixed case and `_`/`.` allowed) because
+/// it has to accept whatever the client already accepts, not invent a
+/// stricter rule the client doesn't enforce. The leading-alphanumeric rule
+/// alone already rules out a leading `.`/`-`/`/`, and the explicit `.`/`..`
+/// rejection closes the one remaining traversal-segment case that rule
+/// doesn't - `compose::route_path`'s `{stack_name}/docker-compose.yml`
+/// prefix is always one `Component::Normal` for the same reason
+/// `RuntimeId`'s doc comment argues for its own path safety.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StackName(String);
+
+impl StackName {
+    pub fn parse(value: &str) -> Result<Self, ValidationError> {
+        if value.is_empty() || value.len() > 64 || value == "." || value == ".." {
+            return Err(ValidationError::InvalidStackName);
+        }
+        let mut bytes = value.bytes();
+        match bytes.next() {
+            Some(byte) if byte.is_ascii_alphanumeric() => {}
+            _ => return Err(ValidationError::InvalidStackName),
+        }
+        if !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-')) {
+            return Err(ValidationError::InvalidStackName);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for StackName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TrustedRoot(PathBuf);
 
@@ -252,6 +294,7 @@ pub enum ValidationError {
     InvalidSiteId,
     InvalidDomain,
     InvalidRuntimeId,
+    InvalidStackName,
     InvalidTrustedRoot,
     RootFilesystemNotAllowed,
     InvalidRelativePath,
@@ -265,7 +308,8 @@ mod tests {
     use std::{fs, path::Path};
 
     use super::{
-        Domain, GitCommitSha, RuntimeId, SiteId, SiteRelativePath, TrustedRoot, ValidationError,
+        Domain, GitCommitSha, RuntimeId, SiteId, SiteRelativePath, StackName, TrustedRoot,
+        ValidationError,
     };
 
     #[test]
@@ -350,6 +394,41 @@ mod tests {
         let runtime_id = RuntimeId::parse("fp1-php83").expect("runtime id should parse");
         let relative = SiteRelativePath::parse(format!("{runtime_id}/example.com.caddyfile"))
             .expect("a runtime-id-derived path should always be a valid relative path");
+        assert_eq!(relative.as_path().components().count(), 2);
+    }
+
+    #[test]
+    fn stack_name_accepts_mixed_case_and_dots_but_not_bare_dot_segments() {
+        assert_eq!(
+            StackName::parse("wp-stack_1.prod")
+                .expect("a mixed-charset stack name should parse")
+                .as_str(),
+            "wp-stack_1.prod"
+        );
+        assert!(StackName::parse("").is_err());
+        assert!(StackName::parse(".").is_err());
+        assert!(StackName::parse("..").is_err());
+        assert!(StackName::parse("-leading-hyphen").is_err());
+        assert!(StackName::parse(".leading-dot").is_err());
+        assert!(StackName::parse(&"a".repeat(65)).is_err());
+        assert!(StackName::parse(&"a".repeat(64)).is_ok());
+        assert_eq!(
+            StackName::parse("has space").unwrap_err(),
+            ValidationError::InvalidStackName
+        );
+    }
+
+    #[test]
+    fn stack_name_never_contains_a_path_separator_or_traversal_segment() {
+        for hostile in ["../etc/passwd", "a/b", "/absolute", "a\0b"] {
+            assert!(
+                StackName::parse(hostile).is_err(),
+                "{hostile} must not parse as a stack name"
+            );
+        }
+        let stack_name = StackName::parse("wp-stack").expect("stack name should parse");
+        let relative = SiteRelativePath::parse(format!("{stack_name}/docker-compose.yml"))
+            .expect("a stack-name-derived path should always be a valid relative path");
         assert_eq!(relative.as_path().components().count(), 2);
     }
 

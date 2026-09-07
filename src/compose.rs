@@ -150,6 +150,25 @@ fn compose_base_dir_inner(home: Option<PathBuf>) -> Result<PathBuf, Error> {
         .ok_or(Error::NoHomeDirectory)
 }
 
+/// Resolves `~/compose` (the parent every Compose stack this host manages
+/// lives under — `website-control-panel`'s `COMPOSE_DIR`, one level above
+/// `COMPOSE_BASE_DIR`'s own `wp-stack` subdirectory) to an absolute path,
+/// via the same `home_dir` resolution `compose_base_dir` uses. Exists for
+/// `crate::compose_config`'s `compose.activateConfig` operation, which
+/// manages arbitrary stacks under this directory rather than the one fixed
+/// WCP stack `compose_base_dir`/`exec` address — resolved dynamically here
+/// rather than sourced from `EngineConfig`, since (unlike every other
+/// trusted root) it is inherently relative to whichever account this
+/// process runs as, not a fixed absolute path an operator configures.
+pub fn compose_root_dir() -> Result<PathBuf, Error> {
+    compose_root_dir_inner(home_dir())
+}
+
+fn compose_root_dir_inner(home: Option<PathBuf>) -> Result<PathBuf, Error> {
+    home.map(|home| home.join("compose"))
+        .ok_or(Error::NoHomeDirectory)
+}
+
 /// Runs `docker compose -p wcp --env-file .env -f stack/docker-compose.yml
 /// exec -T <service> <args...>` through the bounded, argv-only
 /// `process::run` — the shell-free equivalent of `website-control-panel`'s
@@ -448,6 +467,24 @@ mod tests {
     fn compose_base_dir_fails_closed_when_no_home_is_resolvable() {
         assert!(matches!(
             super::compose_base_dir_inner(None),
+            Err(Error::NoHomeDirectory)
+        ));
+    }
+
+    #[test]
+    fn compose_root_dir_joins_the_resolved_home_with_compose() {
+        let fake_home = tempfile::tempdir().expect("fake home should be created");
+
+        let resolved = super::compose_root_dir_inner(Some(fake_home.path().to_path_buf()))
+            .expect("a resolvable home should yield a compose root dir");
+
+        assert_eq!(resolved, fake_home.path().join("compose"));
+    }
+
+    #[test]
+    fn compose_root_dir_fails_closed_when_no_home_is_resolvable() {
+        assert!(matches!(
+            super::compose_root_dir_inner(None),
             Err(Error::NoHomeDirectory)
         ));
     }

@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod commands;
 pub mod compose;
+pub mod compose_config;
 pub mod config;
 pub mod cron;
 pub mod db_restore;
@@ -33,6 +34,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Runtime { command } => commands::runtime_config::run(command),
         Command::Cron { command } => commands::cron::run(command),
         Command::Db { command } => commands::db_restore::run(command),
+        Command::Compose { command } => commands::compose_config::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))
