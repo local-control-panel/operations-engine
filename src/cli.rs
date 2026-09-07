@@ -51,6 +51,12 @@ pub enum Command {
         #[command(subcommand)]
         command: RuntimeCommand,
     },
+
+    /// Host crontab operations.
+    Cron {
+        #[command(subcommand)]
+        command: CronCommand,
+    },
 }
 
 impl Command {
@@ -63,6 +69,7 @@ impl Command {
             Self::Engine { command } => command.operation(),
             Self::Ingress { command } => command.operation(),
             Self::Runtime { command } => command.operation(),
+            Self::Cron { command } => command.operation(),
         }
     }
 }
@@ -309,6 +316,39 @@ impl RuntimeCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateConfig { .. } => "runtime.activateConfig",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CronCommand {
+    /// Atomically replace the engine's own host user's crontab.
+    InstallTab {
+        /// Path to a file holding the complete new crontab contents.
+        #[arg(long = "content-file")]
+        content_file: PathBuf,
+
+        /// The SHA-256 digest of the crontab's current contents, as an
+        /// optimistic-concurrency precondition. Omit only when no crontab
+        /// is expected to exist yet (asserts absence).
+        #[arg(long = "expected-hash")]
+        expected_hash: Option<String>,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of installing twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl CronCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::InstallTab { .. } => "cron.installTab",
         }
     }
 }

@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod cron;
 pub mod doctor;
 pub mod engine;
 pub mod ingress;

@@ -894,7 +894,7 @@ Potential candidates:
 - atomic Caddy and site configuration changes — **pilot in progress, see above**;
 - stack status and reconciliation;
 - backup and restore;
-- narrowly scoped scheduled jobs.
+- narrowly scoped scheduled jobs — **`cron.installTab` shipped** (host-wide, hash-guarded whole-crontab replacement via a staged file + `crontab <path>`, no `docker compose exec`/`TrustedRoot` involved - the first mutation this engine runs as a bare host subprocess rather than against a container or a managed root). Deliberately narrow: only the engine's own host user's crontab, not an arbitrary named user's (`website-control-panel`'s general-purpose per-user cron admin UI stays on its existing raw-SSH path - a materially broader privilege surface this engine's site-scoped model isn't built for).
 
 Interactive terminals, arbitrary shell execution, general file browsing, and
 live log streaming remain outside the structured privileged API unless a new
