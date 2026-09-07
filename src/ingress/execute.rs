@@ -358,6 +358,9 @@ fn replay(
 ) -> Result<ActivateConfigResult, ActivateConfigError> {
     let original_state = state::load(ingress_state, &state_path_for(original))
         .map_err(ActivateConfigError::State)?;
+    if original_state.operation != OPERATION {
+        return Err(ActivateConfigError::State(state::StateError::Corrupt));
+    }
     match original_state.status {
         TransactionStatus::InProgress => Err(ActivateConfigError::ReplayInProgress),
         TransactionStatus::Committed => {
@@ -438,7 +441,8 @@ mod tests {
         error::ErrorCode,
         filesystem::ManagedRoot,
         ingress::{
-            ActivateConfigRequest, ConfigHash, HashGuard, RouteTarget, fake_docker::FakeDocker,
+            ActivateConfigRequest, ConfigHash, HashGuard, ParkRequest, RouteTarget,
+            fake_docker::FakeDocker, park,
         },
         process::CancellationToken,
         site::TrustedRoot,
@@ -601,6 +605,60 @@ mod tests {
                 .path()
                 .join(format!("ingress/transactions/{RETRY_REQUEST_ID}.json"))
                 .exists()
+        );
+    }
+
+    /// Regression test for the cross-operation idempotency-replay hole: all
+    /// three `ingress` operations share one idempotency namespace
+    /// (`fnv1a(key)`, no operation discriminant in the key itself), so
+    /// before `replay` checked `original_state.operation`, a key claimed by
+    /// `ingress.park` and then replayed under `ingress.activateConfig`
+    /// would deserialize `park`'s stored `ParkResult` straight into an
+    /// `ActivateConfigResult` if the shapes happened to line up, silently
+    /// returning a fabricated activation result for a request that never
+    /// activated anything. Confirmed empirically during the final review as
+    /// the mirror-image failure to the `activateConfig` -> `unpark` case
+    /// covered in `unpark.rs`'s own regression test.
+    #[test]
+    fn a_key_claimed_by_park_is_never_replayed_as_a_fake_activate_config_result() {
+        let host = host(Some(PREVIOUS));
+        let docker = FakeDocker::new();
+        let key = Some("shared-key-across-operations");
+
+        let park_context = ActivateContext {
+            ingress_root: &host.ingress_root,
+            engine_state: &host.engine_state,
+            compose: &docker.access(),
+        };
+        let park_request = ParkRequest::parse(
+            DOMAIN,
+            "example.com {\n  respond \"down for maintenance\"\n}\n",
+            REQUEST_ID,
+            key,
+        )
+        .expect("park request should parse");
+        park::execute(&park_context, &park_request, &CancellationToken::default())
+            .expect("the park call under this key should succeed");
+
+        let error = run(
+            &host,
+            &docker,
+            &request(HashGuard::Absent, RouteTarget::Live, RETRY_REQUEST_ID, key),
+        )
+        .expect_err(
+            "an activate-config call reusing a park idempotency key must not silently succeed",
+        );
+
+        assert!(
+            matches!(error, ActivateConfigError::State(_)),
+            "expected the cross-operation mismatch to be reported as a state error, got {error:?}"
+        );
+        // The fix rejects before ever deserializing the stored `ParkResult`
+        // as an `ActivateConfigResult` - proven by the live route still
+        // holding exactly what `park` left it as, untouched by this call.
+        assert_eq!(
+            host.live().as_deref(),
+            Some("example.com {\n  respond \"down for maintenance\"\n}\n")
         );
     }
 

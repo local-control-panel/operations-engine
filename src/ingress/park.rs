@@ -419,6 +419,9 @@ pub fn execute(
 fn replay(ingress_state: &ManagedRoot, original: RequestId) -> Result<ParkResult, ParkError> {
     let original_state =
         state::load(ingress_state, &state_path_for(original)).map_err(ParkError::State)?;
+    if original_state.operation != PARK_OPERATION {
+        return Err(ParkError::State(state::StateError::Corrupt));
+    }
     match original_state.status {
         TransactionStatus::InProgress => Err(ParkError::ReplayInProgress),
         TransactionStatus::Committed => {
@@ -460,7 +463,11 @@ mod tests {
     use crate::{
         error::ErrorCode,
         filesystem::ManagedRoot,
-        ingress::{ParkRequest, ParkResult, execute::ActivateContext, fake_docker::FakeDocker},
+        ingress::{
+            ActivateConfigRequest, HashGuard, ParkRequest, ParkResult, RouteTarget,
+            execute::{self as activate_execute, ActivateContext},
+            fake_docker::FakeDocker,
+        },
         process::CancellationToken,
         site::TrustedRoot,
     };
@@ -643,6 +650,65 @@ mod tests {
             "a replay must not touch the container again"
         );
         assert!(!host.transaction_exists(RETRY_REQUEST_ID));
+    }
+
+    /// Regression test for the cross-operation idempotency-replay hole: all
+    /// three `ingress` operations share one idempotency namespace
+    /// (`fnv1a(key)`, no operation discriminant in the key itself), so
+    /// before `replay` checked `original_state.operation`, a key claimed by
+    /// `ingress.activateConfig` and then replayed under `ingress.park`
+    /// would attempt to deserialize `activateConfig`'s stored
+    /// `ActivateConfigResult` straight into a `ParkResult` for a request
+    /// that never parked anything. See `unpark.rs`'s own regression test
+    /// for the sibling case this same idempotency namespace makes possible
+    /// (that one a *silent* fake success, since `UnparkResult` happens to
+    /// be a structural subset of `ActivateConfigResult`).
+    #[test]
+    fn a_key_claimed_by_activate_config_is_never_replayed_as_a_fake_park_result() {
+        let host = host(Some(PREVIOUS), None);
+        let docker = FakeDocker::new();
+        let key = Some("shared-key-across-operations");
+
+        let activate_context = ActivateContext {
+            ingress_root: &host.ingress_root,
+            engine_state: &host.engine_state,
+            compose: &docker.access(),
+        };
+        let activate_request = ActivateConfigRequest::parse(
+            DOMAIN,
+            PREVIOUS,
+            HashGuard::Sha256(crate::ingress::ConfigHash::of(PREVIOUS.as_bytes())),
+            RouteTarget::Live,
+            REQUEST_ID,
+            key,
+        )
+        .expect("activate-config request should parse");
+        activate_execute::execute(
+            &activate_context,
+            &activate_request,
+            &CancellationToken::default(),
+        )
+        .expect("the activate-config call under this key should succeed");
+
+        let error = run(
+            &host,
+            &docker,
+            &request(MAINTENANCE_A, RETRY_REQUEST_ID, key),
+        )
+        .expect_err(
+            "a park call reusing an activate-config idempotency key must not silently succeed",
+        );
+
+        assert!(
+            matches!(error, ParkError::State(_)),
+            "expected the cross-operation mismatch to be reported as a state error, got {error:?}"
+        );
+        // The fix rejects before ever deserializing the stored
+        // `ActivateConfigResult` as a `ParkResult` - proven by no backup
+        // having been taken and the live route being untouched by this
+        // call.
+        assert_eq!(host.live().as_deref(), Some(PREVIOUS));
+        assert!(host.backup().is_none());
     }
 
     #[test]

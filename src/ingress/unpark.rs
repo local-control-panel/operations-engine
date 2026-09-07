@@ -379,6 +379,9 @@ pub fn execute(
 fn replay(ingress_state: &ManagedRoot, original: RequestId) -> Result<UnparkResult, UnparkError> {
     let original_state =
         state::load(ingress_state, &state_path_for(original)).map_err(UnparkError::State)?;
+    if original_state.operation != UNPARK_OPERATION {
+        return Err(UnparkError::State(state::StateError::Corrupt));
+    }
     match original_state.status {
         TransactionStatus::InProgress => Err(UnparkError::ReplayInProgress),
         TransactionStatus::Committed => {
@@ -420,7 +423,11 @@ mod tests {
     use crate::{
         error::ErrorCode,
         filesystem::ManagedRoot,
-        ingress::{UnparkRequest, UnparkResult, execute::ActivateContext, fake_docker::FakeDocker},
+        ingress::{
+            ActivateConfigRequest, HashGuard, RouteTarget, UnparkRequest, UnparkResult,
+            execute::{self as activate_execute, ActivateContext},
+            fake_docker::FakeDocker,
+        },
         process::CancellationToken,
         site::TrustedRoot,
     };
@@ -609,5 +616,65 @@ mod tests {
             "a replay must not touch the container again"
         );
         assert!(!host.transaction_exists(RETRY_REQUEST_ID));
+    }
+
+    /// Regression test for the cross-operation idempotency-replay hole
+    /// confirmed empirically during the final review: `UnparkResult`
+    /// (`domain`, `contentSha256`, `activatedAtUnixSecs`) is a *structural
+    /// subset* of `ActivateConfigResult` (those same three fields plus
+    /// `activated`), so before `replay` checked `original_state.operation`,
+    /// calling `ingress activate-config --idempotency-key K` and then
+    /// `ingress unpark --idempotency-key K` would deserialize the stored
+    /// `ActivateConfigResult` straight into an `UnparkResult` and return a
+    /// *fake* unpark success - without ever touching the backup or live
+    /// files - because every field `UnparkResult` needs happens to already
+    /// be present in `ActivateConfigResult`'s JSON. Every other
+    /// cross-operation pairing (see `execute.rs`'s and this module's
+    /// sibling `park.rs` regression tests) fails closed even without this
+    /// fix, purely by accident of which fields do *not* line up; this is
+    /// the one pairing that silently succeeded, so it is the one that
+    /// actually proves the fix.
+    #[test]
+    fn an_activate_config_key_is_never_replayed_as_a_fake_unpark_success() {
+        let host = host(Some(MAINTENANCE), None);
+        let docker = FakeDocker::new();
+        let key = Some("shared-key-across-operations");
+
+        let activate_context = ActivateContext {
+            ingress_root: &host.ingress_root,
+            engine_state: &host.engine_state,
+            compose: &docker.access(),
+        };
+        let activate_request = ActivateConfigRequest::parse(
+            DOMAIN,
+            MAINTENANCE,
+            HashGuard::Sha256(crate::ingress::ConfigHash::of(MAINTENANCE.as_bytes())),
+            RouteTarget::Live,
+            REQUEST_ID,
+            key,
+        )
+        .expect("activate-config request should parse");
+        activate_execute::execute(
+            &activate_context,
+            &activate_request,
+            &CancellationToken::default(),
+        )
+        .expect("the activate-config call under this key should succeed");
+
+        let error = run(&host, &docker, &request(RETRY_REQUEST_ID, key)).expect_err(
+            "an unpark call reusing an activate-config idempotency key must not silently \
+             succeed",
+        );
+
+        assert!(
+            matches!(error, UnparkError::State(_)),
+            "expected the cross-operation mismatch to be reported as a state error, got {error:?}"
+        );
+        // The fix rejects before ever deserializing the stored
+        // `ActivateConfigResult` as an `UnparkResult` - proven by the live
+        // route still holding exactly what activate-config left it as, and
+        // no backup having been fabricated or consumed.
+        assert_eq!(host.live().as_deref(), Some(MAINTENANCE));
+        assert!(host.backup().is_none());
     }
 }
