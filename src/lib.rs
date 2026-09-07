@@ -3,6 +3,7 @@ pub mod commands;
 pub mod compose;
 pub mod config;
 pub mod cron;
+pub mod db_restore;
 pub mod deploy;
 pub mod engine;
 pub mod error;
@@ -31,6 +32,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Ingress { command } => commands::ingress::run(command),
         Command::Runtime { command } => commands::runtime_config::run(command),
         Command::Cron { command } => commands::cron::run(command),
+        Command::Db { command } => commands::db_restore::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

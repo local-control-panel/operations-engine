@@ -57,6 +57,12 @@ pub enum Command {
         #[command(subcommand)]
         command: CronCommand,
     },
+
+    /// Database restore operations.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
 }
 
 impl Command {
@@ -70,6 +76,7 @@ impl Command {
             Self::Ingress { command } => command.operation(),
             Self::Runtime { command } => command.operation(),
             Self::Cron { command } => command.operation(),
+            Self::Db { command } => command.operation(),
         }
     }
 }
@@ -349,6 +356,56 @@ impl CronCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::InstallTab { .. } => "cron.installTab",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DbCommand {
+    /// Runs a database client against an already-on-disk dump file.
+    /// Audit-trail only - no snapshot, no rollback; the dump either
+    /// imports cleanly or it doesn't, the same as the raw command this
+    /// replaces.
+    Restore {
+        #[arg(long = "db-type", value_enum)]
+        db_type: DbTypeArg,
+
+        #[arg(long)]
+        database: String,
+
+        /// The Docker container/service running the database.
+        #[arg(long)]
+        container: String,
+
+        /// Path to the dump file on this host - not staged or copied,
+        /// read directly by the database client.
+        #[arg(long = "file-path")]
+        file_path: String,
+
+        #[arg(long = "root-password")]
+        root_password: String,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of restoring twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum DbTypeArg {
+    Mariadb,
+    Postgres,
+}
+
+impl DbCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Restore { .. } => "db.restore",
         }
     }
 }

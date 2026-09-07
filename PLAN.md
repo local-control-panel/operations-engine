@@ -893,7 +893,7 @@ Potential candidates:
 
 - atomic Caddy and site configuration changes — **pilot in progress, see above**;
 - stack status and reconciliation;
-- backup and restore;
+- backup and restore — **`db.restore` shipped, audit-trail scope only** (runs the existing `mariadb`/`psql` restore client against an already-on-disk dump via argv-only subprocess execution instead of a raw SSH shell string; no `HashGuard`, no pre-restore snapshot, no rollback - a destructive import has no "expected prior content" to guard and this was an explicit scope decision, not an oversight, deferring real transactional safety - snapshot + verify + auto-rollback-on-failure - as a materially larger follow-up on par with this engine's original deploy/rollback pipeline). Required two small additions to `process.rs` (`run_with_stdin_file`, `run_piped`) so a large dump file streams into the client via direct fd handoff/OS-level pipe rather than being buffered through this process - the first two callers here that need input larger than what `ProcessLimits`' bounded output capture was ever sized for;
 - narrowly scoped scheduled jobs — **`cron.installTab` shipped** (host-wide, hash-guarded whole-crontab replacement via a staged file + `crontab <path>`, no `docker compose exec`/`TrustedRoot` involved - the first mutation this engine runs as a bare host subprocess rather than against a container or a managed root). Deliberately narrow: only the engine's own host user's crontab, not an arbitrary named user's (`website-control-panel`'s general-purpose per-user cron admin UI stays on its existing raw-SSH path - a materially broader privilege surface this engine's site-scoped model isn't built for).
 
 Interactive terminals, arbitrary shell execution, general file browsing, and

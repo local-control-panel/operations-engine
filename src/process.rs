@@ -205,17 +205,13 @@ impl SubprocessDiagnostics {
     }
 }
 
-pub fn run(
-    request: &ProcessRequest,
-    limits: &ProcessLimits,
-    cancellation: &CancellationToken,
-) -> Result<ProcessOutput, ProcessRunError> {
+/// Builds the `Command` for `request`, everything but `stdin` - every
+/// caller (`run`, `run_with_stdin_file`, `run_piped`'s downstream half)
+/// needs the same program/args/cwd/env/run_as setup and differs only in
+/// what feeds the child's stdin.
+fn build_command(request: &ProcessRequest) -> Command {
     let mut command = Command::new(&request.program);
-    command
-        .args(&request.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(&request.args);
     if let Some(dir) = &request.current_dir {
         command.current_dir(dir);
     }
@@ -227,6 +223,18 @@ pub fn run(
         use std::os::unix::process::CommandExt;
         command.uid(uid).gid(gid);
     }
+    command
+}
+
+/// Spawns `command` (stdin already configured by the caller) and supervises
+/// it exactly as `run` always has: poll for cancellation/timeout/exit,
+/// capture stdout/stderr on background threads bounded by `limits`.
+fn spawn_and_supervise(
+    mut command: Command,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().map_err(ProcessRunError::Spawn)?;
 
     let stdout = child
@@ -276,6 +284,99 @@ pub fn run(
     })
 }
 
+pub fn run(
+    request: &ProcessRequest,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
+    let mut command = build_command(request);
+    command.stdin(Stdio::null());
+    spawn_and_supervise(command, limits, cancellation)
+}
+
+/// Like `run`, but the child's stdin is connected directly to `stdin_path`
+/// (a file descriptor handoff to the kernel, not a buffered read through
+/// this process) rather than closed. For feeding a database client an
+/// on-disk dump that may be arbitrarily large - `capture`'s bounded
+/// in-memory reads (`ProcessLimits::max_stdout_bytes`) exist for *output*
+/// this engine has to hold and inspect, and are the wrong shape for a
+/// multi-gigabyte restore file passed straight through as input.
+pub fn run_with_stdin_file(
+    request: &ProcessRequest,
+    stdin_path: &std::path::Path,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
+    let file = std::fs::File::open(stdin_path).map_err(ProcessRunError::Spawn)?;
+    let mut command = build_command(request);
+    command.stdin(Stdio::from(file));
+    spawn_and_supervise(command, limits, cancellation)
+}
+
+/// Runs `upstream` with its stdout connected directly to `downstream`'s
+/// stdin (an OS-level pipe between the two children, no buffering through
+/// this process) - the argv-only equivalent of a shell `upstream |
+/// downstream` pipeline, for callers that would otherwise need `sh -c` to
+/// decompress a large file into a client's stdin. Returns both
+/// terminations: `downstream`'s full `ProcessOutput` (what a caller
+/// normally cares about) alongside `upstream`'s `ProcessTermination` alone
+/// (its stdout was consumed by the pipe, not captured - only whether it
+/// exited cleanly is observable here), since a downstream client that
+/// happens to accept empty/partial stdin without error can still exit 0
+/// while upstream failed. Callers that need to distinguish "upstream
+/// produced nothing because it failed" from "upstream produced nothing
+/// because the input was empty" should validate upstream's own success
+/// *and* pair this with their own separate integrity check beforehand
+/// (mirroring `website-control-panel`'s existing `gunzip -t` pre-check
+/// before its own `gunzip -c | client` pipeline, for the exact same
+/// pipefail-avoidance reason - this primitive does not add pipefail
+/// semantics either).
+pub fn run_piped(
+    upstream: &ProcessRequest,
+    downstream: &ProcessRequest,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<(ProcessTermination, ProcessOutput), ProcessRunError> {
+    let mut upstream_command = build_command(upstream);
+    upstream_command.stdin(Stdio::null()).stdout(Stdio::piped());
+    let mut upstream_child = upstream_command.spawn().map_err(ProcessRunError::Spawn)?;
+    let upstream_stdout = upstream_child
+        .stdout
+        .take()
+        .ok_or(ProcessRunError::MissingPipe("stdout"))?;
+
+    let mut downstream_command = build_command(downstream);
+    downstream_command.stdin(Stdio::from(upstream_stdout));
+    let downstream_output = spawn_and_supervise(downstream_command, limits, cancellation)?;
+
+    // Downstream has exited (or been killed) by the time `spawn_and_supervise`
+    // returns, which closes its end of the pipe - upstream sees EPIPE/finishes
+    // on its own almost immediately in the normal case. Still bounded by the
+    // same timeout rather than an unbounded wait, in case upstream is wedged
+    // on something unrelated to the pipe (e.g. its own I/O).
+    let upstream_started = Instant::now();
+    let upstream_termination = loop {
+        if let Some(status) = upstream_child.try_wait().map_err(ProcessRunError::Wait)? {
+            break ProcessTermination::Exited {
+                code: status.code(),
+                success: status.success(),
+            };
+        }
+        if upstream_started.elapsed() >= limits.timeout || cancellation.is_cancelled() {
+            upstream_child.kill().map_err(ProcessRunError::Wait)?;
+            upstream_child.wait().map_err(ProcessRunError::Wait)?;
+            break if cancellation.is_cancelled() {
+                ProcessTermination::Cancelled
+            } else {
+                ProcessTermination::TimedOut
+            };
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    Ok((upstream_termination, downstream_output))
+}
+
 fn capture(mut reader: impl Read, limit: usize) -> io::Result<CapturedOutput> {
     let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
     let mut truncated = false;
@@ -311,8 +412,8 @@ mod tests {
 
     use super::{
         CancellationToken, CapturedOutput, ProcessLimits, ProcessOutput, ProcessRequest,
-        ProcessRunError, ProcessTermination, SubprocessDiagnostics, error_code, run,
-        spawn_error_code,
+        ProcessRunError, ProcessTermination, SubprocessDiagnostics, error_code, run, run_piped,
+        run_with_stdin_file, spawn_error_code,
     };
     use crate::error::ErrorCode;
 
@@ -550,6 +651,68 @@ mod tests {
         assert!(matches!(
             dropped.termination,
             ProcessTermination::Exited { success: true, .. }
+        ));
+    }
+
+    #[test]
+    fn run_with_stdin_file_feeds_the_files_bytes_to_the_child() {
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let path = dir.path().join("input.txt");
+        std::fs::write(&path, "hello from disk\n").expect("input file should be written");
+
+        let output = run_with_stdin_file(
+            &ProcessRequest::new("cat"),
+            &path,
+            &ProcessLimits::default(),
+            &CancellationToken::default(),
+        )
+        .expect("cat should run");
+
+        assert_eq!(output.stdout.bytes, b"hello from disk\n");
+        assert!(matches!(
+            output.termination,
+            ProcessTermination::Exited { success: true, .. }
+        ));
+    }
+
+    #[test]
+    fn run_piped_connects_upstream_stdout_to_downstream_stdin() {
+        let (upstream_termination, downstream_output) = run_piped(
+            &ProcessRequest::new("printf").args(["piped-through"]),
+            &ProcessRequest::new("cat"),
+            &ProcessLimits::default(),
+            &CancellationToken::default(),
+        )
+        .expect("piped run should succeed");
+
+        assert!(matches!(
+            upstream_termination,
+            ProcessTermination::Exited { success: true, .. }
+        ));
+        assert_eq!(downstream_output.stdout.bytes, b"piped-through");
+        assert!(matches!(
+            downstream_output.termination,
+            ProcessTermination::Exited { success: true, .. }
+        ));
+    }
+
+    #[test]
+    fn run_piped_reports_a_failing_downstream_even_if_upstream_succeeded() {
+        let (upstream_termination, downstream_output) = run_piped(
+            &ProcessRequest::new("printf").args(["anything"]),
+            &ProcessRequest::new("sh").args(["-c", "cat >/dev/null; exit 1"]),
+            &ProcessLimits::default(),
+            &CancellationToken::default(),
+        )
+        .expect("piped run should still complete");
+
+        assert!(matches!(
+            upstream_termination,
+            ProcessTermination::Exited { success: true, .. }
+        ));
+        assert!(matches!(
+            downstream_output.termination,
+            ProcessTermination::Exited { success: false, .. }
         ));
     }
 }
