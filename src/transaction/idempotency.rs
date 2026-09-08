@@ -84,6 +84,23 @@ pub fn claim(
     }
 }
 
+/// Removes the claim for `key`, if one exists. Not-found is not an error -
+/// the caller (`transaction::prune`) wants "no claim on disk afterward",
+/// which an already-absent file already satisfies. Used to keep the
+/// idempotency index from retaining an entry that points at a
+/// `RequestId` whose `TransactionState` is about to be (or already was)
+/// pruned - an index entry surviving its target only turns a future
+/// retry into a `StateError::NotFound` instead of a clean "not claimed,
+/// proceed as new" resolution, so this is deliberately called before the
+/// state file it points to is removed, not after.
+pub fn remove(root: &ManagedRoot, key: &IdempotencyKey) -> Result<(), IndexError> {
+    match root.remove_file(&index_path(key)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(IndexError::Io),
+    }
+}
+
 /// Looks up an existing claim for `key` without creating one.
 pub fn lookup(root: &ManagedRoot, key: &IdempotencyKey) -> Result<Option<RequestId>, IndexError> {
     let path = index_path(key);

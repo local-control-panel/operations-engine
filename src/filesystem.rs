@@ -58,6 +58,26 @@ impl ManagedRoot {
         self.directory.exists(path.as_path())
     }
 
+    /// Names of the regular files directly inside `path` (non-recursive,
+    /// directories and anything not valid UTF-8 silently skipped - every
+    /// current caller lists a directory this engine itself only ever
+    /// populates with UTF-8-named files, so skipping the rest is a safe
+    /// simplification, not silent data loss). Used by retention sweeps
+    /// (`transaction::prune`) that need to enumerate what is on disk
+    /// before deciding what is old enough to remove.
+    pub fn file_names(&self, path: &SiteRelativePath) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in self.directory.open_dir(path.as_path())?.entries()? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    names.push(name);
+                }
+            }
+        }
+        Ok(names)
+    }
+
     /// Creates `path` only if it does not already exist and writes `contents`
     /// to it. The create-and-open step is atomic, so this is safe to use as a
     /// mutual-exclusion primitive between racing processes.

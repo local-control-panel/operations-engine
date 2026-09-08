@@ -18,6 +18,7 @@ use crate::{
         audit::{self, AuditError, AuditRecord},
         idempotency::{self, IndexError, Resolution},
         lock::{self, DEFAULT_STALE_AFTER, LockError, SiteLockGuard},
+        prune::{self, DEFAULT_COMPLETED_RETENTION},
         state::{self, StateError, TransactionState},
     },
 };
@@ -55,12 +56,25 @@ pub enum Error {
 /// by a path-construction bug. `operation` is the stable protocol
 /// operation name (e.g. `"site.deploy"`, `"site.rollback"`) recorded as
 /// `TransactionState::operation` and in the `MutationStart` audit event.
+///
+/// Also runs `transaction::prune::prune_completed` against this same
+/// scope before anything else — this function is the one place every
+/// mutating operation (site or engine-scoped alike) already calls, so it
+/// is where retention for `transactions/`/`transactions/idempotency/`
+/// lives, rather than duplicated per operation module.
 pub fn run<'a>(
     site_state: &'a ManagedRoot,
     request_id: RequestId,
     idempotency_key: Option<&IdempotencyKey>,
     operation: &'static str,
 ) -> Result<Outcome<'a>, Error> {
+    // Best-effort disk hygiene, run on every mutation attempt precisely
+    // because this is the one place every attempt already passes through -
+    // see `transaction::prune`'s module doc comment for why that matters.
+    // Never fails or delays the attempt itself: a sweep that cannot list or
+    // remove anything just leaves old state for the next call to retry.
+    prune::prune_completed(site_state, DEFAULT_COMPLETED_RETENTION);
+
     if let Some(key) = idempotency_key {
         match idempotency::claim(site_state, key, request_id).map_err(Error::Idempotency)? {
             Resolution::AlreadyClaimed(existing) => return Ok(Outcome::Replay(existing)),
@@ -117,14 +131,14 @@ fn audit_path() -> SiteRelativePath {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, Outcome, lock_path, open_site_state, run};
+    use super::{Error, Outcome, lock_path, open_site_state, run, state_path};
     use crate::{
         filesystem::ManagedRoot,
         site::{SiteId, TrustedRoot},
         transaction::{
             IdempotencyKey, RequestId,
             lock::{self, DEFAULT_STALE_AFTER},
-            state::TransactionStatus,
+            state::{self, TransactionState, TransactionStatus},
         },
     };
 
@@ -208,5 +222,51 @@ mod tests {
             Outcome::Proceed(_) => panic!("a retried idempotency key must not start new work"),
         }
         drop(admitted);
+    }
+
+    /// Proves the *wiring*, not just `transaction::prune::prune_completed`
+    /// in isolation (already covered by that module's own tests): every
+    /// call to `run` - the one place every mutating operation passes
+    /// through - must itself trigger the sweep, so a long-since-finished
+    /// transaction from days ago is gone by the time the *next* unrelated
+    /// request for this site completes preflight. This is the actual
+    /// guarantee against `transactions/`/`transactions/idempotency/`
+    /// growing without bound in production: as long as any operation ever
+    /// calls `run` again for a site, its old state gets swept, with no
+    /// per-operation opt-in required.
+    #[test]
+    fn a_long_finished_transaction_from_a_previous_attempt_is_swept_by_the_next_preflight() {
+        let (_directory, site_state) = site_state();
+        let old_id = request_id("3f0d5a71-2c48-4f6b-8b21-7d5e9c1a4b60");
+        let mut old_transaction = TransactionState::start(old_id, None, OPERATION);
+        old_transaction
+            .mark_committed(serde_json::json!({}))
+            .expect("commit should succeed");
+        // Eight days ago - past the seven-day default retention `run`
+        // wires in, without needing to fake `run`'s own clock.
+        old_transaction.finished_at_unix_secs = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after the epoch")
+                .as_secs()
+                .saturating_sub(8 * 24 * 60 * 60),
+        );
+        state::create(&site_state, &state_path(old_id), &old_transaction)
+            .expect("seeding the old transaction should succeed");
+
+        // An unrelated, brand-new request for the same site - proceeding
+        // and dropping its own lock is enough to prove sweeping does not
+        // require any special "cleanup" call the caller has to remember.
+        let Outcome::Proceed(admitted) = run(&site_state, request_id(REQUEST_ID), None, OPERATION)
+            .expect("preflight should run")
+        else {
+            panic!("a fresh request must proceed")
+        };
+        drop(admitted);
+
+        assert!(
+            !site_state.exists(&state_path(old_id)),
+            "an eight-day-old finished transaction must be swept by the next preflight call"
+        );
     }
 }
