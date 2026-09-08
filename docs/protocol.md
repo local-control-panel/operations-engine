@@ -73,12 +73,27 @@ Protocol version 1 reserves these stable codes:
 | `SUBPROCESS_FAILED` | A bounded external process exited unsuccessfully. |
 | `INTERNAL_SERIALIZATION_ERROR` | A result could not be encoded safely. |
 | `INTERNAL` | An unexpected internal failure occurred. |
+| `ARTIFACT_FETCH_FAILED` | A release manifest or binary could not be downloaded (`engine install`). |
+| `ARTIFACT_VERIFICATION_FAILED` | A downloaded manifest or binary failed signature, checksum, or version verification (`engine install`). |
+| `ARTIFACT_NOT_RUNNABLE` | A verified binary did not run on this host during its pre-activation smoke test, so it was rejected before anything was activated (`engine install`). |
 
 Error messages are safe summaries for operators, not stable API values. The
 optional `details` object is `null` unless an operation documents an allowlisted
 shape for its error code. It must contain identifiers, limits, or state needed
 for recovery—not command lines, environment variables, unrestricted paths,
 subprocess output, or secret-bearing input.
+
+## Warning taxonomy
+
+Warnings ride alongside a successful (`ok: true`) response — the operation's
+primary effect happened, but something adjacent to it needs attention.
+
+| Code | Meaning |
+| --- | --- |
+| `UNSUPPORTED_PLATFORM` | `doctor` found a dependency check that cannot run on this host's platform. |
+| `DEPENDENCY_UNAVAILABLE` | `doctor` found a required local executable or service missing. |
+| `TRANSACTION_RECORD_INCOMPLETE` | A mutation completed and its reported state really changed, but its transaction record could not be persisted afterward. The result is genuine; only the durable bookkeeping is in question. |
+| `INSTALL_STATE_RECORD_INCOMPLETE` | An `engine install`/`engine rollback` completed - the binary at `/usr/local/bin/ops-engine` really was switched - but the record naming the active and rollback-able versions could not be written afterward. Operationally significant: until repaired, `engine rollback` restores the version named by the stale record, not the one just replaced. |
 
 ## Doctor semantics
 
