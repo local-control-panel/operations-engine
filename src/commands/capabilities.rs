@@ -5,7 +5,7 @@ use crate::protocol::{Response, ResponseBuildError};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CapabilitiesResult {
-    operations: [&'static str; 15],
+    operations: [&'static str; 16],
     output_formats: [&'static str; 1],
     features: Features,
 }
@@ -35,6 +35,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "ingress.unpark",
                 "ingress.reconcile",
                 "runtime.activateConfig",
+                "runtime.reconcile",
                 "cron.installTab",
                 "db.restore",
                 "compose.activateConfig",

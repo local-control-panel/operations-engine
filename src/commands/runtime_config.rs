@@ -9,6 +9,10 @@ use crate::{
         execute::{
             RuntimeActivateConfigError, RuntimeActivateContext, execute as execute_activate_config,
         },
+        reconcile::{
+            RECONCILE_OPERATION, RuntimeReconcileContext, RuntimeReconcileError,
+            RuntimeReconcileRequest, RuntimeReconcileRequestError, execute as execute_reconcile,
+        },
     },
     site::{Domain, RuntimeId},
     transaction::{IdempotencyKey, RequestId},
@@ -33,6 +37,11 @@ pub fn run(command: RuntimeCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        RuntimeCommand::Reconcile {
+            runtime_id,
+            request_id,
+            idempotency_key,
+        } => reconcile(&runtime_id, &request_id, idempotency_key.as_deref()),
     }
 }
 
@@ -211,5 +220,95 @@ fn request_error_message(error: RuntimeActivateConfigRequestError) -> &'static s
         }
         RuntimeActivateConfigRequestError::InvalidRequestId => "request-id is not a canonical UUID",
         RuntimeActivateConfigRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+fn reconcile(
+    runtime_id: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let request = match RuntimeReconcileRequest::parse(runtime_id, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                RECONCILE_OPERATION,
+                ErrorCode::InvalidInput,
+                reconcile_request_error_message(error),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_reconcile(&request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            RECONCILE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "runtime.reconcile requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_reconcile(request: &RuntimeReconcileRequest) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{config::EngineConfig, filesystem::ManagedRoot};
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                RECONCILE_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                RECONCILE_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let context = RuntimeReconcileContext {
+        runtime_root: &engine_config.runtime_root,
+        engine_state: &engine_state,
+    };
+
+    match execute_reconcile(&context, request, &CancellationToken::default()) {
+        Ok(result) => Response::success(RECONCILE_OPERATION, result),
+        Err(RuntimeReconcileError::PostCommitRecordFailed { result, .. }) => {
+            Response::success(RECONCILE_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the sweep completed but its transaction record could not be saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(RECONCILE_OPERATION, code, &message))
+        }
+    }
+}
+
+fn reconcile_request_error_message(error: RuntimeReconcileRequestError) -> &'static str {
+    match error {
+        RuntimeReconcileRequestError::InvalidRuntimeId => {
+            "runtime-id is not a valid runtime pool identifier"
+        }
+        RuntimeReconcileRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        RuntimeReconcileRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }

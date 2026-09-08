@@ -28,6 +28,7 @@
 
 pub mod activate;
 pub mod execute;
+pub mod reconcile;
 
 use serde::{Deserialize, Serialize};
 

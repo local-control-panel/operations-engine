@@ -271,7 +271,14 @@ pub fn execute(
 /// engine's own `activate::activate` only ever produces the bare `.tmp`
 /// form; the `-suffix` form is a legacy client-side naming this sweep
 /// still has to account for on a not-yet-fully-migrated server).
-fn is_temp_file(name: &str) -> bool {
+///
+/// `pub(crate)`: also reused verbatim by `runtime_config::reconcile`, which
+/// shares this exact `.tmp`/`.rollback-<suffix>` naming convention (see
+/// `runtime_config::activate::RoutePaths`) - see
+/// `docs/milestones/003-runtime-reconcile.md`'s "Scope" section for why
+/// duplicating this classification logic there would be wrong, not just
+/// redundant.
+pub(crate) fn is_temp_file(name: &str) -> bool {
     name.ends_with(".tmp") || name.contains(".tmp-")
 }
 
@@ -279,7 +286,9 @@ fn is_temp_file(name: &str) -> bool {
 /// `None` otherwise. Mirrors `reconciliation.rs`'s
 /// `backup_path.rsplit_once(".rollback-")` exactly - the live sibling is
 /// always everything before the first `.rollback-`.
-fn rollback_backup_live_sibling(name: &str) -> Option<String> {
+///
+/// `pub(crate)` for the same reason as `is_temp_file`.
+pub(crate) fn rollback_backup_live_sibling(name: &str) -> Option<String> {
     name.split_once(".rollback-")
         .map(|(live, _suffix)| live.to_owned())
 }

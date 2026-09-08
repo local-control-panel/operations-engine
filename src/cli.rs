@@ -342,6 +342,28 @@ pub enum RuntimeCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Sweeps one runtime pool's own subdirectory of the configured runtime
+    /// root for `.tmp`/`.tmp-*` staging siblings and `.rollback-*` backup
+    /// siblings left behind by an interrupted activate-config attempt,
+    /// removing or restoring each. Takes `--runtime-id`, same as
+    /// `activate-config` - see `docs/milestones/003-runtime-reconcile.md`
+    /// for why this sweeps one named pool rather than every pool at once.
+    Reconcile {
+        /// Which runtime pool's subdirectory to sweep.
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of sweeping twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -391,6 +413,7 @@ impl RuntimeCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateConfig { .. } => "runtime.activateConfig",
+            Self::Reconcile { .. } => "runtime.reconcile",
         }
     }
 }
