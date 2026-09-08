@@ -47,6 +47,15 @@ pub struct InstallContext<'a> {
     /// tests can point it at a local fixture server; every production
     /// call site passes `commands::engine::GITHUB_RELEASES_BASE`.
     pub release_base_url: &'a str,
+    /// The two-line `minisign.pub` content `verify::fetch_and_verify`
+    /// checks the fetched manifest signature against. A parameter for the
+    /// same reason `release_base_url` is one: production always passes
+    /// `verify::PRODUCTION_PUBLIC_KEY_FILE` (`release/minisign.pub`), and
+    /// tests pass a dedicated, permanently-test-only key
+    /// (`tests/fixtures/engine/minisign.pub`) so regenerating test
+    /// fixtures never needs the real release-signing secret - including
+    /// after that secret is rotated to a real production key.
+    pub verify_public_key: &'a str,
 }
 
 #[derive(Debug)]
@@ -245,19 +254,23 @@ pub fn execute(
         ));
     };
 
-    let expected =
-        match verify::fetch_and_verify(context.release_base_url, &request.version, target_triple) {
-            Ok(expected) => expected,
-            Err(error) => {
-                return Err(fail(
-                    &engine_state,
-                    &state_path,
-                    &audit_path,
-                    tx,
-                    InstallError::Verify(error),
-                ));
-            }
-        };
+    let expected = match verify::fetch_and_verify(
+        context.release_base_url,
+        &request.version,
+        target_triple,
+        context.verify_public_key,
+    ) {
+        Ok(expected) => expected,
+        Err(error) => {
+            return Err(fail(
+                &engine_state,
+                &state_path,
+                &audit_path,
+                tx,
+                InstallError::Verify(error),
+            ));
+        }
+    };
 
     if pre_commit.check().is_err() {
         return Err(fail(

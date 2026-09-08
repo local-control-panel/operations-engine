@@ -44,6 +44,17 @@ The TEST-ONLY keypair was regenerated once, in the fix round following the
 Phase 7 review, because the secret half of the original was not retained
 anywhere and the test fixtures under `tests/fixtures/engine/` could no
 longer be re-signed. Nothing had ever been released under the original key.
-The password is unchanged (`test-only-do-not-use-in-production`), and
-`tests/fixtures/engine/regenerate.sh` regenerates and re-signs every fixture
-from it.
+
+Since 2026-09-08, the test fixtures no longer share this keypair at all:
+`tests/fixtures/engine/` has its own dedicated, permanently-test-only
+keypair (`minisign.key`/`minisign.pub`, same publicly-known password
+`test-only-do-not-use-in-production`), separate from `release/minisign.key`.
+`tests/fixtures/engine/regenerate.sh` signs with that dedicated key, not
+`release/minisign.key` - so regenerating fixtures never needs, and can
+never accidentally use, whatever secret currently signs real releases,
+including after `release/minisign.key` is rotated to a real production
+key. `InstallContext::verify_public_key` (`src/engine/install.rs`) is what
+lets `install::execute` check against either key depending on caller:
+production always passes `verify::PRODUCTION_PUBLIC_KEY_FILE`
+(`release/minisign.pub`), tests always pass the fixture directory's own
+`minisign.pub`.

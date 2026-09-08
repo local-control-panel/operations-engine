@@ -13,11 +13,24 @@
 # asserting on installed bytes can tell the versions — and the architectures —
 # apart.
 #
-# Signing needs `release/minisign.key`, which is deliberately not committed
-# (`.gitignore`), and its password. The committed keypair is TEST-ONLY; see
-# `docs/release.md`. Run from the repository root:
+# Signing needs `tests/fixtures/engine/minisign.key`, which is deliberately
+# not committed (`.gitignore`), and its password
+# (test-only-do-not-use-in-production, the same publicly-known password as
+# `release/minisign.key` - see `src/engine/verify.rs`). This keypair is
+# dedicated to signing test fixtures only - deliberately never
+# `release/minisign.key`, the one that (eventually) signs real releases, so
+# regenerating fixtures never needs, and can never accidentally use,
+# whatever secret currently signs real releases. If this key file is ever
+# lost, regenerate it with:
 #
-#   MINISIGN_TEST_KEY_PASSWORD=... sh tests/fixtures/engine/regenerate.sh
+#   minisign -G -f -s tests/fixtures/engine/minisign.key \
+#     -p tests/fixtures/engine/minisign.pub
+#
+# and update `tests/engine.rs`'s `TEST_FIXTURE_PUBLIC_KEY` reference (it
+# `include_str!`s the `.pub` file directly, so nothing else needs updating).
+# Run from the repository root:
+#
+#   sh tests/fixtures/engine/regenerate.sh
 set -eu
 
 cd "$(dirname "$0")"
@@ -69,7 +82,7 @@ else
   shasum -a 256 ops-engine-* > SHA256SUMS
 fi
 
-printf '%s\n' "${MINISIGN_TEST_KEY_PASSWORD}" \
-  | minisign -S -s ../../../release/minisign.key -m SHA256SUMS
+printf '%s\n' "test-only-do-not-use-in-production" \
+  | minisign -S -s minisign.key -m SHA256SUMS
 
 echo "Regenerated $(wc -l < SHA256SUMS | tr -d ' ') fixture binaries, SHA256SUMS, and SHA256SUMS.minisig"

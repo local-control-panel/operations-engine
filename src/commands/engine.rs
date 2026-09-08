@@ -5,6 +5,7 @@ use crate::{
         EngineRollbackRequestError,
         install::{InstallContext, InstallError, execute as execute_install},
         rollback::{RollbackContext, RollbackError, execute as execute_rollback},
+        verify::PRODUCTION_PUBLIC_KEY_FILE,
     },
     error::{ErrorCode, WarningCode},
     process::CancellationToken,
@@ -101,6 +102,7 @@ fn run_install(request: &EngineInstallRequest) -> Result<Response, ResponseBuild
         engine_state: &engine_state,
         state_root: &engine_config.state_root,
         release_base_url: GITHUB_RELEASES_BASE,
+        verify_public_key: PRODUCTION_PUBLIC_KEY_FILE,
     };
 
     match execute_install(&context, request, &CancellationToken::default()) {

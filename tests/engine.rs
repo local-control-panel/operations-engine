@@ -24,6 +24,15 @@ use operations_engine::{
     site::TrustedRoot,
 };
 
+/// The dedicated, permanently-test-only key every fixture in this
+/// directory is signed with (see `regenerate.sh`) - never
+/// `release/minisign.pub`/`.key`, so regenerating fixtures never needs,
+/// and can never accidentally use, whatever secret currently signs real
+/// releases (including after that secret is rotated to a real production
+/// key). Passed as `InstallContext::verify_public_key` below in place of
+/// `verify::PRODUCTION_PUBLIC_KEY_FILE`.
+const TEST_FIXTURE_PUBLIC_KEY: &str = include_str!("fixtures/engine/minisign.pub");
+
 const REQUEST_ID_1: &str = "123e4567-e89b-12d3-a456-426614174000";
 const REQUEST_ID_2: &str = "9b2f1c34-5678-4abc-9def-0123456789ab";
 const REQUEST_ID_3: &str = "3f0d5a71-2c48-4f6b-8b21-7d5e9c1a4b60";
@@ -189,6 +198,7 @@ fn a_fresh_install_activates_the_verified_binary() {
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let request =
         EngineInstallRequest::parse(VERSION, REQUEST_ID_1, None).expect("request should parse");
@@ -219,6 +229,7 @@ fn installing_the_same_version_twice_is_rejected_as_already_active() {
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let first =
         EngineInstallRequest::parse(VERSION, REQUEST_ID_1, None).expect("request should parse");
@@ -240,6 +251,7 @@ fn a_corrupted_artifact_is_rejected_and_leaves_the_filesystem_untouched() {
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let request =
         EngineInstallRequest::parse(VERSION, REQUEST_ID_1, None).expect("request should parse");
@@ -355,6 +367,7 @@ fn a_verified_binary_that_will_not_run_here_is_rejected_before_activation() {
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let request = EngineInstallRequest::parse(BROKEN_VERSION, REQUEST_ID_1, None)
         .expect("request should parse");
@@ -391,6 +404,7 @@ fn a_binary_that_reports_a_different_version_is_rejected_before_activation() {
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let request = EngineInstallRequest::parse(MISREPORTING_VERSION, REQUEST_ID_1, None)
         .expect("request should parse");
@@ -439,6 +453,7 @@ fn the_first_install_on_an_unmanaged_host_retains_the_binary_it_replaces() {
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let request =
         EngineInstallRequest::parse(VERSION, REQUEST_ID_1, None).expect("request should parse");
@@ -486,6 +501,7 @@ fn an_unmanaged_binary_that_cannot_be_identified_is_retained_under_a_sentinel() 
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let request =
         EngineInstallRequest::parse(VERSION, REQUEST_ID_1, None).expect("request should parse");
@@ -526,6 +542,7 @@ fn successive_installs_retain_one_previous_version_prune_the_rest_and_stay_rollb
         engine_state: &engine_state,
         state_root: &state_root,
         release_base_url: &server.base_url,
+        verify_public_key: TEST_FIXTURE_PUBLIC_KEY,
     };
     let install = |version: &str, request_id: &str| {
         let request =

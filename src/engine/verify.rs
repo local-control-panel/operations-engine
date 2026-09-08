@@ -12,7 +12,7 @@ use crate::engine::{fetch, release};
 /// Generated once via `minisign -G`; see `docs/release.md`. Only the
 /// public half is ever committed (`release/minisign.pub`).
 // TEST-ONLY key — password is test-only-do-not-use-in-production, publicly known. Must be rotated to a real, secret-held keypair before the first real release; see docs/superpowers/sdd/... ledger.
-const PUBLIC_KEY_FILE: &str = include_str!("../../release/minisign.pub");
+pub const PRODUCTION_PUBLIC_KEY_FILE: &str = include_str!("../../release/minisign.pub");
 
 #[derive(Debug)]
 pub enum Error {
@@ -31,10 +31,19 @@ pub struct ExpectedArtifact {
     pub sha256_hex: String,
 }
 
+/// `public_key_file` is the real two-line `minisign.pub` format: an
+/// `untrusted comment:` line, then the base64 key on its own line.
+/// Production always passes `PRODUCTION_PUBLIC_KEY_FILE`
+/// (`release/minisign.pub`, compiled in); tests pass a dedicated,
+/// permanently-test-only key instead (`tests/fixtures/engine/minisign.pub`)
+/// so regenerating test fixtures never needs - and never risks touching -
+/// whatever secret currently signs real releases. Same pattern as
+/// `InstallContext::release_base_url`.
 pub fn fetch_and_verify(
     base_url: &str,
     version: &release::EngineVersion,
     target_triple: &str,
+    public_key_file: &str,
 ) -> Result<ExpectedArtifact, Error> {
     let manifest =
         fetch::fetch_bytes(&release::sha256sums_url(base_url, version)).map_err(Error::Fetch)?;
@@ -42,7 +51,7 @@ pub fn fetch_and_verify(
         .map_err(Error::Fetch)?;
     let signature_text = String::from_utf8(signature_bytes).map_err(|_| Error::InvalidSignature)?;
 
-    let public_key = public_key()?;
+    let public_key = public_key(public_key_file)?;
     let signature = Signature::decode(&signature_text).map_err(|_| Error::InvalidSignature)?;
     public_key
         .verify(&manifest, &signature, false)
@@ -53,10 +62,8 @@ pub fn fetch_and_verify(
     parse_sha256sums_line(&manifest_text, &expected_name).ok_or(Error::NoLineForThisArchitecture)
 }
 
-/// `PUBLIC_KEY_FILE` is the real two-line `minisign.pub` format: an
-/// `untrusted comment:` line, then the base64 key on its own line.
-fn public_key() -> Result<PublicKey, Error> {
-    let key_line = PUBLIC_KEY_FILE
+fn public_key(public_key_file: &str) -> Result<PublicKey, Error> {
+    let key_line = public_key_file
         .lines()
         .nth(1)
         .ok_or(Error::InvalidPublicKey)?;
@@ -89,11 +96,21 @@ mod tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    use super::{parse_sha256sums_line, public_key};
+    use super::{PRODUCTION_PUBLIC_KEY_FILE, parse_sha256sums_line, public_key};
 
     #[test]
     fn the_committed_public_key_parses() {
-        public_key().expect("release/minisign.pub should parse as a valid minisign public key");
+        public_key(PRODUCTION_PUBLIC_KEY_FILE)
+            .expect("release/minisign.pub should parse as a valid minisign public key");
+    }
+
+    #[test]
+    fn the_committed_test_fixture_public_key_parses() {
+        let key_file = std::fs::read_to_string("tests/fixtures/engine/minisign.pub")
+            .expect("the dedicated test-fixture public key should be readable");
+        public_key(&key_file).expect(
+            "tests/fixtures/engine/minisign.pub should parse as a valid minisign public key",
+        );
     }
 
     #[test]
@@ -154,7 +171,7 @@ cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd  ops-engine-0.5
             .or_else(|_| std::fs::read_to_string(format!("{}.minisig", manifest_path.display())))
             .expect("signature file should be readable");
 
-        let public_key = public_key().expect("public key should parse");
+        let public_key = public_key(PRODUCTION_PUBLIC_KEY_FILE).expect("public key should parse");
         let signature =
             minisign_verify::Signature::decode(&signature_text).expect("signature should decode");
         public_key.verify(&manifest, &signature, false).expect(
