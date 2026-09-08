@@ -758,8 +758,12 @@ TEST-ONLY — see the decision log).
 ### Known follow-ups (non-blocking)
 
 Raised by the final whole-branch review and its fix-round re-review;
-none were load-bearing for this phase's exit criteria. Closed 2026-09-08
-except the two items explicitly noted as still open:
+none were load-bearing for this phase's exit criteria. All closed
+2026-09-08. One item (`previous_version`'s `pre-managed` parser
+tolerance) was entirely about `website-control-panel` code that does not
+exist yet, not this repo — moved to `local-control-panel/docs`'s
+`operations-engine/migration-status.md` ("Заведено за по-късно") rather
+than tracked here, where a public reader has no way to act on it.
 
 - ~~`docs/protocol.md`'s stable-error-code table is missing
   `ARTIFACT_NOT_RUNNABLE`/`ARTIFACT_FETCH_FAILED`/`ARTIFACT_VERIFICATION_FAILED`
@@ -772,13 +776,6 @@ except the two items explicitly noted as still open:
   post-staging failure~~ — closed: `fail_staged` best-effort removes it on
   every post-staging error path, covered by two new test assertions
   (`b279879`).
-- **Still open**: `previous_version` can now surface the literal string
-  `pre-managed` over the wire — `website-control-panel`'s parser needs to
-  tolerate it, not just semver strings. Not actionable yet: that parser
-  does not exist — `website-control-panel` does not call `engine
-  install`/`engine rollback` at all (see Phase 7's "explicit, pinned
-  installation through the control plane — half delivered" note above).
-  Revisit when that separate plan starts.
 - ~~`tests/fixtures/engine/regenerate.sh` couples fixture regeneration to
   whichever minisign key is currently committed — regenerating fixtures
   after the production key rotation will require the production secret
