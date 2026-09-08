@@ -779,12 +779,19 @@ except the two items explicitly noted as still open:
   install`/`engine rollback` at all (see Phase 7's "explicit, pinned
   installation through the control plane — half delivered" note above).
   Revisit when that separate plan starts.
-- **Still open**: `tests/fixtures/engine/regenerate.sh` couples fixture
-  regeneration to whichever minisign key is currently committed —
-  regenerating fixtures after the production key rotation will require the
-  production secret key, which must never be used for this. Inherent to
-  the fixture design, not a bug to fix independently of the key rotation
-  itself.
+- ~~`tests/fixtures/engine/regenerate.sh` couples fixture regeneration to
+  whichever minisign key is currently committed — regenerating fixtures
+  after the production key rotation will require the production secret
+  key, which must never be used for this~~ — closed
+  (2026-09-08): `tests/fixtures/engine/` now has its own dedicated,
+  permanently-test-only keypair, decoupled from `release/minisign.key`.
+  `verify::fetch_and_verify` and `InstallContext` gained a
+  `verify_public_key` parameter (same pattern as `release_base_url`) so
+  production checks against `release/minisign.pub` and every test checks
+  against the fixture directory's own `minisign.pub` — regenerating
+  fixtures never touches, and after key rotation still won't need, the
+  real release-signing secret. All fixtures re-signed under the new key,
+  285/285 tests passing.
 - ~~the `https_only` loopback exemption in `src/engine/fetch.rs` ... has
   one narrow gap: a URL of the form `http://127.0.0.1:80@evil.test/...`
   passes the exemption via userinfo-with-port~~ — closed: userinfo is now
