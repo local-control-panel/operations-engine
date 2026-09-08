@@ -92,6 +92,14 @@ fn is_plain_http_loopback(url: &str) -> bool {
         return false;
     };
     let host_and_port = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    // Userinfo (`user:password@`) is part of the authority but is not the
+    // host — strip it before splitting off a port, so
+    // `http://127.0.0.1:80@evil.test/...` (host really `evil.test`,
+    // `127.0.0.1:80` only `user:password`) cannot be misread as loopback
+    // by having its userinfo mistaken for a host:port pair.
+    let host_and_port = host_and_port
+        .rsplit_once('@')
+        .map_or(host_and_port, |(_userinfo, rest)| rest);
     let host = host_and_port
         .rsplit_once(':')
         .map_or(host_and_port, |(host, _port)| host);
@@ -118,5 +126,13 @@ mod tests {
         // it as userinfo, is not loopback.
         assert!(!is_plain_http_loopback("http://127.0.0.1.example.test/x"));
         assert!(!is_plain_http_loopback("http://127.0.0.1@example.test/x"));
+        // Userinfo with an embedded `:` (user:password@host) must not be
+        // mistaken for a host:port pair - the real host is what follows
+        // `@`, not what precedes it.
+        assert!(!is_plain_http_loopback("http://127.0.0.1:80@evil.test/x"));
+        assert!(!is_plain_http_loopback("http://localhost:1@evil.test/x"));
+        // A genuine loopback host with real userinfo in front of it is
+        // still loopback - the userinfo strip must not eat too much.
+        assert!(is_plain_http_loopback("http://user:pass@127.0.0.1:8080/x"));
     }
 }
