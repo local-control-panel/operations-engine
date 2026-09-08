@@ -300,17 +300,22 @@ pub fn execute(
     let version_binary =
         SiteRelativePath::parse(format!("versions/{}/ops-engine", request.version))
             .expect("a validated EngineVersion always yields a valid relative path");
+    // Every failure from here on happens after `versions/{version}/` has
+    // been created on disk (or an attempt to create it was made) - unlike
+    // `fail`, which only records the transaction/audit outcome,
+    // `fail_staged` also best-effort removes that staged directory so a
+    // rejected candidate (bad smoke test, version mismatch, a later I/O
+    // failure) does not leak disk space forever. Best-effort: a failed
+    // cleanup here does not change the already-decided error outcome.
+    let fail_staged = |tx: tx_state::TransactionState, error: InstallError| -> InstallError {
+        let _ = engine_state.remove_dir_all(&version_dir);
+        fail(&engine_state, &state_path, &audit_path, tx, error)
+    };
     if let Err(error) = engine_state
         .create_dir_all(&version_dir)
         .and_then(|()| engine_state.write_new_executable(&version_binary, &bytes))
     {
-        return Err(fail(
-            &engine_state,
-            &state_path,
-            &audit_path,
-            tx,
-            InstallError::Io(error),
-        ));
+        return Err(fail_staged(tx, InstallError::Io(error)));
     }
 
     // Prove the staged binary actually runs here *before* it becomes the
@@ -320,10 +325,7 @@ pub fn execute(
     let staged_path = match state::resolve_path(context.state_root, &version_binary) {
         Ok(path) => path,
         Err(_) => {
-            return Err(fail(
-                &engine_state,
-                &state_path,
-                &audit_path,
+            return Err(fail_staged(
                 tx,
                 InstallError::Io(std::io::Error::other(
                     "the staged binary's path could not be resolved",
@@ -334,45 +336,21 @@ pub fn execute(
     let reported_version = match smoke::probe_version(&staged_path, cancellation) {
         Ok(version) => version,
         Err(error) => {
-            return Err(fail(
-                &engine_state,
-                &state_path,
-                &audit_path,
-                tx,
-                InstallError::NotRunnable(error),
-            ));
+            return Err(fail_staged(tx, InstallError::NotRunnable(error)));
         }
     };
     if reported_version != request.version.as_str() {
-        return Err(fail(
-            &engine_state,
-            &state_path,
-            &audit_path,
-            tx,
-            InstallError::VersionMismatch,
-        ));
+        return Err(fail_staged(tx, InstallError::VersionMismatch));
     }
 
     if pre_commit.check().is_err() {
-        return Err(fail(
-            &engine_state,
-            &state_path,
-            &audit_path,
-            tx,
-            InstallError::Cancelled,
-        ));
+        return Err(fail_staged(tx, InstallError::Cancelled));
     }
 
     let bin_root = match ManagedRoot::open(context.bin_root) {
         Ok(root) => root,
         Err(error) => {
-            return Err(fail(
-                &engine_state,
-                &state_path,
-                &audit_path,
-                tx,
-                InstallError::Io(error),
-            ));
+            return Err(fail_staged(tx, InstallError::Io(error)));
         }
     };
     // On a host this engine has never managed, whatever is already at
@@ -390,13 +368,7 @@ pub fn execute(
         ) {
             Ok(retained) => retained,
             Err(error) => {
-                return Err(fail(
-                    &engine_state,
-                    &state_path,
-                    &audit_path,
-                    tx,
-                    InstallError::Io(error),
-                ));
+                return Err(fail_staged(tx, InstallError::Io(error)));
             }
         }
     } else {
@@ -406,13 +378,7 @@ pub fn execute(
     // already-verified binary. Nothing from here may be aborted by
     // cancellation — the switch already happened.
     if let Err(error) = bin_root.write_new_executable(&binary_path(), &bytes) {
-        return Err(fail(
-            &engine_state,
-            &state_path,
-            &audit_path,
-            tx,
-            InstallError::Io(error),
-        ));
+        return Err(fail_staged(tx, InstallError::Io(error)));
     }
     let _post_commit = pre_commit.commit();
 

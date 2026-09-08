@@ -349,7 +349,7 @@ fn a_verified_binary_that_will_not_run_here_is_rejected_before_activation() {
     // may be activated, because `engine rollback` would be that same
     // binary.
     let server = start_fixture_server(fixture_routes(&[BROKEN_VERSION]));
-    let (bin_dir, _state_dir, bin_root, state_root, engine_state) = roots();
+    let (bin_dir, state_dir, bin_root, state_root, engine_state) = roots();
     let context = InstallContext {
         bin_root: &bin_root,
         engine_state: &engine_state,
@@ -366,6 +366,15 @@ fn a_verified_binary_that_will_not_run_here_is_rejected_before_activation() {
     );
     assert!(!bin_dir.path().join("ops-engine").exists());
     assert_eq!(state::load(&scoped_state(&engine_state)).unwrap(), None);
+    assert!(
+        !state_dir
+            .path()
+            .join("engine")
+            .join("versions")
+            .join(BROKEN_VERSION)
+            .exists(),
+        "a rejected candidate's staged versions/ directory must not be left behind"
+    );
 }
 
 #[test]
@@ -376,7 +385,7 @@ fn a_binary_that_reports_a_different_version_is_rejected_before_activation() {
     // published release, and the binary's own `version` output
     // disagreeing about what is on the host.
     let server = start_fixture_server(fixture_routes(&[MISREPORTING_VERSION]));
-    let (bin_dir, _state_dir, bin_root, state_root, engine_state) = roots();
+    let (bin_dir, state_dir, bin_root, state_root, engine_state) = roots();
     let context = InstallContext {
         bin_root: &bin_root,
         engine_state: &engine_state,
@@ -392,6 +401,15 @@ fn a_binary_that_reports_a_different_version_is_rejected_before_activation() {
         "expected a version mismatch, got {error:?}"
     );
     assert!(!bin_dir.path().join("ops-engine").exists());
+    assert!(
+        !state_dir
+            .path()
+            .join("engine")
+            .join("versions")
+            .join(MISREPORTING_VERSION)
+            .exists(),
+        "a rejected candidate's staged versions/ directory must not be left behind"
+    );
 }
 
 /// Writes `content` to `bin_dir/ops-engine` with the executable bit set,
