@@ -8,7 +8,7 @@ matrix, redaction review, docs, opt-in rollout procedure) is done and
 tested, but the phase is not complete — see its own section for what
 remains (the control-plane half of pinned installation, and rotating off
 the TEST-ONLY signing key before a real release).
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 This file is the shared implementation plan for Operations Engine. It is the
 authoritative source for what we build next, in what order, and what must be
@@ -758,36 +758,51 @@ TEST-ONLY — see the decision log).
 ### Known follow-ups (non-blocking)
 
 Raised by the final whole-branch review and its fix-round re-review;
-none are load-bearing for this phase's exit criteria, all deliberately
-deferred rather than fixed here:
+none were load-bearing for this phase's exit criteria. Closed 2026-09-08
+except the two items explicitly noted as still open:
 
-- `docs/protocol.md`'s stable-error-code table is missing
+- ~~`docs/protocol.md`'s stable-error-code table is missing
   `ARTIFACT_NOT_RUNNABLE`/`ARTIFACT_FETCH_FAILED`/`ARTIFACT_VERIFICATION_FAILED`
-  and the two new warning codes;
-- no minimum-glibc / tested-distribution floor is recorded anywhere
-  (`docs/compatibility.md`), despite being the most likely real trigger of
-  `ARTIFACT_NOT_RUNNABLE` in production;
-- a staged `versions/<version>/` directory is not cleaned up on a
-  post-staging failure (pre-existing, now has one more path reaching it:
-  a rejected smoke test);
-- `previous_version` can now surface the literal string `pre-managed` over
-  the wire — `website-control-panel`'s parser needs to tolerate it, not
-  just semver strings;
-- `tests/fixtures/engine/regenerate.sh` couples fixture regeneration to
-  whichever minisign key is currently committed — regenerating fixtures
-  after the production key rotation will require the production secret key,
-  which must never be used for this;
-- the `https_only` loopback exemption in `src/engine/fetch.rs` (added so
-  the real-HTTP test fixture server still works) has one narrow gap: a URL
-  of the form `http://127.0.0.1:80@evil.test/...` passes the exemption via
-  userinfo-with-port. Unreachable from production (`release_base_url` is a
-  compiled-in `https://github.com/...` constant), defense-in-depth only;
-- a handful of smaller items (dead `ExpectedArtifact::filename`, cancellation
-  during the smoke probe reporting as `ARTIFACT_NOT_RUNNABLE` rather than
-  `CANCELLED`, `rollback.rs`'s `.expect()` on an `install.state` value) —
-  full detail was in this plan's now-deleted SDD workspace
-  (`final-review-report.md`, `fix-round-1-report.md`, `re-review-report.md`);
-  git history on the fix-round commits (`b0576ba..6287726`) has the rest.
+  and the two new warning codes~~ — closed: both tables added (`4f5529f`).
+- ~~no minimum-glibc / tested-distribution floor is recorded anywhere
+  (`docs/compatibility.md`)~~ — closed: documented as implied by the
+  `ubuntu-latest`/`ubuntu-24.04-arm` build runners (currently 24.04,
+  glibc 2.39), explicitly not independently tested (`4f5529f`).
+- ~~a staged `versions/<version>/` directory is not cleaned up on a
+  post-staging failure~~ — closed: `fail_staged` best-effort removes it on
+  every post-staging error path, covered by two new test assertions
+  (`b279879`).
+- **Still open**: `previous_version` can now surface the literal string
+  `pre-managed` over the wire — `website-control-panel`'s parser needs to
+  tolerate it, not just semver strings. Not actionable yet: that parser
+  does not exist — `website-control-panel` does not call `engine
+  install`/`engine rollback` at all (see Phase 7's "explicit, pinned
+  installation through the control plane — half delivered" note above).
+  Revisit when that separate plan starts.
+- **Still open**: `tests/fixtures/engine/regenerate.sh` couples fixture
+  regeneration to whichever minisign key is currently committed —
+  regenerating fixtures after the production key rotation will require the
+  production secret key, which must never be used for this. Inherent to
+  the fixture design, not a bug to fix independently of the key rotation
+  itself.
+- ~~the `https_only` loopback exemption in `src/engine/fetch.rs` ... has
+  one narrow gap: a URL of the form `http://127.0.0.1:80@evil.test/...`
+  passes the exemption via userinfo-with-port~~ — closed: userinfo is now
+  stripped before the host:port split, with regression tests for the
+  reported bypass shape and a "real userinfo in front of a real loopback
+  host is still loopback" case (`21b957d`).
+- ~~cancellation during the smoke probe reporting as `ARTIFACT_NOT_RUNNABLE`
+  rather than `CANCELLED`~~ — closed: `smoke::Error` gained a `Cancelled`
+  variant, checked before the generic non-success branch, mapped to
+  `ErrorCode::Cancelled` (`2f7899c`).
+- ~~dead `ExpectedArtifact::filename`~~ — inspected, not closed: it is a
+  `pub` field with no non-test reader today, not a defect; left as-is
+  rather than removed as unrequested API surface reduction.
+- ~~`rollback.rs`'s `.expect()` on an `install.state` value~~ — inspected,
+  not found: `state::load`'s result is already exhaustively matched
+  (`Ok(Some)`/`Ok(None)`/`Err`) with no panicking unwrap on the loaded
+  value; may have been fixed by an earlier, untracked commit, or the
+  original review meant a different call site than located here.
 
 ## Phase 8 — selective expansion
 
