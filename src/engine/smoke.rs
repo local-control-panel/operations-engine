@@ -45,11 +45,18 @@ pub enum Error {
     /// internal.
     Run(ProcessRunError),
     /// It started but did not exit successfully — including the runner's
-    /// own timeout and cancellation terminations.
+    /// own timeout termination. Distinct from `Cancelled`: this is a
+    /// property of the binary (or host), not of the caller having asked
+    /// to stop.
     NotRunnable(SubprocessDiagnostics),
     /// It ran and exited successfully but did not print a version
     /// envelope this engine can read.
     UnreadableVersion(SubprocessDiagnostics),
+    /// The probe was cancelled before the binary finished - this says
+    /// nothing about whether the binary itself would have run
+    /// successfully, so it must not be reported the same way as
+    /// `NotRunnable`.
+    Cancelled,
 }
 
 /// Runs `<binary> version` and returns the engine version it reports.
@@ -62,6 +69,9 @@ pub fn probe_version(binary: &Path, cancellation: &CancellationToken) -> Result<
     let request = ProcessRequest::new(binary).args([VERSION_ARGUMENT]);
     let output = run(&request, &limits, cancellation).map_err(Error::Run)?;
 
+    if matches!(output.termination, ProcessTermination::Cancelled) {
+        return Err(Error::Cancelled);
+    }
     if !matches!(
         output.termination,
         ProcessTermination::Exited { success: true, .. }
@@ -175,6 +185,38 @@ mod tests {
 
         let outcome = probe_version(&path, &CancellationToken::default());
         assert!(matches!(outcome, Err(Error::UnreadableVersion(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_cancelled_probe_reports_cancelled_not_not_runnable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let path = directory.path().join("ops-engine");
+        std::fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s\\n' '{\"protocolVersion\":1,\"operation\":\"version\",\"ok\":true,\"result\":{\"engineVersion\":\"9.9.8\"},\"warnings\":[],\"error\":null}'\n",
+        )
+        .expect("stand-in should be written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("stand-in should be executable");
+
+        // Cancelled before the probe even starts its supervise loop - the
+        // runner's own cancellation check runs before its exit-status
+        // check on every iteration (`process::spawn_and_supervise`), so
+        // this is deterministic, not a timing race. A perfectly runnable
+        // binary must still be reported as cancelled, not as an artifact
+        // rejection - the two mean different things to a caller deciding
+        // whether to retry with a different version or just retry.
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+
+        let outcome = probe_version(&path, &cancellation);
+        assert!(
+            matches!(outcome, Err(Error::Cancelled)),
+            "expected Cancelled, got {outcome:?}"
+        );
     }
 
     #[cfg(unix)]

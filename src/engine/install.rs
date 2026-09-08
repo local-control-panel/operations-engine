@@ -153,6 +153,13 @@ impl InstallError {
                 ErrorCode::Internal,
                 "internal engine install error".to_owned(),
             ),
+            // The probe was cancelled, not proven bad - reported the same
+            // way as this function's other cancellation points, not as an
+            // artifact rejection.
+            Self::NotRunnable(smoke::Error::Cancelled) => (
+                ErrorCode::Cancelled,
+                "cancelled before the commit point".to_owned(),
+            ),
             Self::VersionMismatch => (
                 ErrorCode::ArtifactVerificationFailed,
                 "the downloaded binary reports a different version than the one requested"
