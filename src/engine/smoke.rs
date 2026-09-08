@@ -59,6 +59,40 @@ pub enum Error {
     Cancelled,
 }
 
+/// Every caller of this module hands it a binary that was just written and
+/// renamed into place a moment ago (`install`'s freshly staged copy,
+/// `rollback`'s restored previous one) - immediately executing that can
+/// transiently fail with `ExecutableFileBusy` on Linux, the kernel briefly
+/// still treating the inode as open for writing right after the rename that
+/// created it. Observed in practice (CI, `installing_the_same_version_
+/// twice_is_rejected_as_already_active`), not hypothetical.
+///
+/// ponytail: a fixed bounded retry against this one specific, well-known
+/// transient race, not a general "retry any spawn failure" policy - raise
+/// `BUSY_RETRY_ATTEMPTS` only if this exact error is ever seen to outlast
+/// it.
+const BUSY_RETRY_ATTEMPTS: u32 = 5;
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+fn run_tolerating_transient_busy(
+    request: &ProcessRequest,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<crate::process::ProcessOutput, ProcessRunError> {
+    for attempt in 1..=BUSY_RETRY_ATTEMPTS {
+        match run(request, limits, cancellation) {
+            Err(ProcessRunError::Spawn(io_error))
+                if attempt < BUSY_RETRY_ATTEMPTS
+                    && io_error.kind() == std::io::ErrorKind::ExecutableFileBusy =>
+            {
+                std::thread::sleep(BUSY_RETRY_DELAY);
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the loop above always returns by the last attempt")
+}
+
 /// Runs `<binary> version` and returns the engine version it reports.
 pub fn probe_version(binary: &Path, cancellation: &CancellationToken) -> Result<String, Error> {
     let limits = ProcessLimits {
@@ -67,7 +101,8 @@ pub fn probe_version(binary: &Path, cancellation: &CancellationToken) -> Result<
         max_stderr_bytes: MAX_OUTPUT_BYTES,
     };
     let request = ProcessRequest::new(binary).args([VERSION_ARGUMENT]);
-    let output = run(&request, &limits, cancellation).map_err(Error::Run)?;
+    let output =
+        run_tolerating_transient_busy(&request, &limits, cancellation).map_err(Error::Run)?;
 
     if matches!(output.termination, ProcessTermination::Cancelled) {
         return Err(Error::Cancelled);
