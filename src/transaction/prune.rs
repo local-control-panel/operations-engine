@@ -43,7 +43,10 @@ fn transactions_dir() -> SiteRelativePath {
 /// cannot read, parse, or remove is skipped, not fatal to the sweep or to
 /// the caller's own mutation attempt.
 pub fn prune_completed(root: &ManagedRoot, retain_for: Duration) {
-    let Ok(names) = root.file_names(&transactions_dir()) else {
+    let Ok(transactions) = root.open_managed_dir(&transactions_dir()) else {
+        return;
+    };
+    let Ok(names) = transactions.file_names() else {
         return;
     };
     let now = unix_now_secs();

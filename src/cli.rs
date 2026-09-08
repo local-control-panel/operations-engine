@@ -264,6 +264,23 @@ pub enum IngressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Sweeps the whole configured ingress root for `.tmp`/`.tmp-*`
+    /// staging siblings and `.rollback-*` backup siblings left behind by
+    /// an interrupted activate/park/unpark attempt, removing or restoring
+    /// each. No `--domain` - this is a whole-root sweep, not a per-site
+    /// operation.
+    Reconcile {
+        /// Canonical UUID identifying this specific attempt. The caller
+        /// mints this, not the engine — see `docs/site-model.md`.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of sweeping twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -278,6 +295,7 @@ impl IngressCommand {
             Self::ActivateConfig { .. } => "ingress.activateConfig",
             Self::Park { .. } => "ingress.park",
             Self::Unpark { .. } => "ingress.unpark",
+            Self::Reconcile { .. } => "ingress.reconcile",
         }
     }
 }

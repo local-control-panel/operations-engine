@@ -47,6 +47,7 @@ fn capabilities_describe_only_implemented_operations() {
             "ingress.activateConfig",
             "ingress.park",
             "ingress.unpark",
+            "ingress.reconcile",
             "runtime.activateConfig",
             "cron.installTab",
             "db.restore",

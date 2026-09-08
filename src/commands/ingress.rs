@@ -8,6 +8,10 @@ use crate::{
         UnparkRequest, UnparkRequestError,
         execute::{ActivateConfigError, ActivateContext, execute as execute_activate_config},
         park::{ParkError, execute as execute_park},
+        reconcile::{
+            RECONCILE_OPERATION, ReconcileContext, ReconcileError, ReconcileRequest,
+            ReconcileRequestError, execute as execute_reconcile,
+        },
         unpark::{UnparkError, execute as execute_unpark},
     },
     process::CancellationToken,
@@ -51,6 +55,10 @@ pub fn run(command: IngressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => unpark(&domain, &request_id, idempotency_key.as_deref()),
+        IngressCommand::Reconcile {
+            request_id,
+            idempotency_key,
+        } => reconcile(&request_id, idempotency_key.as_deref()),
     }
 }
 
@@ -389,6 +397,92 @@ fn run_unpark(request: &UnparkRequest) -> Result<Response, ResponseBuildError> {
             let (code, message) = error.protocol();
             Ok(Response::failure(UNPARK_OPERATION, code, &message))
         }
+    }
+}
+
+fn reconcile(
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let request = match ReconcileRequest::parse(request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                RECONCILE_OPERATION,
+                ErrorCode::InvalidInput,
+                reconcile_request_error_message(error),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_reconcile(&request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            RECONCILE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "ingress.reconcile requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_reconcile(request: &ReconcileRequest) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{config::EngineConfig, filesystem::ManagedRoot};
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                RECONCILE_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                RECONCILE_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let context = ReconcileContext {
+        ingress_root: &engine_config.ingress_root,
+        engine_state: &engine_state,
+    };
+
+    match execute_reconcile(&context, request, &CancellationToken::default()) {
+        Ok(result) => Response::success(RECONCILE_OPERATION, result),
+        Err(ReconcileError::PostCommitRecordFailed { result, .. }) => {
+            Response::success(RECONCILE_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the sweep completed but its transaction record could not be saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(RECONCILE_OPERATION, code, &message))
+        }
+    }
+}
+
+fn reconcile_request_error_message(error: ReconcileRequestError) -> &'static str {
+    match error {
+        ReconcileRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        ReconcileRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }
 

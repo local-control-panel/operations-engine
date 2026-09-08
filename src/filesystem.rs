@@ -58,16 +58,22 @@ impl ManagedRoot {
         self.directory.exists(path.as_path())
     }
 
-    /// Names of the regular files directly inside `path` (non-recursive,
-    /// directories and anything not valid UTF-8 silently skipped - every
-    /// current caller lists a directory this engine itself only ever
-    /// populates with UTF-8-named files, so skipping the rest is a safe
-    /// simplification, not silent data loss). Used by retention sweeps
-    /// (`transaction::prune`) that need to enumerate what is on disk
-    /// before deciding what is old enough to remove.
-    pub fn file_names(&self, path: &SiteRelativePath) -> io::Result<Vec<String>> {
+    /// Names of the regular files directly inside this `ManagedRoot`'s own
+    /// root (non-recursive, directories and anything not valid UTF-8
+    /// silently skipped - every current caller lists a directory this
+    /// engine itself only ever populates with UTF-8-named files, so
+    /// skipping the rest is a safe simplification, not silent data loss).
+    /// To list a *subdirectory*, `open_managed_dir` into it first and call
+    /// this on the result, the same way any other capability-scoped
+    /// descent works here - there is deliberately no path-taking variant,
+    /// so nothing can list a subdirectory's contents without also holding
+    /// a capability scoped to exactly that subdirectory. Used by retention
+    /// sweeps (`transaction::prune`) and content sweeps
+    /// (`ingress::reconcile`) that need to enumerate what is on disk
+    /// before deciding what to do with it.
+    pub fn file_names(&self) -> io::Result<Vec<String>> {
         let mut names = Vec::new();
-        for entry in self.directory.open_dir(path.as_path())?.entries()? {
+        for entry in self.directory.entries()? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 if let Ok(name) = entry.file_name().into_string() {

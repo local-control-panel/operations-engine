@@ -22,6 +22,7 @@
 pub mod activate;
 pub mod execute;
 pub mod park;
+pub mod reconcile;
 pub mod unpark;
 
 #[cfg(all(test, unix))]
