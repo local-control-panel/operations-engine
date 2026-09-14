@@ -4,6 +4,8 @@
 //! must be strict before any code is allowed to stop a live search service or
 //! touch its data store.
 
+pub mod execute;
+
 use serde::Deserialize;
 
 use crate::{
@@ -24,6 +26,7 @@ const MAX_QUERY_BYTES: usize = 4096;
 struct Plan {
     stack_name: String,
     service: String,
+    expected_source_version: String,
     target_image: String,
     master_key: String,
     #[serde(default)]
@@ -47,6 +50,7 @@ pub struct SearchProbe {
 pub struct UpgradeRequest {
     pub stack_name: StackName,
     pub service: ContainerName,
+    pub expected_source_version: String,
     pub target_image: &'static str,
     /// Execution-only secret. It must never be serialized into transaction or
     /// audit state; the request deliberately does not implement `Serialize`.
@@ -56,11 +60,22 @@ pub struct UpgradeRequest {
     pub idempotency_key: Option<IdempotencyKey>,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpgradeResult {
+    pub source_version: String,
+    pub target_version: String,
+    pub backup_id: String,
+    pub target_volume: String,
+    pub completed_at_unix_secs: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestError {
     InvalidJson,
     InvalidStackName,
     InvalidService,
+    InvalidSourceVersion,
     UnsupportedTargetImage,
     InvalidSecret,
     InvalidProbe,
@@ -76,6 +91,15 @@ impl UpgradeRequest {
         idempotency_key: Option<&str>,
     ) -> Result<Self, RequestError> {
         let plan: Plan = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
+        if plan.stack_name != "wp-stack" {
+            return Err(RequestError::InvalidStackName);
+        }
+        if plan.service != "meili-1" {
+            return Err(RequestError::InvalidService);
+        }
+        if !valid_semver(&plan.expected_source_version) {
+            return Err(RequestError::InvalidSourceVersion);
+        }
         if plan.target_image != TARGET_IMAGE {
             return Err(RequestError::UnsupportedTargetImage);
         }
@@ -110,6 +134,7 @@ impl UpgradeRequest {
                 .map_err(|_| RequestError::InvalidStackName)?,
             service: ContainerName::parse(&plan.service)
                 .map_err(|_| RequestError::InvalidService)?,
+            expected_source_version: plan.expected_source_version,
             target_image: TARGET_IMAGE,
             master_key: plan.master_key,
             search_probes,
@@ -130,6 +155,14 @@ fn valid_index_uid(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
+fn valid_semver(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,7 +171,7 @@ mod tests {
 
     fn plan(target: &str, key: &str) -> String {
         format!(
-            r#"{{"stackName":"wp-stack","service":"meili-1","targetImage":"{target}","masterKey":"{key}","searchProbes":[{{"indexUid":"products_en","query":"червена рокля"}}]}}"#
+            r#"{{"stackName":"wp-stack","service":"meili-1","expectedSourceVersion":"1.53.1","targetImage":"{target}","masterKey":"{key}","searchProbes":[{{"indexUid":"products_en","query":"червена рокля"}}]}}"#
         )
     }
 
@@ -149,6 +182,7 @@ mod tests {
         assert_eq!(request.target_image, TARGET_IMAGE);
         assert_eq!(request.stack_name.as_str(), "wp-stack");
         assert_eq!(request.service.as_str(), "meili-1");
+        assert_eq!(request.expected_source_version, "1.53.1");
         assert_eq!(request.search_probes[0].query, "червена рокля");
 
         for target in [
@@ -186,5 +220,32 @@ mod tests {
             UpgradeRequest::parse(&unknown, ID, None).unwrap_err(),
             RequestError::InvalidJson
         );
+    }
+
+    #[test]
+    fn source_identity_is_guarded_before_execution() {
+        for (from, to, expected) in [
+            (
+                "\"wp-stack\"",
+                "\"another-stack\"",
+                RequestError::InvalidStackName,
+            ),
+            (
+                "\"meili-1\"",
+                "\"mariadb-11\"",
+                RequestError::InvalidService,
+            ),
+            (
+                "\"1.53.1\"",
+                "\"latest\"",
+                RequestError::InvalidSourceVersion,
+            ),
+        ] {
+            let invalid = plan(TARGET_IMAGE, "secret").replace(from, to);
+            assert_eq!(
+                UpgradeRequest::parse(&invalid, ID, None).unwrap_err(),
+                expected
+            );
+        }
     }
 }
