@@ -9,6 +9,10 @@ use crate::{
         OPERATION, RestoreRequest, RestoreRequestError,
         execute::{RestoreContext, RestoreError, execute as execute_restore},
     },
+    db_tool::{
+        OPERATION as TOOL_OPERATION, Request as ToolRequest, RequestError as ToolRequestError,
+        execute::{Context as ToolContext, Error as ToolError, execute as execute_tool},
+    },
     error::{ErrorCode, WarningCode},
     process::CancellationToken,
     protocol::{Response, ResponseBuildError, Warning},
@@ -18,6 +22,11 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        DbCommand::ToolConverge {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => tool_converge(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::ProvisionMariadb {
             request_file,
             request_id,
@@ -40,6 +49,87 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn tool_converge(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    TOOL_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    TOOL_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match ToolRequest::parse(&json, request_id, key) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::failure(
+                    TOOL_OPERATION,
+                    ErrorCode::InvalidInput,
+                    tool_error_message(e),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    TOOL_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = ToolContext {
+            engine_state: &state,
+            docker_program: "docker",
+        };
+        match execute_tool(&context, &request, &CancellationToken::default()) {
+            Ok(v) => Response::success(TOOL_OPERATION, v),
+            Err(ToolError::PostCommit { result }) => Response::success(TOOL_OPERATION, result),
+            Err(e) => {
+                let (c, m) = e.protocol();
+                Ok(Response::failure(TOOL_OPERATION, c, &m))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            TOOL_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "dbTool.converge requires a Unix host",
+        ))
+    }
+}
+fn tool_error_message(e: ToolRequestError) -> &'static str {
+    match e {
+        ToolRequestError::InvalidJson => "request-file is not a valid tool plan",
+        ToolRequestError::InvalidDomain => "domain is invalid",
+        ToolRequestError::InvalidShape => "tool action fields are inconsistent",
+        ToolRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        ToolRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }
 

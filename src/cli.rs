@@ -502,6 +502,15 @@ impl CronCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum DbCommand {
+    /// Converge a protected database administration tool container.
+    ToolConverge {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Create or converge a MariaDB database and optional isolated user.
     ProvisionMariadb {
         /// Root-owned JSON request containing identifiers and credentials.
@@ -558,6 +567,7 @@ pub enum DbTypeArg {
 impl DbCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::ToolConverge { .. } => "dbTool.converge",
             Self::ProvisionMariadb { .. } => "db.provisionMariaDb",
             Self::Restore { .. } => "db.restore",
         }

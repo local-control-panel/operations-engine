@@ -53,6 +53,7 @@ fn capabilities_describe_only_implemented_operations() {
             "cron.installTab",
             "db.restore",
             "db.provisionMariaDb",
+            "dbTool.converge",
             "compose.activateConfig",
             "permissions.fixOwnership",
             "permissions.fixWorldWritable"

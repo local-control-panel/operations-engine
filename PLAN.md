@@ -848,6 +848,12 @@ WordPress install, clone, and migrate provisioning paths. Root credentials and
 SQL are passed through stdin rather than shell or process argv. See
 `docs/milestones/006-mariadb-provisioning.md`.
 
+**Protected database tool convergence shipped.** Milestone 008 adds typed
+`dbTool.converge` install/start/stop actions for pinned phpMyAdmin and Adminer
+containers. Protected routes continue through `ingress.activateConfig`; typed
+destructive removal is the next milestone. See
+`docs/milestones/008-db-tool-converge.md`.
+
 **"Atomic Caddy and site configuration changes" — pilot, a second
 migration batch, and engine-side maintenance-mode modeling all
 shipped; 7 of ~28 call sites migrated.**

@@ -6,6 +6,7 @@ pub mod config;
 pub mod cron;
 pub mod db_provision;
 pub mod db_restore;
+pub mod db_tool;
 pub mod deploy;
 pub mod engine;
 pub mod error;

@@ -87,6 +87,15 @@ preserves every other mode bit. The result reports `processedRoots`,
 `hardenedEntries`, and `completedAtUnixSecs`; transaction and audit behavior is
 the same as for ownership repair.
 
+## `dbTool.converge`
+
+`db tool-converge` accepts a root-owned JSON plan selecting exactly
+`phpMyAdmin|adminer` and `install|start|stop`. Install additionally requires a
+validated domain and supports the allowlisted `mariadb|postgresql` Adminer
+default. Container names, images (version plus manifest digest), networks,
+restart policy, security options, labels, ports, and environment keys are fixed
+by the engine and never accepted as caller-provided command fragments.
+
 ## `db.provisionMariaDb`
 
 `db provision-mariadb` accepts a root-owned, non-group/world-writable JSON
