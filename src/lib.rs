@@ -12,6 +12,7 @@ pub mod engine;
 pub mod error;
 pub mod filesystem;
 pub mod ingress;
+pub mod meilisearch_upgrade;
 pub mod mutation;
 pub mod permissions;
 pub mod pg_provision;
