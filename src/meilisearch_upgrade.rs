@@ -4,6 +4,7 @@
 //! must be strict before any code is allowed to stop a live search service or
 //! touch its data store.
 
+pub mod api;
 pub mod execute;
 
 use serde::Deserialize;
