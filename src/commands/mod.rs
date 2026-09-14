@@ -5,6 +5,7 @@ pub mod db_restore;
 pub mod doctor;
 pub mod engine;
 pub mod ingress;
+pub mod meilisearch;
 pub mod permissions;
 pub mod runtime_config;
 pub mod site;

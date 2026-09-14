@@ -70,6 +70,12 @@ pub enum Command {
         command: ComposeCommand,
     },
 
+    /// Controlled Meilisearch lifecycle operations.
+    Meilisearch {
+        #[command(subcommand)]
+        command: MeilisearchCommand,
+    },
+
     /// Host content ownership repair operations.
     Permissions {
         #[command(subcommand)]
@@ -90,7 +96,33 @@ impl Command {
             Self::Cron { command } => command.operation(),
             Self::Db { command } => command.operation(),
             Self::Compose { command } => command.operation(),
+            Self::Meilisearch { command } => command.operation(),
             Self::Permissions { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MeilisearchCommand {
+    /// Export, validate and blue/green migrate the managed Meilisearch service.
+    Upgrade {
+        /// Root-owned JSON request containing the guarded source version,
+        /// exact target image, API key and representative search probes.
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl MeilisearchCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Upgrade { .. } => "meilisearch.upgrade",
         }
     }
 }

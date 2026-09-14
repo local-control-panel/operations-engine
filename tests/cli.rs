@@ -57,6 +57,7 @@ fn capabilities_describe_only_implemented_operations() {
             "dbTool.converge",
             "dbTool.remove",
             "compose.activateConfig",
+            "meilisearch.upgrade",
             "permissions.fixOwnership",
             "permissions.fixWorldWritable"
         ])
