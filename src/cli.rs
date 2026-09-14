@@ -467,6 +467,10 @@ impl RuntimeCommand {
 pub enum CronCommand {
     /// Atomically replace the engine's own host user's crontab.
     InstallTab {
+        /// Host user whose crontab is replaced. Omit for the engine user.
+        #[arg(long = "user")]
+        user: Option<String>,
+
         /// Path to a file holding the complete new crontab contents.
         #[arg(long = "content-file")]
         content_file: PathBuf,

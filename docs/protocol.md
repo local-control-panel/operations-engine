@@ -48,6 +48,13 @@ Neither value substitutes for the other.
 Protocol-breaking changes require a new protocol version. Adding an optional
 result field or a new capability does not necessarily require one.
 
+## `cron.installTab`
+
+`cron install-tab` atomically replaces a complete crontab with an optimistic
+SHA-256 guard. The optional `--user` selects a named host account; it is a
+strictly validated identifier and is passed to `crontab` as separate `-u` and
+value arguments. Transactions and locks are scoped per target user.
+
 ## `permissions.fixOwnership`
 
 `permissions fix-ownership` accepts `--owners-file`, `--request-id`, and an

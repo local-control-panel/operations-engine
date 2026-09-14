@@ -16,11 +16,13 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 pub fn run(command: CronCommand) -> Result<Response, ResponseBuildError> {
     match command {
         CronCommand::InstallTab {
+            user,
             content_file,
             expected_hash,
             request_id,
             idempotency_key,
         } => install_tab(
+            user.as_deref(),
             &content_file,
             expected_hash.as_deref(),
             &request_id,
@@ -30,6 +32,7 @@ pub fn run(command: CronCommand) -> Result<Response, ResponseBuildError> {
 }
 
 fn install_tab(
+    user: Option<&str>,
     content_file: &std::path::Path,
     expected_hash: Option<&str>,
     request_id: &str,
@@ -71,7 +74,8 @@ fn install_tab(
         }
     };
 
-    let request = match InstallTabRequest::parse(content, guard, request_id, idempotency_key) {
+    let request = match InstallTabRequest::parse(content, user, guard, request_id, idempotency_key)
+    {
         Ok(request) => request,
         Err(error) => {
             return Ok(Response::failure(
@@ -167,6 +171,7 @@ fn request_error_message(error: InstallTabRequestError) -> &'static str {
         InstallTabRequestError::InvalidExpectedHash => {
             "expected-hash is not a valid SHA-256 digest"
         }
+        InstallTabRequestError::InvalidUser => "user is not a valid host username",
         InstallTabRequestError::InvalidRequestId => "request-id is not a canonical UUID",
         InstallTabRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }

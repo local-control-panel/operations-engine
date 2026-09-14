@@ -26,7 +26,6 @@ use crate::{
 };
 
 const CRON_SUBTREE: &str = "cron";
-const INSTALL_STAGING_PATH: &str = "cron/pending.tab";
 
 pub struct InstallTabContext<'a> {
     /// The engine-wide state root, plain (unwrapped) so a staged crontab
@@ -122,7 +121,11 @@ pub fn execute(
     request: &InstallTabRequest,
     cancellation: &CancellationToken,
 ) -> Result<InstallTabResult, InstallTabError> {
-    let cron_state = open_cron_state(context.engine_state).map_err(InstallTabError::Io)?;
+    let cron_state = open_cron_state(
+        context.engine_state,
+        request.user.as_ref().map(|u| u.as_str()),
+    )
+    .map_err(InstallTabError::Io)?;
 
     let admitted = match preflight::run(
         &cron_state,
@@ -151,7 +154,10 @@ pub fn execute(
         ));
     }
 
-    let current = match read_current_tab(context.crontab_program) {
+    let current = match read_current_tab(
+        context.crontab_program,
+        request.user.as_ref().map(|u| u.as_str()),
+    ) {
         Ok(current) => current,
         Err(error) => {
             return Err(fail(
@@ -179,6 +185,7 @@ pub fn execute(
             context.state_root,
             context.crontab_program,
             &request.content,
+            request.user.as_ref().map(|u| u.as_str()),
         ) {
             return Err(fail(
                 &cron_state,
@@ -219,9 +226,16 @@ pub fn execute(
 /// treated as an absent tab, not an error - the same tolerance
 /// `website-control-panel`'s own `crontab -l 2>/dev/null || echo ""` already
 /// applies client-side.
-fn read_current_tab(crontab_program: &str) -> Result<Option<Vec<u8>>, process::ProcessRunError> {
+fn read_current_tab(
+    crontab_program: &str,
+    user: Option<&str>,
+) -> Result<Option<Vec<u8>>, process::ProcessRunError> {
+    let mut args = vec!["-l"];
+    if let Some(user) = user {
+        args.extend(["-u", user]);
+    }
     let output = process::run(
-        &ProcessRequest::new(crontab_program).args(["-l"]),
+        &ProcessRequest::new(crontab_program).args(args),
         &ProcessLimits::default(),
         &CancellationToken::default(),
     )?;
@@ -239,8 +253,12 @@ fn install(
     state_root: &TrustedRoot,
     crontab_program: &str,
     content: &str,
+    user: Option<&str>,
 ) -> Result<(), InstallFailure> {
-    let staged_path = state_root.as_path().join(INSTALL_STAGING_PATH);
+    let staged_path = state_root
+        .as_path()
+        .join("cron")
+        .join(format!("pending-{}.tab", user.unwrap_or("self")));
     if let Some(parent) = staged_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| InstallFailure::Run(process::ProcessRunError::Spawn(e)))?;
@@ -248,8 +266,13 @@ fn install(
     std::fs::write(&staged_path, content)
         .map_err(|e| InstallFailure::Run(process::ProcessRunError::Spawn(e)))?;
 
+    let mut args = Vec::new();
+    if let Some(user) = user {
+        args.extend([std::ffi::OsString::from("-u"), user.into()]);
+    }
+    args.push(staged_path.as_os_str().to_owned());
     let outcome = process::run(
-        &ProcessRequest::new(crontab_program).args([staged_path.as_os_str()]),
+        &ProcessRequest::new(crontab_program).args(args),
         &ProcessLimits::default(),
         &CancellationToken::default(),
     );
@@ -267,8 +290,9 @@ fn install(
     ))
 }
 
-pub fn open_cron_state(engine_state: &ManagedRoot) -> io::Result<ManagedRoot> {
-    let relative = SiteRelativePath::parse(CRON_SUBTREE).expect("literal path is valid");
+pub fn open_cron_state(engine_state: &ManagedRoot, user: Option<&str>) -> io::Result<ManagedRoot> {
+    let relative = SiteRelativePath::parse(format!("{CRON_SUBTREE}/{}", user.unwrap_or("self")))
+        .expect("validated path");
     engine_state.create_dir_all(&relative)?;
     let scoped = engine_state.open_managed_dir(&relative)?;
     for sub in ["locks", "transactions", "audit"] {
@@ -388,7 +412,7 @@ mod tests {
             fs::write(&installed_tab, contents).expect("existing tab should be written");
         }
         let script = format!(
-            "#!/bin/sh\nif [ \"$1\" = \"-l\" ]; then\n  [ -f {tab} ] && cat {tab} || exit 1\nelse\n  [ -f {reject} ] && exit 1\n  cp \"$1\" {tab}\nfi\n",
+            "#!/bin/sh\nif [ \"$1\" = \"-l\" ]; then\n  [ -f {tab} ] && cat {tab} || exit 1\nelse\n  [ \"$1\" = \"-u\" ] && shift 2\n  [ -f {reject} ] && exit 1\n  cp \"$1\" {tab}\nfi\n",
             tab = shell_quote(&installed_tab),
             reject = shell_quote(&reject_flag),
         );
@@ -423,7 +447,7 @@ mod tests {
     }
 
     fn request(guard: HashGuard, request_id: &str, key: Option<&str>) -> InstallTabRequest {
-        InstallTabRequest::parse("* * * * * true\n", guard, request_id, key)
+        InstallTabRequest::parse("* * * * * true\n", None, guard, request_id, key)
             .expect("request should parse")
     }
 
@@ -437,6 +461,25 @@ mod tests {
         )
         .expect("fresh install should succeed");
 
+        assert!(result.activated);
+        assert_eq!(
+            fs::read_to_string(&host.installed_tab).unwrap(),
+            "* * * * * true\n"
+        );
+    }
+
+    #[test]
+    fn a_targeted_install_uses_the_named_users_tab() {
+        let host = host(None);
+        let request = InstallTabRequest::parse(
+            "* * * * * true\n",
+            Some("www-data"),
+            HashGuard::Absent,
+            REQUEST_ID,
+            None,
+        )
+        .unwrap();
+        let result = execute(&context(&host), &request, &CancellationToken::default()).unwrap();
         assert!(result.activated);
         assert_eq!(
             fs::read_to_string(&host.installed_tab).unwrap(),
