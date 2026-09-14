@@ -328,7 +328,7 @@ fn discard(root: &ManagedRoot, path: &SiteRelativePath) {
     let _ = root.remove_file(path);
 }
 
-fn validate(compose: &compose::Access, staged: &str) -> Result<(), ComposeFailure> {
+pub(crate) fn validate(compose: &compose::Access, staged: &str) -> Result<(), ComposeFailure> {
     check(
         "caddy validate",
         compose.exec(
@@ -345,7 +345,7 @@ fn validate(compose: &compose::Access, staged: &str) -> Result<(), ComposeFailur
     )
 }
 
-fn reload(compose: &compose::Access) -> Result<(), ComposeFailure> {
+pub(crate) fn reload(compose: &compose::Access) -> Result<(), ComposeFailure> {
     check(
         "caddy reload",
         compose.exec(

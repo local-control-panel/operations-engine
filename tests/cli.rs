@@ -54,6 +54,7 @@ fn capabilities_describe_only_implemented_operations() {
             "db.restore",
             "db.provisionMariaDb",
             "dbTool.converge",
+            "dbTool.remove",
             "compose.activateConfig",
             "permissions.fixOwnership",
             "permissions.fixWorldWritable"

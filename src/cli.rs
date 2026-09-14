@@ -511,6 +511,15 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Remove a protected database administration tool and its ingress route.
+    ToolRemove {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Create or converge a MariaDB database and optional isolated user.
     ProvisionMariadb {
         /// Root-owned JSON request containing identifiers and credentials.
@@ -568,6 +577,7 @@ impl DbCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ToolConverge { .. } => "dbTool.converge",
+            Self::ToolRemove { .. } => "dbTool.remove",
             Self::ProvisionMariadb { .. } => "db.provisionMariaDb",
             Self::Restore { .. } => "db.restore",
         }

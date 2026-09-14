@@ -850,9 +850,10 @@ SQL are passed through stdin rather than shell or process argv. See
 
 **Protected database tool convergence shipped.** Milestone 008 adds typed
 `dbTool.converge` install/start/stop actions for pinned phpMyAdmin and Adminer
-containers. Protected routes continue through `ingress.activateConfig`; typed
-destructive removal is the next milestone. See
-`docs/milestones/008-db-tool-converge.md`.
+containers. Protected routes continue through `ingress.activateConfig`. The
+follow-up milestone adds transactional `dbTool.remove`, including route restore
+when container removal fails. See `docs/milestones/008-db-tool-converge.md` and
+`docs/milestones/009-db-tool-remove.md`.
 
 **"Atomic Caddy and site configuration changes" — pilot, a second
 migration batch, and engine-side maintenance-mode modeling all

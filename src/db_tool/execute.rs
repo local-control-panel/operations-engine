@@ -248,6 +248,12 @@ fn replay(
 ) -> std::result::Result<ToolResult, Error> {
     let l = state::load(s, &state_path(id))
         .map_err(|e| Error::Io(std::io::Error::other(format!("{e:?}"))))?;
+    if l.operation != OPERATION {
+        return Err(Error::Replayed {
+            code: ErrorCode::Conflict,
+            message: "idempotency key belongs to another operation".into(),
+        });
+    }
     match l.status {
         TransactionStatus::InProgress => Err(Error::ReplayInProgress),
         TransactionStatus::Committed => serde_json::from_value(l.outcome.unwrap().result.unwrap())

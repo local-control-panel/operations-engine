@@ -96,6 +96,14 @@ default. Container names, images (version plus manifest digest), networks,
 restart policy, security options, labels, ports, and environment keys are fixed
 by the engine and never accepted as caller-provided command fragments.
 
+## `dbTool.remove`
+
+`db tool-remove` accepts a root-owned JSON plan selecting `phpMyAdmin|adminer`
+and an optional validated domain. When a route exists, the engine atomically
+moves it outside Caddy's import glob, validates and reloads the remaining
+configuration, and only then removes the fixed container. A failed container
+removal restores the route and reloads Caddy before returning failure.
+
 ## `db.provisionMariaDb`
 
 `db provision-mariadb` accepts a root-owned, non-group/world-writable JSON

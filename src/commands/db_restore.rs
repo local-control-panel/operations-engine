@@ -10,8 +10,10 @@ use crate::{
         execute::{RestoreContext, RestoreError, execute as execute_restore},
     },
     db_tool::{
-        OPERATION as TOOL_OPERATION, Request as ToolRequest, RequestError as ToolRequestError,
+        OPERATION as TOOL_OPERATION, REMOVE_OPERATION, RemoveRequest, Request as ToolRequest,
+        RequestError as ToolRequestError,
         execute::{Context as ToolContext, Error as ToolError, execute as execute_tool},
+        remove::{Context as RemoveContext, Error as RemoveError, execute as execute_remove},
     },
     error::{ErrorCode, WarningCode},
     process::CancellationToken,
@@ -27,6 +29,11 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => tool_converge(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::ToolRemove {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => tool_remove(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::ProvisionMariadb {
             request_file,
             request_id,
@@ -49,6 +56,81 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn tool_remove(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    REMOVE_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    REMOVE_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match RemoveRequest::parse(&json, request_id, key) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::failure(
+                    REMOVE_OPERATION,
+                    ErrorCode::InvalidInput,
+                    tool_error_message(e),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    REMOVE_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let compose = crate::compose::Access::default();
+        let context = RemoveContext {
+            engine_state: &state,
+            ingress_root: &config.ingress_root,
+            docker_program: "docker",
+            compose: &compose,
+        };
+        match execute_remove(&context, &request, &CancellationToken::default()) {
+            Ok(v) => Response::success(REMOVE_OPERATION, v),
+            Err(RemoveError::PostCommit { result }) => Response::success(REMOVE_OPERATION, result),
+            Err(e) => {
+                let (c, m) = e.protocol();
+                Ok(Response::failure(REMOVE_OPERATION, c, &m))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            REMOVE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "dbTool.remove requires a Unix host",
+        ))
     }
 }
 
