@@ -827,6 +827,14 @@ Additional workflows are considered only after the Git pilot succeeds. Each
 workflow requires its own milestone document and measurable reason to move into
 Operations Engine.
 
+**Permissions ownership repair shipped.** Milestone 004 adds the typed
+`permissions.fixOwnership` operation and removes `permissions_fix_ownership`'s
+raw privileged `find -exec chown` fallback from `website-control-panel`. The
+engine accepts a bounded, root-owned staged plan, validates every target below
+the configured content root, skips symlinks and mount boundaries, and records
+the host-wide mutation through the standard lock, idempotency, transaction, and
+audit pipeline. See `docs/milestones/004-permissions-fix-ownership.md`.
+
 **"Atomic Caddy and site configuration changes" — pilot, a second
 migration batch, and engine-side maintenance-mode modeling all
 shipped; 7 of ~28 call sites migrated.**

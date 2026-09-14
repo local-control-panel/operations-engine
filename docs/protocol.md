@@ -48,6 +48,28 @@ Neither value substitutes for the other.
 Protocol-breaking changes require a new protocol version. Adding an optional
 result field or a new capability does not necessarily require one.
 
+## `permissions.fixOwnership`
+
+`permissions fix-ownership` accepts `--owners-file`, `--request-id`, and an
+optional `--idempotency-key`. The owners file is root-owned JSON:
+
+```json
+{
+  "default": { "root": "/var/www", "uid": 33, "gid": 33 },
+  "targets": [
+    { "root": "/var/www/example.com", "uid": 10001, "gid": 10001 }
+  ]
+}
+```
+
+The default root must exactly match a configured `contentRoot`; every target
+must be a non-overlapping strict descendant. The engine repairs each target,
+then repairs the default tree while excluding those targets. It stays on each
+root's filesystem, skips symbolic links, and applies ownership with
+`AT_SYMLINK_NOFOLLOW`. The result reports `processedRoots`, `repairedEntries`,
+and `completedAtUnixSecs`. Request and result are persisted in the engine's
+transaction/audit trail.
+
 ## Exit status
 
 An envelope with `ok: true` exits with status 0. An envelope with `ok: false`

@@ -5,6 +5,7 @@ pub mod db_restore;
 pub mod doctor;
 pub mod engine;
 pub mod ingress;
+pub mod permissions;
 pub mod runtime_config;
 pub mod site;
 pub mod version;
@@ -81,6 +82,36 @@ pub(crate) fn read_content_file(path: &std::path::Path) -> Result<String, Conten
     Ok(content)
 }
 
+/// Reads a request document that was staged by the control plane. Unlike
+/// config fragments, an ownership plan contains privileged UID/GID targets,
+/// so it must itself be root-owned and not writable by group or other users.
+#[cfg(unix)]
+pub(crate) fn read_root_owned_content_file(
+    path: &std::path::Path,
+) -> Result<String, ContentFileError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| ContentFileError::Unreadable)?;
+    let metadata = file.metadata().map_err(|_| ContentFileError::Unreadable)?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(ContentFileError::Unreadable);
+    }
+    let mut content = String::new();
+    let read = file
+        .take(MAX_CONTENT_BYTES as u64 + 1)
+        .read_to_string(&mut content)
+        .map_err(|_| ContentFileError::Unreadable)?;
+    if read > MAX_CONTENT_BYTES {
+        return Err(ContentFileError::TooLarge);
+    }
+    Ok(content)
+}
+
 /// Opens `path` non-blocking, so a FIFO's read end returns immediately
 /// instead of waiting for a writer — see `read_content_file`'s doc comment.
 /// `O_NONBLOCK` is Unix-specific; every caller of `read_content_file` is
@@ -132,6 +163,7 @@ pub const CONFIG_UNAVAILABLE_MESSAGE: &str = "engine configuration is unavailabl
 mod tests {
     use super::{
         CONFIG_UNAVAILABLE_MESSAGE, ContentFileError, MAX_CONTENT_BYTES, read_content_file,
+        read_root_owned_content_file,
     };
 
     /// Pins the literal, spelled out rather than compared to the constant,
@@ -230,5 +262,21 @@ mod tests {
             // itself must be non-blocking, not just the read.
             assert_eq!(read_content_file(&fifo), Err(ContentFileError::Unreadable));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_root_owned_request_file_cannot_be_supplied_through_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("owners.json");
+        let link = directory.path().join("owners-link.json");
+        std::fs::write(&real, "{}").unwrap();
+        symlink(&real, &link).unwrap();
+        assert_eq!(
+            read_root_owned_content_file(&link),
+            Err(ContentFileError::Unreadable)
+        );
     }
 }

@@ -11,6 +11,7 @@ pub mod error;
 pub mod filesystem;
 pub mod ingress;
 pub mod mutation;
+pub mod permissions;
 pub mod process;
 pub mod protocol;
 pub mod rollback;
@@ -35,6 +36,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Cron { command } => commands::cron::run(command),
         Command::Db { command } => commands::db_restore::run(command),
         Command::Compose { command } => commands::compose_config::run(command),
+        Command::Permissions { command } => commands::permissions::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

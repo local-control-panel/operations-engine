@@ -52,7 +52,8 @@ fn capabilities_describe_only_implemented_operations() {
             "runtime.reconcile",
             "cron.installTab",
             "db.restore",
-            "compose.activateConfig"
+            "compose.activateConfig",
+            "permissions.fixOwnership"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

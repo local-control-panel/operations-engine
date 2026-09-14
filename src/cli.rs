@@ -69,6 +69,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ComposeCommand,
     },
+
+    /// Host content ownership repair operations.
+    Permissions {
+        #[command(subcommand)]
+        command: PermissionsCommand,
+    },
 }
 
 impl Command {
@@ -84,6 +90,31 @@ impl Command {
             Self::Cron { command } => command.operation(),
             Self::Db { command } => command.operation(),
             Self::Compose { command } => command.operation(),
+            Self::Permissions { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PermissionsCommand {
+    /// Restore the declared owner of each managed content tree.
+    FixOwnership {
+        /// Root-owned JSON file containing the typed ownership plan.
+        #[arg(long = "owners-file")]
+        owners_file: PathBuf,
+
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl PermissionsCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::FixOwnership { .. } => "permissions.fixOwnership",
         }
     }
 }
