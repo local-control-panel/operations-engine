@@ -498,6 +498,19 @@ impl CronCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum DbCommand {
+    /// Create or converge a MariaDB database and optional isolated user.
+    ProvisionMariadb {
+        /// Root-owned JSON request containing identifiers and credentials.
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Runs a database client against an already-on-disk dump file.
     /// Audit-trail only - no snapshot, no rollback; the dump either
     /// imports cleanly or it doesn't, the same as the raw command this
@@ -541,6 +554,7 @@ pub enum DbTypeArg {
 impl DbCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::ProvisionMariadb { .. } => "db.provisionMariaDb",
             Self::Restore { .. } => "db.restore",
         }
     }

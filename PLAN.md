@@ -842,6 +842,12 @@ The operation accepts only an exact configured content root and uses an
 fd-relative, no-symlink, same-filesystem walk. See
 `docs/milestones/005-permissions-fix-world-writable.md`.
 
+**MariaDB provisioning shipped.** Milestone 006 adds the typed
+`db.provisionMariaDb` operation and migrates database/user creation plus the
+WordPress install, clone, and migrate provisioning paths. Root credentials and
+SQL are passed through stdin rather than shell or process argv. See
+`docs/milestones/006-mariadb-provisioning.md`.
+
 **"Atomic Caddy and site configuration changes" — pilot, a second
 migration batch, and engine-side maintenance-mode modeling all
 shipped; 7 of ~28 call sites migrated.**

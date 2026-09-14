@@ -1,5 +1,10 @@
 use crate::{
     cli::{DbCommand, DbTypeArg},
+    commands::{ContentFileError, read_root_owned_content_file},
+    db_provision::{
+        OPERATION as PROVISION_OPERATION, ProvisionRequest, RequestError as ProvisionRequestError,
+        execute::{ProvisionContext, ProvisionError, execute as execute_provision},
+    },
     db_restore::{
         OPERATION, RestoreRequest, RestoreRequestError,
         execute::{RestoreContext, RestoreError, execute as execute_restore},
@@ -13,6 +18,11 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        DbCommand::ProvisionMariadb {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => provision_mariadb(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::Restore {
             db_type,
             database,
@@ -30,6 +40,107 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn provision_mariadb(
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PROVISION_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(json) => json,
+            Err(ContentFileError::TooLarge) => {
+                return Ok(Response::failure(
+                    PROVISION_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file is too large",
+                ));
+            }
+            Err(ContentFileError::Unreadable) => {
+                return Ok(Response::failure(
+                    PROVISION_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match ProvisionRequest::parse(&json, request_id, idempotency_key) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    PROVISION_OPERATION,
+                    ErrorCode::InvalidInput,
+                    provision_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(state) => state,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PROVISION_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = ProvisionContext {
+            engine_state: &state,
+            docker_program: "docker",
+        };
+        match execute_provision(&context, &request, &CancellationToken::default()) {
+            Ok(result) => Response::success(PROVISION_OPERATION, result),
+            Err(ProvisionError::PostCommitRecordFailed { result }) => {
+                Response::success(PROVISION_OPERATION, result).map(|response| {
+                    response.with_warnings(vec![Warning {
+                        code: WarningCode::TransactionRecordIncomplete,
+                        message:
+                            "MariaDB was provisioned but its transaction record could not be saved"
+                                .into(),
+                    }])
+                })
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(PROVISION_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            PROVISION_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.provisionMariaDb requires a Unix host",
+        ))
+    }
+}
+
+fn provision_error_message(error: ProvisionRequestError) -> &'static str {
+    match error {
+        ProvisionRequestError::InvalidJson => "request-file is not a valid provisioning plan",
+        ProvisionRequestError::InvalidContainer => "container is invalid",
+        ProvisionRequestError::InvalidDatabase => "database is invalid",
+        ProvisionRequestError::InvalidUser => "user is invalid",
+        ProvisionRequestError::InvalidHost => "host is invalid",
+        ProvisionRequestError::InvalidSecret => "credential value is invalid",
+        ProvisionRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        ProvisionRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }
 

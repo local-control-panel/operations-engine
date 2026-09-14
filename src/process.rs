@@ -1,6 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
-    io::{self, Read},
+    io::{self, Read, Write},
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
@@ -311,6 +311,70 @@ pub fn run_with_stdin_file(
     let mut command = build_command(request);
     command.stdin(Stdio::from(file));
     spawn_and_supervise(command, limits, cancellation)
+}
+
+/// Feeds a bounded request body through stdin so secret-bearing input does not
+/// appear in the child process argument list.
+pub fn run_with_stdin_bytes(
+    request: &ProcessRequest,
+    input: &[u8],
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
+    let mut command = build_command(request);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(ProcessRunError::Spawn)?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or(ProcessRunError::MissingPipe("stdin"))?;
+    let input = input.to_vec();
+    let writer = thread::spawn(move || stdin.write_all(&input));
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(ProcessRunError::MissingPipe("stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(ProcessRunError::MissingPipe("stderr"))?;
+    let stdout_limit = limits.max_stdout_bytes;
+    let stderr_limit = limits.max_stderr_bytes;
+    let stdout_thread = thread::spawn(move || capture(stdout, stdout_limit));
+    let stderr_thread = thread::spawn(move || capture(stderr, stderr_limit));
+    let started = Instant::now();
+    let termination = loop {
+        if cancellation.is_cancelled() {
+            child.kill().map_err(ProcessRunError::Wait)?;
+            child.wait().map_err(ProcessRunError::Wait)?;
+            break ProcessTermination::Cancelled;
+        }
+        if started.elapsed() >= limits.timeout {
+            child.kill().map_err(ProcessRunError::Wait)?;
+            child.wait().map_err(ProcessRunError::Wait)?;
+            break ProcessTermination::TimedOut;
+        }
+        if let Some(status) = child.try_wait().map_err(ProcessRunError::Wait)? {
+            break ProcessTermination::Exited {
+                code: status.code(),
+                success: status.success(),
+            };
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    writer
+        .join()
+        .map_err(|_| ProcessRunError::CaptureThreadPanicked)?
+        .map_err(ProcessRunError::Capture)?;
+    Ok(ProcessOutput {
+        termination,
+        stdout: join_capture(stdout_thread)?,
+        stderr: join_capture(stderr_thread)?,
+    })
 }
 
 /// Runs `upstream` with its stdout connected directly to `downstream`'s

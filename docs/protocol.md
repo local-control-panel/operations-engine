@@ -80,6 +80,17 @@ preserves every other mode bit. The result reports `processedRoots`,
 `hardenedEntries`, and `completedAtUnixSecs`; transaction and audit behavior is
 the same as for ownership repair.
 
+## `db.provisionMariaDb`
+
+`db provision-mariadb` accepts a root-owned, non-group/world-writable JSON
+request file plus `--request-id` and optional `--idempotency-key`. It may create
+or ensure a database, create or ensure a user, and independently grant access
+to an existing validated database. At least one action is required.
+
+The root password and generated SQL are delivered to a fixed MariaDB client
+command over stdin; neither appears in host process argv, protocol envelopes,
+audit records, or subprocess diagnostics.
+
 ## Exit status
 
 An envelope with `ok: true` exits with status 0. An envelope with `ok: false`

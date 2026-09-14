@@ -4,6 +4,7 @@ pub mod compose;
 pub mod compose_config;
 pub mod config;
 pub mod cron;
+pub mod db_provision;
 pub mod db_restore;
 pub mod deploy;
 pub mod engine;
