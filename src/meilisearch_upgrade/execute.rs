@@ -395,6 +395,8 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         fail: Option<&'static str>,
+        empty_dump: bool,
+        rollback_fails: bool,
         calls: Vec<&'static str>,
     }
 
@@ -425,7 +427,7 @@ mod tests {
             }
             Ok(ExportedDump {
                 backup_id: "dump-1".into(),
-                byte_len: 42,
+                byte_len: if self.empty_dump { 0 } else { 42 },
             })
         }
         fn stop_source(&mut self, _: &UpgradeRequest, _: &CancellationToken) -> Result<(), ()> {
@@ -480,11 +482,7 @@ mod tests {
         }
         fn rollback_source(&mut self, _: &UpgradeRequest) -> Result<(), ()> {
             self.calls.push("rollback");
-            if self.fail == Some("rollback") {
-                Err(())
-            } else {
-                Ok(())
-            }
+            if self.rollback_fails { Err(()) } else { Ok(()) }
         }
     }
 
@@ -521,6 +519,16 @@ mod tests {
             driver.calls,
             ["baseline", "dump", "stop", "import", "validate", "cutover"]
         );
+        let transaction =
+            std::fs::read_to_string(_dir.path().join(
+                "meilisearch/wp-stack/transactions/123e4567-e89b-12d3-a456-426614174000.json",
+            ))
+            .unwrap();
+        let audit =
+            std::fs::read_to_string(_dir.path().join("meilisearch/wp-stack/audit/events.jsonl"))
+                .unwrap();
+        assert!(!transaction.contains("secret"));
+        assert!(!audit.contains("secret"));
     }
 
     #[test]
@@ -529,6 +537,8 @@ mod tests {
             let (_dir, state) = root();
             let mut driver = Fake {
                 fail: Some(failing),
+                empty_dump: false,
+                rollback_fails: false,
                 calls: vec![],
             };
             let error = execute(
@@ -557,13 +567,38 @@ mod tests {
     }
 
     #[test]
-    fn no_source_shutdown_occurs_without_a_nonempty_dump() {
+    fn no_source_shutdown_occurs_without_a_successful_nonempty_dump() {
+        for (fail, empty) in [(Some("dump"), false), (None, true)] {
+            let (_dir, state) = root();
+            let mut driver = Fake {
+                fail,
+                empty_dump: empty,
+                rollback_fails: false,
+                calls: vec![],
+            };
+            execute(
+                &mut Context {
+                    engine_state: &state,
+                    driver: &mut driver,
+                },
+                &request(),
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+            assert_eq!(driver.calls, ["baseline", "dump"]);
+        }
+    }
+
+    #[test]
+    fn rollback_failure_is_escalated_to_internal() {
         let (_dir, state) = root();
         let mut driver = Fake {
-            fail: Some("dump"),
+            fail: Some("validate"),
+            empty_dump: false,
+            rollback_fails: true,
             calls: vec![],
         };
-        execute(
+        let error = execute(
             &mut Context {
                 engine_state: &state,
                 driver: &mut driver,
@@ -572,6 +607,14 @@ mod tests {
             &CancellationToken::default(),
         )
         .unwrap_err();
-        assert_eq!(driver.calls, ["baseline", "dump"]);
+        assert_eq!(error.protocol().0, ErrorCode::Internal);
+        assert!(matches!(
+            error,
+            Error::PhaseFailed {
+                rollback_attempted: true,
+                rollback_succeeded: false,
+                ..
+            }
+        ));
     }
 }
