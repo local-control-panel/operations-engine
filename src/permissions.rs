@@ -1,6 +1,7 @@
 //! Typed ownership repair request for content managed by the control plane.
 
 pub mod execute;
+pub mod world_writable;
 
 use std::path::{Path, PathBuf};
 
@@ -12,6 +13,7 @@ use crate::{
 };
 
 pub const OPERATION: &str = "permissions.fixOwnership";
+pub const WORLD_WRITABLE_OPERATION: &str = "permissions.fixWorldWritable";
 /// A second defense behind the staged file's 256 KiB byte bound.
 pub const MAX_OWNERS: usize = 1_000;
 
@@ -36,6 +38,38 @@ pub struct FixOwnershipRequest {
     pub default: OwnershipTarget,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
+}
+
+#[derive(Debug)]
+pub struct FixWorldWritableRequest {
+    pub root: PathBuf,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl FixWorldWritableRequest {
+    pub fn parse(
+        root: &Path,
+        content_roots: &[TrustedRoot],
+        request_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        TrustedRoot::parse(root).map_err(|_| RequestError::InvalidRoot)?;
+        if !content_roots
+            .iter()
+            .any(|allowed| root == allowed.as_path())
+        {
+            return Err(RequestError::RootOutsideContentRoots);
+        }
+        Ok(Self {
+            root: root.to_owned(),
+            request_id: RequestId::parse(request_id).map_err(|_| RequestError::InvalidRequestId)?,
+            idempotency_key: idempotency_key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| RequestError::InvalidIdempotencyKey)?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +147,14 @@ pub struct FixOwnershipResult {
     pub completed_at_unix_secs: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FixWorldWritableResult {
+    pub processed_roots: usize,
+    pub hardened_entries: u64,
+    pub completed_at_unix_secs: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +196,17 @@ mod tests {
             None,
         );
         assert!(matches!(result, Err(RequestError::OverlappingRoots)));
+    }
+
+    #[test]
+    fn world_writable_repair_requires_an_exact_configured_root() {
+        assert!(
+            FixWorldWritableRequest::parse(Path::new("/var/www"), &roots(), REQUEST_ID, None)
+                .is_ok()
+        );
+        assert!(matches!(
+            FixWorldWritableRequest::parse(Path::new("/var/www/site"), &roots(), REQUEST_ID, None),
+            Err(RequestError::RootOutsideContentRoots)
+        ));
     }
 }

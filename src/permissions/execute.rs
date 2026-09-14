@@ -176,7 +176,7 @@ fn repair_tree(path: &Path, uid: u32, gid: u32, exclusions: &[&Path]) -> io::Res
     Ok(repaired)
 }
 
-fn open_directory(path: &Path) -> io::Result<OwnedFd> {
+pub(super) fn open_directory(path: &Path) -> io::Result<OwnedFd> {
     let path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
     let fd = unsafe {
@@ -239,7 +239,7 @@ fn repair_directory(
     Ok(repaired)
 }
 
-fn open_directory_at(parent: libc::c_int, name: &CStr) -> io::Result<OwnedFd> {
+pub(super) fn open_directory_at(parent: libc::c_int, name: &CStr) -> io::Result<OwnedFd> {
     let fd = unsafe {
         libc::openat(
             parent,
@@ -254,7 +254,7 @@ fn open_directory_at(parent: libc::c_int, name: &CStr) -> io::Result<OwnedFd> {
     }
 }
 
-fn stat_fd(fd: libc::c_int) -> io::Result<libc::stat> {
+pub(super) fn stat_fd(fd: libc::c_int) -> io::Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::uninit();
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
         Err(io::Error::last_os_error())
@@ -263,7 +263,7 @@ fn stat_fd(fd: libc::c_int) -> io::Result<libc::stat> {
     }
 }
 
-fn stat_at(parent: libc::c_int, name: &CStr) -> io::Result<libc::stat> {
+pub(super) fn stat_at(parent: libc::c_int, name: &CStr) -> io::Result<libc::stat> {
     let mut stat = std::mem::MaybeUninit::uninit();
     if unsafe {
         libc::fstatat(
@@ -280,7 +280,7 @@ fn stat_at(parent: libc::c_int, name: &CStr) -> io::Result<libc::stat> {
     }
 }
 
-fn directory_names(fd: libc::c_int) -> io::Result<Vec<OsString>> {
+pub(super) fn directory_names(fd: libc::c_int) -> io::Result<Vec<OsString>> {
     let duplicate = unsafe { libc::dup(fd) };
     if duplicate < 0 {
         return Err(io::Error::last_os_error());

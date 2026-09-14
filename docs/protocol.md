@@ -70,6 +70,16 @@ root's filesystem, skips symbolic links, and applies ownership with
 and `completedAtUnixSecs`. Request and result are persisted in the engine's
 transaction/audit trail.
 
+## `permissions.fixWorldWritable`
+
+`permissions fix-world-writable` accepts `--root`, `--request-id`, and an
+optional `--idempotency-key`. The root must exactly match a configured
+`contentRoot`. The engine walks regular files and directories without crossing
+mount points or following symbolic links, removes only the world-write bit, and
+preserves every other mode bit. The result reports `processedRoots`,
+`hardenedEntries`, and `completedAtUnixSecs`; transaction and audit behavior is
+the same as for ownership repair.
+
 ## Exit status
 
 An envelope with `ok: true` exits with status 0. An envelope with `ok: false`

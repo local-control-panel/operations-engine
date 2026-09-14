@@ -53,7 +53,8 @@ fn capabilities_describe_only_implemented_operations() {
             "cron.installTab",
             "db.restore",
             "compose.activateConfig",
-            "permissions.fixOwnership"
+            "permissions.fixOwnership",
+            "permissions.fixWorldWritable"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

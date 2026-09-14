@@ -835,6 +835,13 @@ the configured content root, skips symlinks and mount boundaries, and records
 the host-wide mutation through the standard lock, idempotency, transaction, and
 audit pipeline. See `docs/milestones/004-permissions-fix-ownership.md`.
 
+**World-writable permissions repair shipped.** Milestone 005 adds
+`permissions.fixWorldWritable` and removes the remaining privileged
+`find -exec chmod` path from the control panel's permissions repair actions.
+The operation accepts only an exact configured content root and uses an
+fd-relative, no-symlink, same-filesystem walk. See
+`docs/milestones/005-permissions-fix-world-writable.md`.
+
 **"Atomic Caddy and site configuration changes" — pilot, a second
 migration batch, and engine-side maintenance-mode modeling all
 shipped; 7 of ~28 call sites migrated.**

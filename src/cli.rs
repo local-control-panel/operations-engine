@@ -109,12 +109,26 @@ pub enum PermissionsCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Remove the world-writable bit from managed content.
+    FixWorldWritable {
+        /// Configured content root to harden.
+        #[arg(long = "root")]
+        root: PathBuf,
+
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl PermissionsCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::FixOwnership { .. } => "permissions.fixOwnership",
+            Self::FixWorldWritable { .. } => "permissions.fixWorldWritable",
         }
     }
 }
