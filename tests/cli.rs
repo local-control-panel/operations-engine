@@ -53,6 +53,7 @@ fn capabilities_describe_only_implemented_operations() {
             "cron.installTab",
             "db.restore",
             "db.provisionMariaDb",
+            "db.provisionPostgres",
             "dbTool.converge",
             "dbTool.remove",
             "compose.activateConfig",

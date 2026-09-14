@@ -115,6 +115,14 @@ The root password and generated SQL are delivered to a fixed MariaDB client
 command over stdin; neither appears in host process argv, protocol envelopes,
 audit records, or subprocess diagnostics.
 
+## `db.provisionPostgres`
+
+`db provision-postgres` accepts a root-owned JSON request containing a
+validated container name, database identifier, and PostgreSQL root password.
+The engine invokes a fixed `psql` command with `ON_ERROR_STOP` and sends both
+the password and generated `CREATE DATABASE` statement through stdin. Neither
+the credential nor caller-provided command fragments appear in process argv.
+
 ## Exit status
 
 An envelope with `ok: true` exits with status 0. An envelope with `ok: false`

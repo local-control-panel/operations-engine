@@ -855,6 +855,10 @@ follow-up milestone adds transactional `dbTool.remove`, including route restore
 when container removal fails. See `docs/milestones/008-db-tool-converge.md` and
 `docs/milestones/009-db-tool-remove.md`.
 
+**PostgreSQL database creation shipped.** Milestone 010 adds the typed
+`db.provisionPostgres` operation and migrates `pg_create_db` away from raw SSH
+SQL construction. See `docs/milestones/010-postgres-provisioning.md`.
+
 **"Atomic Caddy and site configuration changes" — pilot, a second
 migration batch, and engine-side maintenance-mode modeling all
 shipped; 7 of ~28 call sites migrated.**

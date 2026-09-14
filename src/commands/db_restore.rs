@@ -16,6 +16,14 @@ use crate::{
         remove::{Context as RemoveContext, Error as RemoveError, execute as execute_remove},
     },
     error::{ErrorCode, WarningCode},
+    pg_provision::{
+        OPERATION as PG_PROVISION_OPERATION, Request as PgProvisionRequest,
+        RequestError as PgProvisionRequestError,
+        execute::{
+            Context as PgProvisionContext, Error as PgProvisionError,
+            execute as execute_pg_provision,
+        },
+    },
     process::CancellationToken,
     protocol::{Response, ResponseBuildError, Warning},
 };
@@ -39,6 +47,11 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => provision_mariadb(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::ProvisionPostgres {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => provision_postgres(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::Restore {
             db_type,
             database,
@@ -56,6 +69,95 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn provision_postgres(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_PROVISION_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_PROVISION_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match PgProvisionRequest::parse(&json, request_id, key) {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(Response::failure(
+                    PG_PROVISION_OPERATION,
+                    ErrorCode::InvalidInput,
+                    pg_provision_error_message(e),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_PROVISION_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_pg_provision(
+            &PgProvisionContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(v) => Response::success(PG_PROVISION_OPERATION, v),
+            Err(PgProvisionError::PostCommit { result }) => {
+                Response::success(PG_PROVISION_OPERATION, result)
+            }
+            Err(e) => {
+                let (c, m) = e.protocol();
+                Ok(Response::failure(PG_PROVISION_OPERATION, c, &m))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            PG_PROVISION_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.provisionPostgres requires a Unix host",
+        ))
+    }
+}
+fn pg_provision_error_message(e: PgProvisionRequestError) -> &'static str {
+    match e {
+        PgProvisionRequestError::InvalidJson => {
+            "request-file is not a valid PostgreSQL provisioning plan"
+        }
+        PgProvisionRequestError::InvalidContainer => "container is invalid",
+        PgProvisionRequestError::InvalidDatabase => "database is invalid",
+        PgProvisionRequestError::InvalidSecret => "root password is invalid",
+        PgProvisionRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        PgProvisionRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }
 

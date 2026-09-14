@@ -14,6 +14,7 @@ pub mod filesystem;
 pub mod ingress;
 pub mod mutation;
 pub mod permissions;
+pub mod pg_provision;
 pub mod process;
 pub mod protocol;
 pub mod rollback;
