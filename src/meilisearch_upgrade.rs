@@ -5,6 +5,7 @@
 //! touch its data store.
 
 pub mod api;
+pub mod docker;
 pub mod execute;
 
 use serde::Deserialize;

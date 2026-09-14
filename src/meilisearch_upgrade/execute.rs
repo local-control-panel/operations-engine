@@ -232,12 +232,13 @@ pub fn execute<D: Driver>(
         ));
     }
     if context.driver.stop_source(request, cancellation).is_err() {
+        let rollback = context.driver.rollback_source(request).is_ok();
         return Err(fail(
             &scope,
             &state_path,
             &audit_path,
             state,
-            phase("source shutdown", false, false),
+            phase("source shutdown", true, rollback),
         ));
     }
 
@@ -533,7 +534,7 @@ mod tests {
 
     #[test]
     fn failed_import_or_validation_restores_the_source() {
-        for failing in ["import", "validate", "cutover"] {
+        for failing in ["stop", "import", "validate", "cutover"] {
             let (_dir, state) = root();
             let mut driver = Fake {
                 fail: Some(failing),
