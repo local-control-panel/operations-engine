@@ -227,6 +227,32 @@ impl<'a> DockerDriver<'a> {
         }
     }
 
+    fn wait_live_target(
+        &self,
+        request: &UpgradeRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(), Error> {
+        let started = Instant::now();
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+            if started.elapsed() >= START_TIMEOUT {
+                return Err(Error::InvalidInspect);
+            }
+            if let Ok(live) = self.discover_source(request) {
+                if self
+                    .client(&live, &request.master_key)
+                    .and_then(|client| client.version().map_err(Error::Api))
+                    .is_ok_and(|version| version.pkg_version == TARGET_VERSION)
+                {
+                    return Ok(());
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     fn env_path(&self) -> PathBuf {
         self.stack_dir.join(".env")
     }
@@ -438,15 +464,7 @@ impl Driver for DockerDriver<'_> {
             ],
             cancellation,
         )?;
-        let live = self.discover_source(request)?;
-        let version = self
-            .client(&live, &request.master_key)?
-            .version()?
-            .pkg_version;
-        if version != TARGET_VERSION {
-            return Err(Error::ValidationMismatch);
-        }
-        Ok(())
+        self.wait_live_target(request, cancellation)
     }
 
     fn rollback_source(&mut self, request: &UpgradeRequest) -> Result<(), Error> {
