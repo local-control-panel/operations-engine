@@ -123,6 +123,15 @@ The engine invokes a fixed `psql` command with `ON_ERROR_STOP` and sends both
 the password and generated `CREATE DATABASE` statement through stdin. Neither
 the credential nor caller-provided command fragments appear in process argv.
 
+## `db.dropPostgres`
+
+`db drop-postgres` accepts a root-owned JSON request containing a validated
+container name, database identifier and PostgreSQL root password. The system
+databases `postgres`, `template0` and `template1` are rejected. The engine uses
+the fixed `DROP DATABASE <identifier> WITH (FORCE)` operation, which closes
+active sessions as part of the drop instead of exposing a terminate/drop race.
+The password and generated SQL travel only over stdin.
+
 ## Exit status
 
 An envelope with `ok: true` exits with status 0. An envelope with `ok: false`

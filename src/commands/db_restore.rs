@@ -16,6 +16,11 @@ use crate::{
         remove::{Context as RemoveContext, Error as RemoveError, execute as execute_remove},
     },
     error::{ErrorCode, WarningCode},
+    pg_drop::{
+        OPERATION as PG_DROP_OPERATION, Request as PgDropRequest,
+        RequestError as PgDropRequestError,
+        execute::{Context as PgDropContext, Error as PgDropError, execute as execute_pg_drop},
+    },
     pg_provision::{
         OPERATION as PG_PROVISION_OPERATION, Request as PgProvisionRequest,
         RequestError as PgProvisionRequestError,
@@ -52,6 +57,11 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => provision_postgres(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::DropPostgres {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => drop_postgres(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::Restore {
             db_type,
             database,
@@ -69,6 +79,93 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn drop_postgres(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match PgDropRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Response::failure(
+                    PG_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    pg_drop_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_pg_drop(
+            &PgDropContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(PG_DROP_OPERATION, value),
+            Err(PgDropError::PostCommit { result }) => Response::success(PG_DROP_OPERATION, result),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(PG_DROP_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            PG_DROP_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.dropPostgres requires a Unix host",
+        ))
+    }
+}
+
+fn pg_drop_error_message(error: PgDropRequestError) -> &'static str {
+    match error {
+        PgDropRequestError::InvalidJson => "request-file is not a valid PostgreSQL removal plan",
+        PgDropRequestError::InvalidContainer => "container is invalid",
+        PgDropRequestError::InvalidDatabase => "database is invalid",
+        PgDropRequestError::ProtectedDatabase => "system databases cannot be removed",
+        PgDropRequestError::InvalidSecret => "root password is invalid",
+        PgDropRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        PgDropRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }
 

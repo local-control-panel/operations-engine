@@ -15,6 +15,7 @@ pub mod ingress;
 pub mod meilisearch_upgrade;
 pub mod mutation;
 pub mod permissions;
+pub mod pg_drop;
 pub mod pg_provision;
 pub mod process;
 pub mod protocol;
