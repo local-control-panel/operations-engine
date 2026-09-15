@@ -31,6 +31,7 @@ const SOURCE_VERSION: &str = "1.12.8";
 const MASTER_KEY: &str = "integration-test-master-key-32bytes";
 const REQUEST_ID: &str = "5d27415b-e403-4f31-b0c7-81ffdb92fc61";
 const FAILURE_REQUEST_ID: &str = "6e38526c-f514-4032-a1d8-92aaeca30d72";
+const IMPORT_FAILURE_REQUEST_ID: &str = "7f49637d-a625-4143-b2e9-a3bbfdb41e83";
 static DOCKER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Stack {
@@ -140,6 +141,13 @@ fn production_driver_migrates_real_unicode_documents_without_publishing_a_port()
         r#"[{"id":1,"title":"Здравей свят"},{"id":2,"title":"coffee grinder"}]"#,
     );
     wait_task(stack.address().unwrap(), task);
+    let settings_task = json_task(
+        stack.address().unwrap(),
+        "PATCH",
+        "/indexes/products/settings",
+        r#"{"filterableAttributes":["title"]}"#,
+    );
+    wait_task(stack.address().unwrap(), settings_task);
 
     let state_dir = tempfile::tempdir_in(stack.root.path()).unwrap();
     let trusted = TrustedRoot::parse(state_dir.path()).unwrap();
@@ -165,6 +173,37 @@ fn production_driver_migrates_real_unicode_documents_without_publishing_a_port()
         r#"{"q":"Здравей"}"#,
     );
     wait_task_or_assert_search(stack.address().unwrap(), search);
+    let settings = http(
+        stack.address().unwrap(),
+        "GET",
+        "/indexes/products/settings",
+        None,
+    );
+    assert!(
+        settings.contains(r#""filterableAttributes":["title"]"#),
+        "{settings}"
+    );
+
+    assert!(
+        compose(
+            stack.root.path(),
+            &["--profile", "meilisearch", "restart", "meili-1"]
+        )
+        .status()
+        .unwrap()
+        .success()
+    );
+    stack.wait_ready();
+    let restarted_search = http(
+        stack.address().unwrap(),
+        "POST",
+        "/indexes/products/search",
+        Some(r#"{"q":"Здравей"}"#),
+    );
+    assert!(
+        restarted_search.contains("Здравей свят"),
+        "{restarted_search}"
+    );
 }
 
 #[test]
@@ -215,6 +254,114 @@ fn validation_failure_restores_the_real_source_image_volume_and_documents() {
     let env = fs::read_to_string(stack.root.path().join(".env")).unwrap();
     assert!(env.contains(&format!("WCP_MEILISEARCH_IMAGE={SOURCE_IMAGE}")));
     assert!(env.contains("WCP_MEILISEARCH_VOLUME=wcp_meilisearch_data_it"));
+}
+
+#[test]
+#[ignore = "requires a Linux Docker daemon and pulls real Meilisearch images"]
+fn import_failure_after_real_shutdown_restores_the_source_and_documents() {
+    let _guard = DOCKER_TEST_LOCK.lock().unwrap();
+    let stack = Stack::start();
+    let task = json_post(
+        stack.address().unwrap(),
+        "/indexes/products/documents?primaryKey=id",
+        r#"[{"id":1,"title":"import rollback sentinel"}]"#,
+    );
+    wait_task(stack.address().unwrap(), task);
+
+    let state_dir = tempfile::tempdir_in(stack.root.path()).unwrap();
+    let trusted = TrustedRoot::parse(state_dir.path()).unwrap();
+    let state = ManagedRoot::open(&trusted).unwrap();
+    let request = upgrade_request(IMPORT_FAILURE_REQUEST_ID, "sentinel");
+    let driver = DockerDriver::new(stack.root.path(), &trusted);
+    let mut driver = ImportFailureDriver { inner: driver };
+    let mut context = Context {
+        engine_state: &state,
+        driver: &mut driver,
+    };
+    let error = execute(&mut context, &request, &CancellationToken::default()).unwrap_err();
+
+    assert!(
+        matches!(
+            error,
+            operations_engine::meilisearch_upgrade::execute::Error::PhaseFailed {
+                phase: "target import",
+                rollback_attempted: true,
+                rollback_succeeded: true,
+            }
+        ),
+        "{error:?}"
+    );
+    stack.wait_ready();
+    let version = http(stack.address().unwrap(), "GET", "/version", None);
+    assert!(version.contains(SOURCE_VERSION), "{version}");
+    let search = http(
+        stack.address().unwrap(),
+        "POST",
+        "/indexes/products/search",
+        Some(r#"{"q":"sentinel"}"#),
+    );
+    assert!(search.contains("import rollback sentinel"), "{search}");
+    let env = fs::read_to_string(stack.root.path().join(".env")).unwrap();
+    assert!(env.contains(&format!("WCP_MEILISEARCH_IMAGE={SOURCE_IMAGE}")));
+    assert!(env.contains("WCP_MEILISEARCH_VOLUME=wcp_meilisearch_data_it"));
+}
+
+struct ImportFailureDriver<'a> {
+    inner: DockerDriver<'a>,
+}
+
+impl Driver for ImportFailureDriver<'_> {
+    type Error = DockerError;
+    fn capture_baseline(
+        &mut self,
+        request: &UpgradeRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<Baseline, Self::Error> {
+        self.inner.capture_baseline(request, cancellation)
+    }
+    fn create_and_export_dump(
+        &mut self,
+        request: &UpgradeRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ExportedDump, Self::Error> {
+        self.inner.create_and_export_dump(request, cancellation)
+    }
+    fn stop_source(
+        &mut self,
+        request: &UpgradeRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<(), Self::Error> {
+        self.inner.stop_source(request, cancellation)
+    }
+    fn import_target(
+        &mut self,
+        _request: &UpgradeRequest,
+        _dump: &ExportedDump,
+        _cancellation: &CancellationToken,
+    ) -> Result<ImportedTarget, Self::Error> {
+        Err(DockerError::InvalidDump)
+    }
+    fn validate_target(
+        &mut self,
+        request: &UpgradeRequest,
+        baseline: &Baseline,
+        target: &ImportedTarget,
+        cancellation: &CancellationToken,
+    ) -> Result<(), Self::Error> {
+        self.inner
+            .validate_target(request, baseline, target, cancellation)
+    }
+    fn cutover(
+        &mut self,
+        request: &UpgradeRequest,
+        target: &ImportedTarget,
+        cancellation: &CancellationToken,
+    ) -> Result<(), Self::Error> {
+        self.inner.cutover(request, target, cancellation)
+    }
+    fn rollback_source(&mut self, request: &UpgradeRequest) -> Result<(), Self::Error> {
+        self.inner.rollback_source(request)
+    }
 }
 
 struct ValidationFailureDriver<'a> {
@@ -279,7 +426,11 @@ fn upgrade_request(request_id: &str, query: &str) -> UpgradeRequest {
 }
 
 fn json_post(address: SocketAddr, path: &str, body: &str) -> u64 {
-    let response = http(address, "POST", path, Some(body));
+    json_task(address, "POST", path, body)
+}
+
+fn json_task(address: SocketAddr, method: &str, path: &str, body: &str) -> u64 {
+    let response = http(address, method, path, Some(body));
     assert!(
         response.starts_with("HTTP/1.1 202") || response.starts_with("HTTP/1.1 200"),
         "{response}"
