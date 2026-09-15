@@ -5,7 +5,7 @@ use crate::protocol::{Response, ResponseBuildError};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CapabilitiesResult {
-    operations: [&'static str; 23],
+    operations: [&'static str; 24],
     output_formats: [&'static str; 1],
     features: Features,
 }
@@ -44,6 +44,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "dbTool.remove",
                 "compose.activateConfig",
                 "meilisearch.upgrade",
+                "meilisearch.cleanup",
                 "permissions.fixOwnership",
                 "permissions.fixWorldWritable",
             ],

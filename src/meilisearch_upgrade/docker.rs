@@ -147,15 +147,9 @@ impl<'a> DockerDriver<'a> {
         Ok(output.stdout.bytes)
     }
 
-    fn discover_source(&self, request: &UpgradeRequest) -> Result<Source, Error> {
+    fn discover_service(&self, service: &str) -> Result<Source, Error> {
         let output = self.compose(
-            &[
-                "--profile",
-                "meilisearch",
-                "ps",
-                "-q",
-                request.service.as_str(),
-            ],
+            &["--profile", "meilisearch", "ps", "-q", service],
             &CancellationToken::default(),
         )?;
         let container_id = std::str::from_utf8(&output)
@@ -174,6 +168,10 @@ impl<'a> DockerDriver<'a> {
             &CancellationToken::default(),
         )?;
         inspect_source(&inspect, container_id)
+    }
+
+    fn discover_source(&self, request: &UpgradeRequest) -> Result<Source, Error> {
+        self.discover_service(request.service.as_str())
     }
 
     fn client(&self, source: &Source, key: &str) -> Result<Client, Error> {
@@ -269,6 +267,31 @@ impl<'a> DockerDriver<'a> {
     }
 }
 
+impl crate::meilisearch_upgrade::cleanup::Driver for DockerDriver<'_> {
+    type Error = Error;
+
+    fn active_volume(&mut self) -> Result<String, Self::Error> {
+        self.discover_service("meili-1").map(|source| source.volume)
+    }
+
+    fn remove_volume(&mut self, volume: &str) -> Result<(), Self::Error> {
+        let filter = format!("name=^{volume}$");
+        let existing = self.docker(
+            ["volume", "ls", "--quiet", "--filter", filter.as_str()],
+            &CancellationToken::default(),
+        )?;
+        if !std::str::from_utf8(&existing)
+            .map_err(|_| Error::InvalidInspect)?
+            .lines()
+            .any(|name| name == volume)
+        {
+            return Ok(());
+        }
+        self.docker(["volume", "rm", volume], &CancellationToken::default())?;
+        Ok(())
+    }
+}
+
 impl Driver for DockerDriver<'_> {
     type Error = Error;
 
@@ -284,9 +307,11 @@ impl Driver for DockerDriver<'_> {
         let client = self.client(&source, &request.master_key)?;
         let version = client.version()?.pkg_version;
         let snapshot = client.capture_validation(&request.search_probes)?;
+        let source_volume = source.volume.clone();
         self.source = Some(source);
         Ok(Baseline {
             source_version: version,
+            source_volume,
             validation_token: serde_json::to_string(&snapshot)
                 .map_err(|_| Error::InvalidInspect)?,
         })

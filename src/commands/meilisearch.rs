@@ -12,6 +12,7 @@ use crate::{
 };
 
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
+const CLEANUP_OPERATION: &str = "meilisearch.cleanup";
 
 pub fn run(command: MeilisearchCommand) -> Result<Response, ResponseBuildError> {
     match command {
@@ -20,6 +21,70 @@ pub fn run(command: MeilisearchCommand) -> Result<Response, ResponseBuildError> 
             request_id,
             idempotency_key,
         } => upgrade(&request_file, &request_id, idempotency_key.as_deref()),
+        MeilisearchCommand::Cleanup => cleanup(),
+    }
+}
+
+fn cleanup() -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{
+            compose,
+            config::EngineConfig,
+            filesystem::ManagedRoot,
+            meilisearch_upgrade::{cleanup::cleanup_expired_now, execute::open_state},
+        };
+
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(_) => {
+                return Ok(Response::failure(
+                    CLEANUP_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let engine_state = match ManagedRoot::open(&config.state_root) {
+            Ok(state) => state,
+            Err(_) => {
+                return Ok(Response::failure(
+                    CLEANUP_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let scope = match open_state(&engine_state, "wp-stack") {
+            Ok(scope) => scope,
+            Err(_) => {
+                return Ok(Response::failure(
+                    CLEANUP_OPERATION,
+                    ErrorCode::Internal,
+                    "Meilisearch state is unavailable",
+                ));
+            }
+        };
+        let stack_dir = match compose::compose_base_dir() {
+            Ok(path) => path,
+            Err(_) => {
+                return Ok(Response::failure(
+                    CLEANUP_OPERATION,
+                    ErrorCode::Internal,
+                    "compose stack is unavailable",
+                ));
+            }
+        };
+        let mut driver = DockerDriver::new(&stack_dir, &config.state_root);
+        Response::success(CLEANUP_OPERATION, cleanup_expired_now(&scope, &mut driver))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Response::failure(
+            CLEANUP_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "meilisearch.cleanup requires a Unix host",
+        ))
     }
 }
 

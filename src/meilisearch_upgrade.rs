@@ -5,6 +5,7 @@
 //! touch its data store.
 
 pub mod api;
+pub mod cleanup;
 pub mod docker;
 pub mod execute;
 
@@ -68,8 +69,10 @@ pub struct UpgradeResult {
     pub source_version: String,
     pub target_version: String,
     pub backup_id: String,
+    pub retained_source_volume: String,
     pub target_volume: String,
     pub completed_at_unix_secs: u64,
+    pub recovery_expires_at_unix_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

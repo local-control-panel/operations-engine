@@ -117,12 +117,17 @@ pub enum MeilisearchCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Remove expired dump/source-volume recovery artifacts after verifying
+    /// that their corresponding target volume is still active.
+    Cleanup,
 }
 
 impl MeilisearchCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Upgrade { .. } => "meilisearch.upgrade",
+            Self::Cleanup => "meilisearch.cleanup",
         }
     }
 }

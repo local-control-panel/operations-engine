@@ -58,6 +58,7 @@ fn capabilities_describe_only_implemented_operations() {
             "dbTool.remove",
             "compose.activateConfig",
             "meilisearch.upgrade",
+            "meilisearch.cleanup",
             "permissions.fixOwnership",
             "permissions.fixWorldWritable"
         ])

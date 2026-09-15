@@ -31,9 +31,23 @@ pub struct Context<'a, D> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Baseline {
     pub source_version: String,
+    pub source_volume: String,
     /// Driver-owned, secret-free comparison token for index counts/settings
     /// and caller-declared representative search results.
     pub validation_token: String,
+}
+
+pub const RECOVERY_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RetainedArtifact {
+    pub upgrade_request_id: RequestId,
+    pub source_volume: String,
+    pub target_volume: String,
+    pub backup_id: String,
+    pub retained_at_unix_secs: u64,
+    pub expires_at_unix_secs: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -285,15 +299,37 @@ pub fn execute<D: Driver>(
         ));
     }
 
+    let completed_at = now();
+    let recovery_expires_at = completed_at.saturating_add(RECOVERY_RETENTION_SECS);
+    let result = UpgradeResult {
+        source_version: baseline.source_version.clone(),
+        target_version: TARGET_VERSION.into(),
+        backup_id: dump.backup_id.clone(),
+        retained_source_volume: baseline.source_volume.clone(),
+        target_volume: target.volume.clone(),
+        completed_at_unix_secs: completed_at,
+        recovery_expires_at_unix_secs: recovery_expires_at,
+    };
+    let artifact = RetainedArtifact {
+        upgrade_request_id: request.request_id,
+        source_volume: baseline.source_volume,
+        target_volume: target.volume,
+        backup_id: dump.backup_id,
+        retained_at_unix_secs: completed_at,
+        expires_at_unix_secs: recovery_expires_at,
+    };
+    if save_retained_artifact(&scope, &artifact).is_err() {
+        let rollback = context.driver.rollback_source(request).is_ok();
+        return Err(fail(
+            &scope,
+            &state_path,
+            &audit_path,
+            state,
+            phase("retention metadata", true, rollback),
+        ));
+    }
     let _committed = pre_commit.commit();
     drop(lock);
-    let result = UpgradeResult {
-        source_version: baseline.source_version,
-        target_version: TARGET_VERSION.into(),
-        backup_id: dump.backup_id,
-        target_volume: target.volume,
-        completed_at_unix_secs: now(),
-    };
     state
         .mark_committed(serde_json::to_value(&result).expect("upgrade result serializes"))
         .expect("transaction is in progress");
@@ -362,15 +398,24 @@ fn replay(scope: &ManagedRoot, id: RequestId) -> Result<UpgradeResult, Error> {
     }
 }
 
-fn open_state(root: &ManagedRoot, stack: &str) -> std::io::Result<ManagedRoot> {
+pub(crate) fn open_state(root: &ManagedRoot, stack: &str) -> std::io::Result<ManagedRoot> {
     let path = SiteRelativePath::parse(format!("meilisearch/{stack}"))
         .expect("validated stack name produces a safe state path");
     root.create_dir_all(&path)?;
     let scope = root.open_managed_dir(&path)?;
-    for child in ["locks", "transactions", "audit"] {
+    for child in ["locks", "transactions", "audit", "artifacts"] {
         scope.create_dir_all(&SiteRelativePath::parse(child).expect("static path"))?;
     }
     Ok(scope)
+}
+
+fn artifact_path(id: RequestId) -> SiteRelativePath {
+    SiteRelativePath::parse(format!("artifacts/{id}.json")).expect("UUID path")
+}
+
+fn save_retained_artifact(root: &ManagedRoot, artifact: &RetainedArtifact) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(artifact).map_err(std::io::Error::other)?;
+    root.write_atomic(&artifact_path(artifact.upgrade_request_id), &bytes)
 }
 
 fn state_path(id: RequestId) -> SiteRelativePath {
@@ -414,6 +459,7 @@ mod tests {
             }
             Ok(Baseline {
                 source_version: "1.53.1".into(),
+                source_volume: "wcp_meilisearch_data".into(),
                 validation_token: "counts+searches".into(),
             })
         }
@@ -516,6 +562,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.target_version, TARGET_VERSION);
+        assert_eq!(result.retained_source_volume, "wcp_meilisearch_data");
+        assert_eq!(
+            result.recovery_expires_at_unix_secs - result.completed_at_unix_secs,
+            RECOVERY_RETENTION_SECS
+        );
         assert_eq!(
             driver.calls,
             ["baseline", "dump", "stop", "import", "validate", "cutover"]
@@ -528,8 +579,15 @@ mod tests {
         let audit =
             std::fs::read_to_string(_dir.path().join("meilisearch/wp-stack/audit/events.jsonl"))
                 .unwrap();
+        let artifact = std::fs::read_to_string(
+            _dir.path()
+                .join("meilisearch/wp-stack/artifacts/123e4567-e89b-12d3-a456-426614174000.json"),
+        )
+        .unwrap();
         assert!(!transaction.contains("secret"));
         assert!(!audit.contains("secret"));
+        assert!(!artifact.contains("secret"));
+        assert!(artifact.contains("wcp_meilisearch_data"));
     }
 
     #[test]
