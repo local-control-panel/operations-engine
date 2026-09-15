@@ -140,6 +140,14 @@ namespace are rejected. Role creation and the optional grant share one SQL
 transaction. Root and user passwords, together with generated SQL, travel only
 over stdin and never appear in process argv or persisted transaction state.
 
+## `db.dropPostgresUser`
+
+`db drop-postgres-user` removes one validated role. The `postgres` role and
+the reserved `pg_` namespace are rejected before execution. The root password
+and fixed `DROP ROLE` statement travel only over stdin; PostgreSQL dependency
+errors fail closed without attempting ownership reassignment or cascading
+object deletion.
+
 ## Exit status
 
 An envelope with `ok: true` exits with status 0. An envelope with `ok: false`

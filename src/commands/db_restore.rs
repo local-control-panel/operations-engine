@@ -30,8 +30,12 @@ use crate::{
         },
     },
     pg_user::{
+        DROP_OPERATION as PG_USER_DROP_OPERATION, DropRequest as PgUserDropRequest,
         OPERATION as PG_USER_OPERATION, Request as PgUserRequest,
         RequestError as PgUserRequestError,
+        drop::{
+            Context as PgUserDropContext, Error as PgUserDropError, execute as execute_pg_user_drop,
+        },
         execute::{Context as PgUserContext, Error as PgUserError, execute as execute_pg_user},
     },
     process::CancellationToken,
@@ -72,6 +76,11 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => provision_postgres_user(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::DropPostgresUser {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => drop_postgres_user(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::Restore {
             db_type,
             database,
@@ -89,6 +98,83 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn drop_postgres_user(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_USER_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_USER_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match PgUserDropRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Response::failure(
+                    PG_USER_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    pg_user_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    PG_USER_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_pg_user_drop(
+            &PgUserDropContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(PG_USER_DROP_OPERATION, value),
+            Err(PgUserDropError::PostCommit { result }) => {
+                Response::success(PG_USER_DROP_OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(PG_USER_DROP_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            PG_USER_DROP_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.dropPostgresUser requires a Unix host",
+        ))
     }
 }
 

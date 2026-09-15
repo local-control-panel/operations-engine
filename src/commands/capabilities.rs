@@ -5,7 +5,7 @@ use crate::protocol::{Response, ResponseBuildError};
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CapabilitiesResult {
-    operations: [&'static str; 26],
+    operations: [&'static str; 27],
     output_formats: [&'static str; 1],
     features: Features,
 }
@@ -42,6 +42,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "db.provisionPostgres",
                 "db.dropPostgres",
                 "db.provisionPostgresUser",
+                "db.dropPostgresUser",
                 "dbTool.converge",
                 "dbTool.remove",
                 "compose.activateConfig",

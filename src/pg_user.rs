@@ -1,3 +1,4 @@
+pub mod drop;
 pub mod execute;
 
 use crate::{
@@ -7,6 +8,7 @@ use crate::{
 use serde::Deserialize;
 
 pub const OPERATION: &str = "db.provisionPostgresUser";
+pub const DROP_OPERATION: &str = "db.dropPostgresUser";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -81,6 +83,52 @@ fn valid_user(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DropPlan {
+    container: String,
+    root_password: String,
+    user: String,
+}
+
+#[derive(Debug)]
+pub struct DropRequest {
+    pub container: ContainerName,
+    pub root_password: String,
+    pub user: String,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl DropRequest {
+    pub fn parse(json: &str, request_id: &str, key: Option<&str>) -> Result<Self, RequestError> {
+        let plan: DropPlan = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
+        if plan.root_password.is_empty()
+            || plan.root_password.len() > 4096
+            || plan.root_password.contains(['\n', '\r', '\0'])
+        {
+            return Err(RequestError::InvalidSecret);
+        }
+        if !valid_user(&plan.user) {
+            return Err(RequestError::InvalidUser);
+        }
+        if plan.user == "postgres" || plan.user.starts_with("pg_") {
+            return Err(RequestError::ProtectedUser);
+        }
+        Ok(Self {
+            container: ContainerName::parse(&plan.container)
+                .map_err(|_| RequestError::InvalidContainer)?,
+            root_password: plan.root_password,
+            user: plan.user,
+            request_id: RequestId::parse(request_id).map_err(|_| RequestError::InvalidRequestId)?,
+            idempotency_key: key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| RequestError::InvalidIdempotencyKey)?,
+        })
+    }
+}
 pub(crate) fn quote_literal(value: &str) -> String {
     value.replace('\'', "''")
 }
@@ -90,6 +138,13 @@ pub(crate) fn quote_literal(value: &str) -> String {
 pub struct ProvisionResult {
     pub user: String,
     pub database: Option<String>,
+    pub completed_at_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DropResult {
+    pub user: String,
     pub completed_at_unix_secs: u64,
 }
 
@@ -107,5 +162,22 @@ mod tests {
             assert!(Request::parse(&json, ID, None).is_err());
         }
         assert_eq!(quote_literal("p'ass"), "p''ass");
+    }
+
+    #[test]
+    fn drop_request_rejects_protected_roles() {
+        for user in ["postgres", "pg_monitor", "bad-user"] {
+            let json =
+                format!(r#"{{"container":"postgres-17","rootPassword":"root","user":"{user}"}}"#);
+            assert!(DropRequest::parse(&json, ID, None).is_err());
+        }
+        assert!(
+            DropRequest::parse(
+                r#"{"container":"postgres-17","rootPassword":"root","user":"app_user"}"#,
+                ID,
+                None
+            )
+            .is_ok()
+        );
     }
 }

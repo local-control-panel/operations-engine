@@ -56,6 +56,7 @@ fn capabilities_describe_only_implemented_operations() {
             "db.provisionPostgres",
             "db.dropPostgres",
             "db.provisionPostgresUser",
+            "db.dropPostgresUser",
             "dbTool.converge",
             "dbTool.remove",
             "compose.activateConfig",

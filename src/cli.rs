@@ -596,6 +596,15 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Drop a non-system PostgreSQL role.
+    DropPostgresUser {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 
     /// Runs a database client against an already-on-disk dump file.
     /// Audit-trail only - no snapshot, no rollback; the dump either
@@ -646,6 +655,7 @@ impl DbCommand {
             Self::ProvisionPostgres { .. } => "db.provisionPostgres",
             Self::DropPostgres { .. } => "db.dropPostgres",
             Self::ProvisionPostgresUser { .. } => "db.provisionPostgresUser",
+            Self::DropPostgresUser { .. } => "db.dropPostgresUser",
             Self::Restore { .. } => "db.restore",
         }
     }
