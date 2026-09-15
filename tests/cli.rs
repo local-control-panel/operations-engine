@@ -55,6 +55,7 @@ fn capabilities_describe_only_implemented_operations() {
             "db.provisionMariaDb",
             "db.provisionPostgres",
             "db.dropPostgres",
+            "db.provisionPostgresUser",
             "dbTool.converge",
             "dbTool.remove",
             "compose.activateConfig",

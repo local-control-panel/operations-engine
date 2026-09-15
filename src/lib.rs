@@ -17,6 +17,7 @@ pub mod mutation;
 pub mod permissions;
 pub mod pg_drop;
 pub mod pg_provision;
+pub mod pg_user;
 pub mod process;
 pub mod protocol;
 pub mod rollback;

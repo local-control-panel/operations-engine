@@ -132,6 +132,14 @@ the fixed `DROP DATABASE <identifier> WITH (FORCE)` operation, which closes
 active sessions as part of the drop instead of exposing a terminate/drop race.
 The password and generated SQL travel only over stdin.
 
+## `db.provisionPostgresUser`
+
+`db provision-postgres-user` creates a validated login role and may grant it
+access to one validated database. The `postgres` role and the reserved `pg_`
+namespace are rejected. Role creation and the optional grant share one SQL
+transaction. Root and user passwords, together with generated SQL, travel only
+over stdin and never appear in process argv or persisted transaction state.
+
 ## Exit status
 
 An envelope with `ok: true` exits with status 0. An envelope with `ok: false`
