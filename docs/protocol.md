@@ -142,6 +142,15 @@ only over stdin; the account name and host contain no SQL quoting characters.
 Each `user@host` account has an independent mutation lock, idempotency state
 and audit trail.
 
+## `db.clearMariaSlowLog`
+
+`db clear-mariadb-slow-log` accepts a root-owned request containing a validated
+container name and root credential. Under a per-container lock it reads the
+configured log path and enabled state, disables logging, invokes only the fixed
+`truncate -s 0 <absolute-path>` argv inside the container, and restores the
+previous enabled state. The path never enters a shell command. Requests have
+idempotent transaction state and an append-only audit record.
+
 ## `db.deleteValkeyKey`
 
 `db delete-valkey-key` accepts a root-owned JSON request containing a validated

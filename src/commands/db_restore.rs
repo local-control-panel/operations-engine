@@ -24,6 +24,10 @@ use crate::{
             Context as MariaDropContext, Error as MariaDropError, execute as execute_maria_drop,
         },
     },
+    maria_slow_log::{
+        self, OPERATION as MARIA_SLOW_LOG_OPERATION,
+        execute::{Context as MariaSlowLogContext, Error as MariaSlowLogError},
+    },
     maria_user::{
         DROP_OPERATION as MARIA_USER_DROP_OPERATION, DropRequest as MariaUserDropRequest,
         RequestError as MariaUserRequestError,
@@ -106,6 +110,11 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => drop_mariadb_user(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::ClearMariadbSlowLog {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => clear_mariadb_slow_log(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::DeleteValkeyKey {
             request_file,
             request_id,
@@ -158,6 +167,83 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn clear_mariadb_slow_log(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_SLOW_LOG_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_SLOW_LOG_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match maria_slow_log::Request::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_SLOW_LOG_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "MariaDB slow-log request is invalid",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_SLOW_LOG_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match maria_slow_log::execute::execute(
+            &MariaSlowLogContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(MARIA_SLOW_LOG_OPERATION, value),
+            Err(MariaSlowLogError::PostCommit { result }) => {
+                Response::success(MARIA_SLOW_LOG_OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(MARIA_SLOW_LOG_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            MARIA_SLOW_LOG_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.clearMariaSlowLog requires a Unix host",
+        ))
     }
 }
 

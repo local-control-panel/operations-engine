@@ -189,7 +189,8 @@ cancellation contract in [docs/subprocess.md](./docs/subprocess.md).
 5. Migrate additional operations only where the structured boundary provides a
    measurable benefit.
 
-Detailed implementation milestones live in [`docs/milestones`](./docs/milestones).
+Detailed implementation milestones live in the docs repository's
+[`operations-engine/milestones`](https://github.com/local-control-panel/docs/tree/main/operations-engine/milestones).
 The authoritative execution order and current status live in [PLAN.md](./PLAN.md).
 
 ## Naming

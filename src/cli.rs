@@ -456,7 +456,7 @@ pub enum RuntimeCommand {
     /// root for `.tmp`/`.tmp-*` staging siblings and `.rollback-*` backup
     /// siblings left behind by an interrupted activate-config attempt,
     /// removing or restoring each. Takes `--runtime-id`, same as
-    /// `activate-config` - see `docs/milestones/003-runtime-reconcile.md`
+    /// `activate-config` - see docs repo milestone `003-runtime-reconcile.md`
     /// for why this sweeps one named pool rather than every pool at once.
     Reconcile {
         /// Which runtime pool's subdirectory to sweep.
@@ -619,6 +619,15 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Clear the configured MariaDB slow-query log and restore its enabled state.
+    ClearMariadbSlowLog {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Delete one bounded Valkey key without placing it in process argv.
     DeleteValkeyKey {
         #[arg(long = "request-file")]
@@ -732,6 +741,7 @@ impl DbCommand {
             Self::ProvisionMariadb { .. } => "db.provisionMariaDb",
             Self::DropMariadb { .. } => "db.dropMariaDb",
             Self::DropMariadbUser { .. } => "db.dropMariaDbUser",
+            Self::ClearMariadbSlowLog { .. } => "db.clearMariaSlowLog",
             Self::DeleteValkeyKey { .. } => "db.deleteValkeyKey",
             Self::FlushValkeyDb { .. } => "db.flushValkeyDb",
             Self::FlushAllValkey { .. } => "db.flushAllValkey",

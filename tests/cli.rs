@@ -57,6 +57,7 @@ fn capabilities_describe_only_implemented_operations() {
             "db.provisionMariaDb",
             "db.dropMariaDb",
             "db.dropMariaDbUser",
+            "db.clearMariaSlowLog",
             "db.deleteValkeyKey",
             "db.flushValkeyDb",
             "db.flushAllValkey",

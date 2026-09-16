@@ -16,6 +16,7 @@ pub mod error;
 pub mod filesystem;
 pub mod ingress;
 pub mod maria_drop;
+pub mod maria_slow_log;
 pub mod maria_user;
 pub mod meilisearch_upgrade;
 pub mod mutation;

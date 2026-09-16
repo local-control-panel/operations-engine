@@ -1,5 +1,5 @@
 //! The `ingress.reconcile` operation (Milestone 002,
-//! `docs/milestones/002-ingress-reconcile.md`): a whole-`ingressRoot` sweep
+//! docs repo milestone `002-ingress-reconcile.md`): a whole-`ingressRoot` sweep
 //! that removes orphaned `.tmp`/`.tmp-*` staging siblings and resolves
 //! orphaned `.rollback-*` backup siblings left behind by an
 //! `ingress.activateConfig`/`ingress.park`/`ingress.unpark` attempt that
@@ -275,7 +275,7 @@ pub fn execute(
 /// `pub(crate)`: also reused verbatim by `runtime_config::reconcile`, which
 /// shares this exact `.tmp`/`.rollback-<suffix>` naming convention (see
 /// `runtime_config::activate::RoutePaths`) - see
-/// `docs/milestones/003-runtime-reconcile.md`'s "Scope" section for why
+/// docs repo milestone `003-runtime-reconcile.md`'s "Scope" section for why
 /// duplicating this classification logic there would be wrong, not just
 /// redundant.
 pub(crate) fn is_temp_file(name: &str) -> bool {

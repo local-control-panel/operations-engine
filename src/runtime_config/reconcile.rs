@@ -1,5 +1,5 @@
 //! The `runtime.reconcile` operation (Milestone 003,
-//! `docs/milestones/003-runtime-reconcile.md`): sweeps one runtime pool's
+//! docs repo milestone `003-runtime-reconcile.md`): sweeps one runtime pool's
 //! `<runtime_id>/` subdirectory of `runtimeRoot` for orphaned `.tmp`/
 //! `.tmp-*` staging siblings and orphaned `.rollback-*` backup siblings left
 //! behind by a `runtime.activateConfig` attempt that never reached its own
