@@ -19,6 +19,11 @@ pub enum OutputFormat {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Backup artifact operations.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommand,
+    },
     /// Print engine and protocol version information.
     Version,
 
@@ -89,6 +94,7 @@ impl Command {
             Self::Version => "version",
             Self::Capabilities => "capabilities",
             Self::Doctor => "doctor",
+            Self::Backup { command } => command.operation(),
             Self::Site { command } => command.operation(),
             Self::Engine { command } => command.operation(),
             Self::Ingress { command } => command.operation(),
@@ -128,6 +134,27 @@ impl MeilisearchCommand {
         match self {
             Self::Upgrade { .. } => "meilisearch.upgrade",
             Self::Cleanup => "meilisearch.cleanup",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BackupCommand {
+    /// Delete one file constrained beneath the managed backup root.
+    Delete {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl BackupCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Delete { .. } => "backup.delete",
         }
     }
 }
@@ -539,6 +566,11 @@ impl CronCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum DbCommand {
+    /// Export a database through a fixed client invocation.
+    Export {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+    },
     /// Converge a protected database administration tool container.
     ToolConverge {
         #[arg(long = "request-file")]
@@ -566,6 +598,51 @@ pub enum DbCommand {
         #[arg(long = "request-id")]
         request_id: String,
 
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Drop a non-system MariaDB database through a fixed client invocation.
+    DropMariadb {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Drop a non-system MariaDB account through a fixed client invocation.
+    DropMariadbUser {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Delete one bounded Valkey key without placing it in process argv.
+    DeleteValkeyKey {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Asynchronously flush the selected Valkey database after explicit confirmation.
+    FlushValkeyDb {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Asynchronously flush every Valkey database after explicit confirmation.
+    FlushAllValkey {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
@@ -649,9 +726,15 @@ pub enum DbTypeArg {
 impl DbCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::Export { .. } => "db.export",
             Self::ToolConverge { .. } => "dbTool.converge",
             Self::ToolRemove { .. } => "dbTool.remove",
             Self::ProvisionMariadb { .. } => "db.provisionMariaDb",
+            Self::DropMariadb { .. } => "db.dropMariaDb",
+            Self::DropMariadbUser { .. } => "db.dropMariaDbUser",
+            Self::DeleteValkeyKey { .. } => "db.deleteValkeyKey",
+            Self::FlushValkeyDb { .. } => "db.flushValkeyDb",
+            Self::FlushAllValkey { .. } => "db.flushAllValkey",
             Self::ProvisionPostgres { .. } => "db.provisionPostgres",
             Self::DropPostgres { .. } => "db.dropPostgres",
             Self::ProvisionPostgresUser { .. } => "db.provisionPostgresUser",

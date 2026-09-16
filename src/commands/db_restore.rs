@@ -1,6 +1,7 @@
 use crate::{
     cli::{DbCommand, DbTypeArg},
     commands::{ContentFileError, read_root_owned_content_file},
+    db_export::{self, OPERATION as EXPORT_OPERATION},
     db_provision::{
         OPERATION as PROVISION_OPERATION, ProvisionRequest, RequestError as ProvisionRequestError,
         execute::{ProvisionContext, ProvisionError, execute as execute_provision},
@@ -16,6 +17,21 @@ use crate::{
         remove::{Context as RemoveContext, Error as RemoveError, execute as execute_remove},
     },
     error::{ErrorCode, WarningCode},
+    maria_drop::{
+        OPERATION as MARIA_DROP_OPERATION, Request as MariaDropRequest,
+        RequestError as MariaDropRequestError,
+        execute::{
+            Context as MariaDropContext, Error as MariaDropError, execute as execute_maria_drop,
+        },
+    },
+    maria_user::{
+        DROP_OPERATION as MARIA_USER_DROP_OPERATION, DropRequest as MariaUserDropRequest,
+        RequestError as MariaUserRequestError,
+        drop::{
+            Context as MariaUserDropContext, Error as MariaUserDropError,
+            execute as execute_maria_user_drop,
+        },
+    },
     pg_drop::{
         OPERATION as PG_DROP_OPERATION, Request as PgDropRequest,
         RequestError as PgDropRequestError,
@@ -40,12 +56,31 @@ use crate::{
     },
     process::CancellationToken,
     protocol::{Response, ResponseBuildError, Warning},
+    valkey::{
+        DELETE_OPERATION as VALKEY_DELETE_OPERATION, DeleteRequest as ValkeyDeleteRequest,
+        FLUSH_ALL_OPERATION as VALKEY_FLUSH_ALL_OPERATION,
+        FLUSH_DB_OPERATION as VALKEY_FLUSH_DB_OPERATION, FlushAllRequest, FlushDbRequest,
+        RequestError as ValkeyRequestError,
+        delete::{
+            Context as ValkeyDeleteContext, Error as ValkeyDeleteError,
+            execute as execute_valkey_delete,
+        },
+        flush::{
+            Context as ValkeyFlushContext, Error as ValkeyFlushError,
+            execute as execute_valkey_flush,
+        },
+        flush_all::{
+            Context as ValkeyFlushAllContext, Error as ValkeyFlushAllError,
+            execute as execute_valkey_flush_all,
+        },
+    },
 };
 
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        DbCommand::Export { request_file } => export(&request_file),
         DbCommand::ToolConverge {
             request_file,
             request_id,
@@ -61,6 +96,31 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => provision_mariadb(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::DropMariadb {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => drop_mariadb(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::DropMariadbUser {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => drop_mariadb_user(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::DeleteValkeyKey {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => delete_valkey_key(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::FlushValkeyDb {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => flush_valkey_db(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::FlushAllValkey {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => flush_all_valkey(&request_file, &request_id, idempotency_key.as_deref()),
         DbCommand::ProvisionPostgres {
             request_file,
             request_id,
@@ -98,6 +158,476 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn export(path: &std::path::Path) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    EXPORT_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match db_export::Request::parse(&json) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    EXPORT_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "database export request is invalid",
+                ));
+            }
+        };
+        match db_export::execute(&request, "docker") {
+            Ok(result) => Response::success(EXPORT_OPERATION, result),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(EXPORT_OPERATION, code, message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(Response::failure(
+            EXPORT_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.export requires a Unix host",
+        ))
+    }
+}
+
+fn flush_all_valkey(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_ALL_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_ALL_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match FlushAllRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_ALL_OPERATION,
+                    ErrorCode::InvalidInput,
+                    valkey_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_ALL_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_valkey_flush_all(
+            &ValkeyFlushAllContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(VALKEY_FLUSH_ALL_OPERATION, value),
+            Err(ValkeyFlushAllError::PostCommit { result }) => {
+                Response::success(VALKEY_FLUSH_ALL_OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(
+                    VALKEY_FLUSH_ALL_OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            VALKEY_FLUSH_ALL_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.flushAllValkey requires a Unix host",
+        ))
+    }
+}
+
+fn flush_valkey_db(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_DB_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_DB_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match FlushDbRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_DB_OPERATION,
+                    ErrorCode::InvalidInput,
+                    valkey_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_FLUSH_DB_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_valkey_flush(
+            &ValkeyFlushContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(VALKEY_FLUSH_DB_OPERATION, value),
+            Err(ValkeyFlushError::PostCommit { result }) => {
+                Response::success(VALKEY_FLUSH_DB_OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(VALKEY_FLUSH_DB_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            VALKEY_FLUSH_DB_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.flushValkeyDb requires a Unix host",
+        ))
+    }
+}
+
+fn delete_valkey_key(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_DELETE_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_DELETE_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match ValkeyDeleteRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Response::failure(
+                    VALKEY_DELETE_OPERATION,
+                    ErrorCode::InvalidInput,
+                    valkey_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    VALKEY_DELETE_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_valkey_delete(
+            &ValkeyDeleteContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(VALKEY_DELETE_OPERATION, value),
+            Err(ValkeyDeleteError::PostCommit { result }) => {
+                Response::success(VALKEY_DELETE_OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(VALKEY_DELETE_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            VALKEY_DELETE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.deleteValkeyKey requires a Unix host",
+        ))
+    }
+}
+
+fn valkey_error_message(error: ValkeyRequestError) -> &'static str {
+    match error {
+        ValkeyRequestError::InvalidJson => "request-file is not a valid Valkey key deletion plan",
+        ValkeyRequestError::InvalidContainer => "container is invalid",
+        ValkeyRequestError::InvalidKey => "key is empty or exceeds the size limit",
+        ValkeyRequestError::InvalidFlushDbConfirmation => "confirmation must be exactly FLUSHDB",
+        ValkeyRequestError::InvalidFlushAllConfirmation => "confirmation must be exactly FLUSHALL",
+        ValkeyRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        ValkeyRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+fn drop_mariadb_user(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_USER_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_USER_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match MariaUserDropRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Response::failure(
+                    MARIA_USER_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    maria_user_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_USER_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_maria_user_drop(
+            &MariaUserDropContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(MARIA_USER_DROP_OPERATION, value),
+            Err(MariaUserDropError::PostCommit { result }) => {
+                Response::success(MARIA_USER_DROP_OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(MARIA_USER_DROP_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            MARIA_USER_DROP_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.dropMariaDbUser requires a Unix host",
+        ))
+    }
+}
+
+fn maria_user_error_message(error: MariaUserRequestError) -> &'static str {
+    match error {
+        MariaUserRequestError::InvalidJson => {
+            "request-file is not a valid MariaDB user removal plan"
+        }
+        MariaUserRequestError::InvalidContainer => "container is invalid",
+        MariaUserRequestError::InvalidUser => "user is invalid",
+        MariaUserRequestError::ProtectedUser => "protected MariaDB users cannot be removed",
+        MariaUserRequestError::InvalidHost => "host is invalid",
+        MariaUserRequestError::InvalidSecret => "root password is invalid",
+        MariaUserRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        MariaUserRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+fn drop_mariadb(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match MariaDropRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(Response::failure(
+                    MARIA_DROP_OPERATION,
+                    ErrorCode::InvalidInput,
+                    maria_drop_error_message(error),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    MARIA_DROP_OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match execute_maria_drop(
+            &MariaDropContext {
+                engine_state: &state,
+                docker_program: "docker",
+            },
+            &request,
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(MARIA_DROP_OPERATION, value),
+            Err(MariaDropError::PostCommit { result }) => {
+                Response::success(MARIA_DROP_OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(MARIA_DROP_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            MARIA_DROP_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "db.dropMariaDb requires a Unix host",
+        ))
+    }
+}
+
+fn maria_drop_error_message(error: MariaDropRequestError) -> &'static str {
+    match error {
+        MariaDropRequestError::InvalidJson => "request-file is not a valid MariaDB removal plan",
+        MariaDropRequestError::InvalidContainer => "container is invalid",
+        MariaDropRequestError::InvalidDatabase => "database is invalid",
+        MariaDropRequestError::ProtectedDatabase => "system databases cannot be removed",
+        MariaDropRequestError::InvalidSecret => "root password is invalid",
+        MariaDropRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        MariaDropRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
 }
 

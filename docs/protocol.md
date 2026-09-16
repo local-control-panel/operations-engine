@@ -115,6 +115,69 @@ The root password and generated SQL are delivered to a fixed MariaDB client
 command over stdin; neither appears in host process argv, protocol envelopes,
 audit records, or subprocess diagnostics.
 
+## `db.dropMariaDb`
+
+`db drop-mariadb` accepts a root-owned JSON request containing a validated
+container name, database identifier and MariaDB root password. The system
+schemas `mysql`, `information_schema`, `performance_schema` and `sys` are
+rejected case-insensitively. The password and generated `DROP DATABASE`
+statement travel only over stdin. Per-database mutation state provides
+locking, idempotent replay and an append-only audit record.
+
+## `db.export`
+
+`db export` accepts a root-owned JSON request containing the database type,
+validated database/container identifiers and root credential. It invokes only
+the fixed MariaDB or PostgreSQL dump argv and returns UTF-8 SQL in the result.
+The response is capped at 64 MiB and the subprocess at five minutes; truncated,
+failed or non-UTF-8 output is rejected rather than returned as a partial dump.
+
+## `db.dropMariaDbUser`
+
+`db drop-mariadb-user` accepts a root-owned JSON request containing a validated
+container name, MariaDB account name, host and root password. The engine
+rejects `root`, `mysql`, `mariadb.sys` and `healthcheck` accounts
+case-insensitively. The password and generated `DROP USER` statement travel
+only over stdin; the account name and host contain no SQL quoting characters.
+Each `user@host` account has an independent mutation lock, idempotency state
+and audit trail.
+
+## `db.deleteValkeyKey`
+
+`db delete-valkey-key` accepts a root-owned JSON request containing a validated
+container name and one non-empty Valkey key of at most 4096 UTF-8 bytes. The
+key is sent verbatim over stdin to the fixed `valkey-cli -x DEL` invocation and
+never appears in process argv, transaction results or audit records. Lock and
+transaction state are scoped by the key's SHA-256 digest. The result reports
+whether the key existed and was deleted.
+
+## `db.flushValkeyDb`
+
+`db flush-valkey-db` accepts a root-owned JSON request containing a validated
+container name and the exact confirmation token `FLUSHDB`. The engine rejects
+missing, differently-cased or broader tokens before execution, then invokes
+only the fixed `valkey-cli FLUSHDB ASYNC` argv. Per-container locking,
+idempotency, transaction state and audit records prevent overlapping or
+ambiguous retries. The operation never exposes a generic Valkey command.
+
+## `db.flushAllValkey`
+
+`db flush-all-valkey` accepts a root-owned JSON request containing a validated
+container name and the exact confirmation token `FLUSHALL`. `FLUSHDB` and all
+other variants are rejected before execution. The engine invokes only the
+fixed `valkey-cli FLUSHALL ASYNC` argv and serializes the host-wide mutation
+with its own per-container lock, idempotency state and audit trail.
+
+## `backup.delete`
+
+`backup delete` accepts a root-owned JSON request naming one `.sql` or
+`.sql.gz` artifact beneath the fixed `/root/db-backups` root. The engine strips
+that exact prefix, validates the remainder as a normal relative path and
+deletes through an opened directory capability. It cannot delete a directory
+or escape through traversal or symlink resolution. Missing files are an
+idempotent success reported as `deleted: false`; transaction scope stores only
+a SHA-256 digest of the relative path.
+
 ## `db.provisionPostgres`
 
 `db provision-postgres` accepts a root-owned JSON request containing a

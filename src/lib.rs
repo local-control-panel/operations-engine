@@ -1,9 +1,12 @@
+pub mod backup_delete;
+pub mod backup_deploy;
 pub mod cli;
 pub mod commands;
 pub mod compose;
 pub mod compose_config;
 pub mod config;
 pub mod cron;
+pub mod db_export;
 pub mod db_provision;
 pub mod db_restore;
 pub mod db_tool;
@@ -12,6 +15,8 @@ pub mod engine;
 pub mod error;
 pub mod filesystem;
 pub mod ingress;
+pub mod maria_drop;
+pub mod maria_user;
 pub mod meilisearch_upgrade;
 pub mod mutation;
 pub mod permissions;
@@ -24,6 +29,7 @@ pub mod rollback;
 pub mod runtime_config;
 pub mod site;
 pub mod transaction;
+pub mod valkey;
 
 use cli::{Cli, Command};
 use error::ErrorCode;
@@ -33,6 +39,7 @@ pub fn execute(cli: Cli) -> Response {
     let operation = cli.command.operation();
     let response = match cli.command {
         Command::Version => commands::version::run(),
+        Command::Backup { command } => commands::backup::run(command),
         Command::Capabilities => commands::capabilities::run(),
         Command::Doctor => commands::doctor::run(),
         Command::Site { command } => commands::site::run(command),
