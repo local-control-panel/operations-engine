@@ -138,7 +138,7 @@ pub fn execute(
             request.database.as_str().into(),
         ]),
     }
-    let output = process::run_with_stdout_file(
+    let output = match process::run_with_stdout_file(
         &ProcessRequest::new(docker_program).args(args),
         file,
         &ProcessLimits {
@@ -147,8 +147,13 @@ pub fn execute(
             max_stderr_bytes: 64 * 1024,
         },
         cancel,
-    )
-    .map_err(ExecuteError::Run)?;
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = backup_root.remove_file(&temp_path);
+            return Err(ExecuteError::Run(error));
+        }
+    };
     if !matches!(
         output.termination,
         ProcessTermination::Exited { success: true, .. }
@@ -159,9 +164,10 @@ pub fn execute(
             &output,
         )));
     }
-    backup_root
-        .rename(&temp_path, &final_path)
-        .map_err(ExecuteError::Io)?;
+    if let Err(error) = backup_root.rename(&temp_path, &final_path) {
+        let _ = backup_root.remove_file(&temp_path);
+        return Err(ExecuteError::Io(error));
+    }
     let mut pruned = 0;
     if request.retention_days > 0 {
         let cutoff =
