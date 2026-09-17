@@ -16,8 +16,18 @@ pub struct Request {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestError {
     InvalidJson,
+    InvalidConfigJson,
     EmptyAgent,
+    InvalidAgent,
+    InvalidCrontab,
     ContentTooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Artifact<'a> {
+    pub relative_path: &'static str,
+    pub content: &'a str,
+    pub mode: u32,
 }
 
 impl Request {
@@ -25,6 +35,19 @@ impl Request {
         let request: Self = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
         if request.agent_script.trim().is_empty() {
             return Err(RequestError::EmptyAgent);
+        }
+        for content in [&request.backup_config, &request.notify_config] {
+            let value: serde_json::Value =
+                serde_json::from_str(content).map_err(|_| RequestError::InvalidConfigJson)?;
+            if !value.is_object() {
+                return Err(RequestError::InvalidConfigJson);
+            }
+        }
+        if !request.agent_script.starts_with("#!/") || request.agent_script.contains('\0') {
+            return Err(RequestError::InvalidAgent);
+        }
+        if request.crontab.contains('\0') || !request.crontab.is_ascii() {
+            return Err(RequestError::InvalidCrontab);
         }
         let total = request.rclone_config.len()
             + request.backup_config.len()
@@ -35,6 +58,31 @@ impl Request {
             return Err(RequestError::ContentTooLarge);
         }
         Ok(request)
+    }
+
+    pub fn artifacts(&self) -> [Artifact<'_>; 4] {
+        [
+            Artifact {
+                relative_path: "rclone.conf",
+                content: &self.rclone_config,
+                mode: 0o600,
+            },
+            Artifact {
+                relative_path: "backup.conf",
+                content: &self.backup_config,
+                mode: 0o600,
+            },
+            Artifact {
+                relative_path: "notify.conf",
+                content: &self.notify_config,
+                mode: 0o600,
+            },
+            Artifact {
+                relative_path: "agents/backup-agent.sh",
+                content: &self.agent_script,
+                mode: 0o700,
+            },
+        ]
     }
 }
 
@@ -52,6 +100,16 @@ mod tests {
             "crontab":"0 2 * * * /root/.wcp/agents/backup-agent.sh\n"
         });
         assert!(Request::parse(&valid.to_string()).is_ok());
+        let parsed = Request::parse(&valid.to_string()).unwrap();
+        assert_eq!(
+            parsed.artifacts().map(|a| (a.relative_path, a.mode)),
+            [
+                ("rclone.conf", 0o600),
+                ("backup.conf", 0o600),
+                ("notify.conf", 0o600),
+                ("agents/backup-agent.sh", 0o700),
+            ]
+        );
         let empty = serde_json::json!({
             "rcloneConfig":"",
             "backupConfig":"{}",
@@ -62,6 +120,22 @@ mod tests {
         assert!(matches!(
             Request::parse(&empty.to_string()),
             Err(RequestError::EmptyAgent)
+        ));
+        let malformed_config = serde_json::json!({
+            "rcloneConfig":"", "backupConfig":"[]", "notifyConfig":"{}",
+            "agentScript":"#!/bin/sh\nexit 0", "crontab":""
+        });
+        assert!(matches!(
+            Request::parse(&malformed_config.to_string()),
+            Err(RequestError::InvalidConfigJson)
+        ));
+        let unsafe_agent = serde_json::json!({
+            "rcloneConfig":"", "backupConfig":"{}", "notifyConfig":"{}",
+            "agentScript":"echo no shebang", "crontab":""
+        });
+        assert!(matches!(
+            Request::parse(&unsafe_agent.to_string()),
+            Err(RequestError::InvalidAgent)
         ));
     }
 }
