@@ -123,6 +123,17 @@ impl ManagedRoot {
         )
     }
 
+    #[cfg(unix)]
+    pub fn mode(&self, path: &SiteRelativePath) -> io::Result<u32> {
+        use cap_std::fs::PermissionsExt;
+        Ok(self
+            .directory
+            .metadata(path.as_path())?
+            .permissions()
+            .mode()
+            & 0o777)
+    }
+
     pub fn remove_file(&self, path: &SiteRelativePath) -> io::Result<()> {
         self.directory.remove_file(path.as_path())
     }

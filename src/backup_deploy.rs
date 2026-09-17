@@ -33,6 +33,31 @@ pub struct Artifact<'a> {
     pub mode: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArtifactSpec {
+    pub relative_path: &'static str,
+    pub mode: u32,
+}
+
+pub const ARTIFACTS: [ArtifactSpec; 4] = [
+    ArtifactSpec {
+        relative_path: "rclone.conf",
+        mode: 0o600,
+    },
+    ArtifactSpec {
+        relative_path: "backup.conf",
+        mode: 0o600,
+    },
+    ArtifactSpec {
+        relative_path: "notify.conf",
+        mode: 0o600,
+    },
+    ArtifactSpec {
+        relative_path: "agents/backup-agent.sh",
+        mode: 0o700,
+    },
+];
+
 impl Request {
     pub fn parse(json: &str) -> Result<Self, RequestError> {
         let request: Self = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
@@ -66,24 +91,24 @@ impl Request {
     pub fn artifacts(&self) -> [Artifact<'_>; 4] {
         [
             Artifact {
-                relative_path: "rclone.conf",
+                relative_path: ARTIFACTS[0].relative_path,
                 content: &self.rclone_config,
-                mode: 0o600,
+                mode: ARTIFACTS[0].mode,
             },
             Artifact {
-                relative_path: "backup.conf",
+                relative_path: ARTIFACTS[1].relative_path,
                 content: &self.backup_config,
-                mode: 0o600,
+                mode: ARTIFACTS[1].mode,
             },
             Artifact {
-                relative_path: "notify.conf",
+                relative_path: ARTIFACTS[2].relative_path,
                 content: &self.notify_config,
-                mode: 0o600,
+                mode: ARTIFACTS[2].mode,
             },
             Artifact {
-                relative_path: "agents/backup-agent.sh",
+                relative_path: ARTIFACTS[3].relative_path,
                 content: &self.agent_script,
-                mode: 0o700,
+                mode: ARTIFACTS[3].mode,
             },
         ]
     }
