@@ -44,6 +44,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "db.dropMariaDb",
                 "db.dropMariaDbUser",
                 "db.clearMariaSlowLog",
+                "db.configureMariaSlowLog",
                 "db.deleteValkeyKey",
                 "db.flushValkeyDb",
                 "db.flushAllValkey",

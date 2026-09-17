@@ -151,6 +151,15 @@ configured log path and enabled state, disables logging, invokes only the fixed
 previous enabled state. The path never enters a shell command. Requests have
 idempotent transaction state and an append-only audit record.
 
+## `db.configureMariaSlowLog`
+
+`db configure-mariadb-slow-log` accepts a root-owned request containing a
+validated container, root credential, enabled flag and optional finite
+`longQueryTime` in the inclusive `0..=3600` range. When enabling, the threshold
+is applied before the log is enabled; disabling ignores the optional threshold.
+The fixed MariaDB argv runs under the same per-container lock namespace as
+`db.clearMariaSlowLog`, with idempotent transaction state and audit records.
+
 ## `db.deleteValkeyKey`
 
 `db delete-valkey-key` accepts a root-owned JSON request containing a validated

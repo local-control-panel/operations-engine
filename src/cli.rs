@@ -628,6 +628,15 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Enable or disable MariaDB slow logging with an optional threshold.
+    ConfigureMariadbSlowLog {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Delete one bounded Valkey key without placing it in process argv.
     DeleteValkeyKey {
         #[arg(long = "request-file")]
@@ -742,6 +751,7 @@ impl DbCommand {
             Self::DropMariadb { .. } => "db.dropMariaDb",
             Self::DropMariadbUser { .. } => "db.dropMariaDbUser",
             Self::ClearMariadbSlowLog { .. } => "db.clearMariaSlowLog",
+            Self::ConfigureMariadbSlowLog { .. } => "db.configureMariaSlowLog",
             Self::DeleteValkeyKey { .. } => "db.deleteValkeyKey",
             Self::FlushValkeyDb { .. } => "db.flushValkeyDb",
             Self::FlushAllValkey { .. } => "db.flushAllValkey",
