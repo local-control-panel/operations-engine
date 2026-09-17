@@ -114,6 +114,15 @@ impl ManagedRoot {
             .map(cap_std::time::SystemTime::into_std)
     }
 
+    #[cfg(unix)]
+    pub fn set_mode(&self, path: &SiteRelativePath, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        self.directory.set_permissions(
+            path.as_path(),
+            cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(mode)),
+        )
+    }
+
     pub fn remove_file(&self, path: &SiteRelativePath) -> io::Result<()> {
         self.directory.remove_file(path.as_path())
     }

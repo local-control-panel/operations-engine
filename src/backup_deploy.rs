@@ -1,5 +1,8 @@
 use serde::Deserialize;
 
+#[cfg(unix)]
+pub mod staging;
+
 pub const OPERATION: &str = "backup.activateConfig";
 pub const MAX_CONTENT_BYTES: usize = 1024 * 1024;
 
