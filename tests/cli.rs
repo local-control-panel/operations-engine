@@ -73,7 +73,8 @@ fn capabilities_describe_only_implemented_operations() {
             "meilisearch.upgrade",
             "meilisearch.cleanup",
             "permissions.fixOwnership",
-            "permissions.fixWorldWritable"
+            "permissions.fixWorldWritable",
+            "wordpress.cleanup"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

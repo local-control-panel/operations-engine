@@ -32,6 +32,7 @@ pub mod runtime_config;
 pub mod site;
 pub mod transaction;
 pub mod valkey;
+pub mod wordpress;
 
 use cli::{Cli, Command};
 use error::ErrorCode;
@@ -53,6 +54,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Compose { command } => commands::compose_config::run(command),
         Command::Meilisearch { command } => commands::meilisearch::run(command),
         Command::Permissions { command } => commands::permissions::run(command),
+        Command::Wordpress { command } => commands::wordpress::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

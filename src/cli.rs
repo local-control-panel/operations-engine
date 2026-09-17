@@ -86,6 +86,12 @@ pub enum Command {
         #[command(subcommand)]
         command: PermissionsCommand,
     },
+
+    /// Bounded WordPress application operations.
+    Wordpress {
+        #[command(subcommand)]
+        command: WordpressCommand,
+    },
 }
 
 impl Command {
@@ -104,6 +110,24 @@ impl Command {
             Self::Compose { command } => command.operation(),
             Self::Meilisearch { command } => command.operation(),
             Self::Permissions { command } => command.operation(),
+            Self::Wordpress { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WordpressCommand {
+    /// Run one developer-defined cleanup action as the site's container user.
+    Cleanup {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+    },
+}
+
+impl WordpressCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Cleanup { .. } => "wordpress.cleanup",
         }
     }
 }

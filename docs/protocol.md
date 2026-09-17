@@ -206,6 +206,15 @@ completion atomically renames it to `<database>_<unix-seconds>.sql`, while a
 failed or cancelled dump removes the temporary artifact. Retention deletes
 only older `.sql` files carrying the same validated database prefix.
 
+## `wordpress.cleanup`
+
+`wordpress cleanup` accepts a root-owned JSON request selecting one of four
+fixed cleanup actions together with a validated runtime container, WordPress
+root and site UID/GID. The root must be beneath a configured content root. The
+engine invokes `docker exec` with a fixed argv and passes the developer-owned
+PHP fragment as one argument to `wp eval`; no caller-controlled command text
+is interpreted by a shell.
+
 ## `db.provisionPostgres`
 
 `db provision-postgres` accepts a root-owned JSON request containing a

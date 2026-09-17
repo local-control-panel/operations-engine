@@ -60,6 +60,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "meilisearch.cleanup",
                 "permissions.fixOwnership",
                 "permissions.fixWorldWritable",
+                "wordpress.cleanup",
             ],
             output_formats: ["json"],
             features: Features {

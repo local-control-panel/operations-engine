@@ -11,6 +11,7 @@ pub mod permissions;
 pub mod runtime_config;
 pub mod site;
 pub mod version;
+pub mod wordpress;
 
 use crate::ingress::MAX_CONTENT_BYTES;
 
