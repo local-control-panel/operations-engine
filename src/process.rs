@@ -313,6 +313,56 @@ pub fn run_with_stdin_file(
     spawn_and_supervise(command, limits, cancellation)
 }
 
+/// Streams stdout into an already-opened file descriptor while retaining the
+/// same timeout/cancellation supervision and bounded stderr capture as `run`.
+pub fn run_with_stdout_file(
+    request: &ProcessRequest,
+    stdout_file: std::fs::File,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
+    let mut command = build_command(request);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(ProcessRunError::Spawn)?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(ProcessRunError::MissingPipe("stderr"))?;
+    let stderr_limit = limits.max_stderr_bytes;
+    let stderr_thread = thread::spawn(move || capture(stderr, stderr_limit));
+    let started = Instant::now();
+    let termination = loop {
+        if cancellation.is_cancelled() {
+            child.kill().map_err(ProcessRunError::Wait)?;
+            child.wait().map_err(ProcessRunError::Wait)?;
+            break ProcessTermination::Cancelled;
+        }
+        if started.elapsed() >= limits.timeout {
+            child.kill().map_err(ProcessRunError::Wait)?;
+            child.wait().map_err(ProcessRunError::Wait)?;
+            break ProcessTermination::TimedOut;
+        }
+        if let Some(status) = child.try_wait().map_err(ProcessRunError::Wait)? {
+            break ProcessTermination::Exited {
+                code: status.code(),
+                success: status.success(),
+            };
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    Ok(ProcessOutput {
+        termination,
+        stdout: CapturedOutput {
+            bytes: Vec::new(),
+            truncated: false,
+        },
+        stderr: join_capture(stderr_thread)?,
+    })
+}
+
 /// Feeds a bounded request body through stdin so secret-bearing input does not
 /// appear in the child process argument list.
 pub fn run_with_stdin_bytes(

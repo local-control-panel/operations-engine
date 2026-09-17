@@ -1,3 +1,4 @@
+pub mod backup_create;
 pub mod backup_delete;
 pub mod backup_deploy;
 pub mod cli;

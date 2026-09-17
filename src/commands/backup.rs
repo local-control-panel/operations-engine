@@ -1,4 +1,5 @@
 use crate::{
+    backup_create,
     backup_delete::{
         BACKUP_ROOT, OPERATION, Request, RequestError,
         execute::{Context, Error, execute},
@@ -14,11 +15,109 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        BackupCommand::CreateDatabase {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => create_database(&request_file, &request_id, idempotency_key.as_deref()),
         BackupCommand::Delete {
             request_file,
             request_id,
             idempotency_key,
         } => delete(&request_file, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn create_database(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot, site::TrustedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_create::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_create::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match backup_create::Request::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_create::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file is not a valid database backup plan",
+                ));
+            }
+        };
+        let _state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_create::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        if std::fs::create_dir_all(BACKUP_ROOT).is_err() {
+            return Ok(Response::failure(
+                backup_create::OPERATION,
+                ErrorCode::Internal,
+                "backup root is unavailable",
+            ));
+        }
+        let backup_root =
+            match TrustedRoot::parse(std::path::Path::new(BACKUP_ROOT)).and_then(|root| {
+                ManagedRoot::open(&root)
+                    .map_err(|_| crate::site::ValidationError::PathResolutionFailed)
+            }) {
+                Ok(value) => value,
+                Err(_) => {
+                    return Ok(Response::failure(
+                        backup_create::OPERATION,
+                        ErrorCode::Internal,
+                        "backup root is unavailable",
+                    ));
+                }
+            };
+        match backup_create::execute(
+            &request,
+            &backup_root,
+            "docker",
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(backup_create::OPERATION, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(backup_create::OPERATION, code, message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            backup_create::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.createDatabase requires a Unix host",
+        ))
     }
 }
 

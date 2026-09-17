@@ -140,6 +140,15 @@ impl MeilisearchCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum BackupCommand {
+    /// Stream a database dump into the managed backup root.
+    CreateDatabase {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Delete one file constrained beneath the managed backup root.
     Delete {
         #[arg(long = "request-file")]
@@ -154,6 +163,7 @@ pub enum BackupCommand {
 impl BackupCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::CreateDatabase { .. } => "backup.createDatabase",
             Self::Delete { .. } => "backup.delete",
         }
     }

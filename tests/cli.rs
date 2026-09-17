@@ -41,6 +41,7 @@ fn capabilities_describe_only_implemented_operations() {
             "capabilities",
             "doctor",
             "backup.delete",
+            "backup.createDatabase",
             "site.deploy",
             "site.rollback",
             "engine.install",

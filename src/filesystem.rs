@@ -95,6 +95,25 @@ impl ManagedRoot {
         file.write_all(contents)
     }
 
+    /// Opens a brand-new file beneath this capability root for streaming
+    /// content directly into it. The exclusive create prevents accidental
+    /// replacement of an existing artifact.
+    pub fn create_new_file(&self, path: &SiteRelativePath) -> io::Result<std::fs::File> {
+        self.directory
+            .open_with(
+                path.as_path(),
+                OpenOptions::new().write(true).create_new(true),
+            )
+            .map(cap_std::fs::File::into_std)
+    }
+
+    pub fn modified(&self, path: &SiteRelativePath) -> io::Result<std::time::SystemTime> {
+        self.directory
+            .metadata(path.as_path())?
+            .modified()
+            .map(cap_std::time::SystemTime::into_std)
+    }
+
     pub fn remove_file(&self, path: &SiteRelativePath) -> io::Result<()> {
         self.directory.remove_file(path.as_path())
     }

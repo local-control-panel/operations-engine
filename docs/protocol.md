@@ -196,6 +196,16 @@ or escape through traversal or symlink resolution. Missing files are an
 idempotent success reported as `deleted: false`; transaction scope stores only
 a SHA-256 digest of the relative path.
 
+## `backup.createDatabase`
+
+`backup create-database` accepts a root-owned JSON request containing a
+validated database type/name, container, root password and retention window.
+The fixed `mariadb-dump` or `pg_dump` argv streams stdout directly into an
+exclusively-created temporary file beneath `/root/db-backups`; successful
+completion atomically renames it to `<database>_<unix-seconds>.sql`, while a
+failed or cancelled dump removes the temporary artifact. Retention deletes
+only older `.sql` files carrying the same validated database prefix.
+
 ## `db.provisionPostgres`
 
 `db provision-postgres` accepts a root-owned JSON request containing a
