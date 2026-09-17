@@ -92,6 +92,12 @@ pub enum Command {
         #[command(subcommand)]
         command: WordpressCommand,
     },
+
+    /// Configuration for bundled host agents.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
 }
 
 impl Command {
@@ -111,6 +117,24 @@ impl Command {
             Self::Meilisearch { command } => command.operation(),
             Self::Permissions { command } => command.operation(),
             Self::Wordpress { command } => command.operation(),
+            Self::Agent { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    /// Atomically replace the typed brute-force guard configuration.
+    ActivateBruteforceConfig {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+    },
+}
+
+impl AgentCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::ActivateBruteforceConfig { .. } => "agent.activateBruteforceConfig",
         }
     }
 }

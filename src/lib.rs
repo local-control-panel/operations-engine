@@ -1,3 +1,4 @@
+pub mod agent_config;
 pub mod backup_create;
 pub mod backup_delete;
 pub mod backup_deploy;
@@ -55,6 +56,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Meilisearch { command } => commands::meilisearch::run(command),
         Command::Permissions { command } => commands::permissions::run(command),
         Command::Wordpress { command } => commands::wordpress::run(command),
+        Command::Agent { command } => commands::agent::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

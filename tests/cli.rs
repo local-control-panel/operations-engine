@@ -74,7 +74,8 @@ fn capabilities_describe_only_implemented_operations() {
             "meilisearch.cleanup",
             "permissions.fixOwnership",
             "permissions.fixWorldWritable",
-            "wordpress.cleanup"
+            "wordpress.cleanup",
+            "agent.activateBruteforceConfig"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

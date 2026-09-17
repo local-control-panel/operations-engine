@@ -215,6 +215,14 @@ engine invokes `docker exec` with a fixed argv and passes the developer-owned
 PHP fragment as one argument to `wp eval`; no caller-controlled command text
 is interpreted by a shell.
 
+## `agent.activateBruteforceConfig`
+
+`agent activate-bruteforce-config` accepts a root-owned JSON request with the
+complete typed `wpLogin` and `caddy` jail configuration. Every numeric
+threshold must be within `1..=1_000_000`. The engine renders the fixed env-file
+shape itself and atomically replaces `bruteforce-config.env` through a
+directory capability rooted at `/root/.wcp`.
+
 ## `db.provisionPostgres`
 
 `db provision-postgres` accepts a root-owned JSON request containing a

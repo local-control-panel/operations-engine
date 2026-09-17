@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod backup;
 pub mod capabilities;
 pub mod compose_config;
