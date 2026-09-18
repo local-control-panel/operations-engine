@@ -29,6 +29,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "backup.delete",
                 "backup.createDatabase",
                 "backup.activateConfig",
+                "backup.triggerNow",
                 "site.deploy",
                 "site.rollback",
                 "engine.install",

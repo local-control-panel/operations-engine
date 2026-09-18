@@ -215,6 +215,14 @@ rollback, then `crontab -` is installed over stdin as the final commit step.
 The operation uses a host-wide lock, idempotent transaction state and redacted
 audit records; no submitted config or credential is persisted in engine state.
 
+## `backup.triggerNow`
+
+`backup trigger-now` accepts only a request ID and optional idempotency key; it
+has no caller-controlled command, path or payload. The engine invokes the fixed
+`bash /root/.wcp/agents/backup-agent.sh` argv with a six-hour timeout under one
+host-wide lock. Retries replay the recorded result instead of starting a second
+backup, and completion or failure is recorded in the transaction and audit log.
+
 ## `wordpress.cleanup`
 
 `wordpress cleanup` accepts a root-owned JSON request selecting one of four

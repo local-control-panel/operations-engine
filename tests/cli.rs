@@ -43,6 +43,7 @@ fn capabilities_describe_only_implemented_operations() {
             "backup.delete",
             "backup.createDatabase",
             "backup.activateConfig",
+            "backup.triggerNow",
             "site.deploy",
             "site.rollback",
             "engine.install",

@@ -197,6 +197,13 @@ pub enum BackupCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Run the installed remote-backup agent immediately.
+    TriggerNow {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Stream a database dump into the managed backup root.
     CreateDatabase {
         #[arg(long = "request-file")]
@@ -221,6 +228,7 @@ impl BackupCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateConfig { .. } => "backup.activateConfig",
+            Self::TriggerNow { .. } => "backup.triggerNow",
             Self::CreateDatabase { .. } => "backup.createDatabase",
             Self::Delete { .. } => "backup.delete",
         }

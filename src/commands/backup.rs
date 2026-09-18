@@ -4,7 +4,7 @@ use crate::{
         BACKUP_ROOT, OPERATION, Request, RequestError,
         execute::{Context, Error, execute},
     },
-    backup_deploy,
+    backup_deploy, backup_trigger,
     cli::BackupCommand,
     commands::read_root_owned_content_file,
     error::ErrorCode,
@@ -21,6 +21,10 @@ pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => activate_config(&request_file, &request_id, idempotency_key.as_deref()),
+        BackupCommand::TriggerNow {
+            request_id,
+            idempotency_key,
+        } => trigger_now(&request_id, idempotency_key.as_deref()),
         BackupCommand::CreateDatabase {
             request_file,
             request_id,
@@ -31,6 +35,66 @@ pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => delete(&request_file, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn trigger_now(request_id: &str, key: Option<&str>) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_trigger::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let request = match backup_trigger::Request::parse(request_id, key) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_trigger::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-id or idempotency-key is invalid",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_trigger::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = backup_trigger::Context {
+            engine_state: &state,
+            bash_program: "bash",
+            agent_path: backup_trigger::AGENT_PATH,
+        };
+        match backup_trigger::execute(&context, &request, &CancellationToken::default()) {
+            Ok(value) | Err(backup_trigger::Error::PostCommit { result: value }) => {
+                Response::success(backup_trigger::OPERATION, value)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(backup_trigger::OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request_id, key);
+        Ok(Response::failure(
+            backup_trigger::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.triggerNow requires a Unix host",
+        ))
     }
 }
 
