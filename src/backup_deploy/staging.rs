@@ -28,7 +28,25 @@ pub struct StagedConfig<'a> {
     directory: SiteRelativePath,
 }
 
-impl StagedConfig<'_> {
+pub struct ActivatedConfig<'a> {
+    root: &'a ManagedRoot,
+    directory: SiteRelativePath,
+    previous: Vec<Previous>,
+}
+
+impl ActivatedConfig<'_> {
+    pub fn commit(self) -> ActivationResult {
+        ActivationResult {
+            staging_cleanup_incomplete: self.root.remove_dir_all(&self.directory).is_err(),
+        }
+    }
+
+    pub fn rollback(self) -> Result<(), Error> {
+        restore(self.root, &self.previous)
+    }
+}
+
+impl<'a> StagedConfig<'a> {
     pub fn directory(&self) -> &SiteRelativePath {
         &self.directory
     }
@@ -38,6 +56,10 @@ impl StagedConfig<'_> {
     }
 
     pub fn activate(self) -> Result<ActivationResult, Error> {
+        Ok(self.activate_files()?.commit())
+    }
+
+    pub fn activate_files(self) -> Result<ActivatedConfig<'a>, Error> {
         self.root
             .create_dir_all(&SiteRelativePath::parse("agents").unwrap())
             .map_err(Error::Io)?;
@@ -85,9 +107,19 @@ impl StagedConfig<'_> {
             }
             committed.push(previous);
         }
-        Ok(ActivationResult {
-            staging_cleanup_incomplete: self.root.remove_dir_all(&self.directory).is_err(),
+        Ok(ActivatedConfig {
+            root: self.root,
+            directory: self.directory,
+            previous: committed,
         })
+    }
+}
+
+fn restore(root: &ManagedRoot, committed: &[Previous]) -> Result<(), Error> {
+    let synthetic = std::io::Error::other("activation rolled back");
+    match rollback(root, committed, synthetic) {
+        Error::Io(_) => Ok(()),
+        error => Err(error),
     }
 }
 

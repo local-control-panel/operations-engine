@@ -1,6 +1,8 @@
 use serde::Deserialize;
 
 #[cfg(unix)]
+pub mod activation;
+#[cfg(unix)]
 pub mod staging;
 
 pub const OPERATION: &str = "backup.activateConfig";
