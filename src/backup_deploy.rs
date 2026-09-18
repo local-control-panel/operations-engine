@@ -1,7 +1,10 @@
+use crate::transaction::{IdempotencyKey, RequestId};
 use serde::Deserialize;
 
 #[cfg(unix)]
 pub mod activation;
+#[cfg(unix)]
+pub mod execute;
 #[cfg(unix)]
 pub mod staging;
 
@@ -18,6 +21,12 @@ pub struct Request {
     pub crontab: String,
 }
 
+pub struct OperationRequest {
+    pub config: Request,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RequestError {
     InvalidJson,
@@ -26,6 +35,15 @@ pub enum RequestError {
     InvalidAgent,
     InvalidCrontab,
     ContentTooLarge,
+    InvalidRequestId,
+    InvalidIdempotencyKey,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivateResult {
+    pub activated_at_unix_secs: u64,
+    pub staging_cleanup_incomplete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +131,19 @@ impl Request {
                 mode: ARTIFACTS[3].mode,
             },
         ]
+    }
+}
+
+impl OperationRequest {
+    pub fn parse(json: &str, request_id: &str, key: Option<&str>) -> Result<Self, RequestError> {
+        Ok(Self {
+            config: Request::parse(json)?,
+            request_id: RequestId::parse(request_id).map_err(|_| RequestError::InvalidRequestId)?,
+            idempotency_key: key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| RequestError::InvalidIdempotencyKey)?,
+        })
     }
 }
 

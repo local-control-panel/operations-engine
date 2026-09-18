@@ -4,6 +4,7 @@ use crate::{
         BACKUP_ROOT, OPERATION, Request, RequestError,
         execute::{Context, Error, execute},
     },
+    backup_deploy,
     cli::BackupCommand,
     commands::read_root_owned_content_file,
     error::ErrorCode,
@@ -15,6 +16,11 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        BackupCommand::ActivateConfig {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => activate_config(&request_file, &request_id, idempotency_key.as_deref()),
         BackupCommand::CreateDatabase {
             request_file,
             request_id,
@@ -25,6 +31,99 @@ pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => delete(&request_file, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn activate_config(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot, site::TrustedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_deploy::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_deploy::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match backup_deploy::OperationRequest::parse(&json, request_id, key) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_deploy::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file is not a valid backup activation plan",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_deploy::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        if std::fs::create_dir_all("/root/.wcp").is_err() {
+            return Ok(Response::failure(
+                backup_deploy::OPERATION,
+                ErrorCode::Internal,
+                "backup configuration root is unavailable",
+            ));
+        }
+        let root = match TrustedRoot::parse(std::path::Path::new("/root/.wcp")).and_then(|r| {
+            ManagedRoot::open(&r).map_err(|_| crate::site::ValidationError::PathResolutionFailed)
+        }) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_deploy::OPERATION,
+                    ErrorCode::Internal,
+                    "backup configuration root is unavailable",
+                ));
+            }
+        };
+        let ctx = backup_deploy::execute::Context {
+            engine_state: &state,
+            config_root: &root,
+            crontab_program: "crontab",
+        };
+        match backup_deploy::execute::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) | Err(backup_deploy::execute::Error::PostCommit { result: v }) => {
+                Response::success(backup_deploy::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(backup_deploy::OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            backup_deploy::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.activateConfig requires a Unix host",
+        ))
     }
 }
 

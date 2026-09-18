@@ -206,6 +206,15 @@ completion atomically renames it to `<database>_<unix-seconds>.sql`, while a
 failed or cancelled dump removes the temporary artifact. Retention deletes
 only older `.sql` files carrying the same validated database prefix.
 
+## `backup.activateConfig`
+
+`backup activate-config` consumes one root-owned bounded JSON plan containing
+the three remote-backup configs, agent script and complete crontab. Four files
+are staged beneath `/root/.wcp`, activated with exact modes and reverse-order
+rollback, then `crontab -` is installed over stdin as the final commit step.
+The operation uses a host-wide lock, idempotent transaction state and redacted
+audit records; no submitted config or credential is persisted in engine state.
+
 ## `wordpress.cleanup`
 
 `wordpress cleanup` accepts a root-owned JSON request selecting one of four
