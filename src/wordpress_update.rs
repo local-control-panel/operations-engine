@@ -21,6 +21,7 @@ use std::{
 
 pub const OPERATION: &str = "wordpress.updateCore";
 pub const PLUGINS_OPERATION: &str = "wordpress.updatePlugins";
+pub const THEMES_OPERATION: &str = "wordpress.updateThemes";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -42,9 +43,20 @@ struct PluginsPlan {
     plugins: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThemesPlan {
+    container: String,
+    root: String,
+    uid: u32,
+    gid: u32,
+    themes: Vec<String>,
+}
+
 enum Update {
     Core(Option<String>),
     Plugins(Vec<String>),
+    Themes(Vec<String>),
 }
 
 pub struct Request {
@@ -135,6 +147,47 @@ impl Request {
                 .map_err(|_| RequestError)?,
         })
     }
+
+    pub fn parse_themes(
+        json: &str,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        let plan: ThemesPlan = serde_json::from_str(json).map_err(|_| RequestError)?;
+        if plan.themes.len() > 128
+            || plan.themes.iter().any(|slug| {
+                slug.is_empty()
+                    || slug.len() > 200
+                    || !slug.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+            })
+        {
+            return Err(RequestError);
+        }
+        let root = PathBuf::from(plan.root);
+        if !root.is_absolute()
+            || root.as_os_str().len() > 4096
+            || root
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(RequestError);
+        }
+        Ok(Self {
+            container: ContainerName::parse(&plan.container)
+                .map_err(|_: RestoreRequestError| RequestError)?,
+            root,
+            uid: plan.uid,
+            gid: plan.gid,
+            update: Update::Themes(plan.themes),
+            request_id: RequestId::parse(request_id).map_err(|_| RequestError)?,
+            idempotency_key: key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| RequestError)?,
+        })
+    }
     pub fn root(&self) -> &std::path::Path {
         &self.root
     }
@@ -203,6 +256,7 @@ pub fn execute(
     let operation = match req.update {
         Update::Core(_) => OPERATION,
         Update::Plugins(_) => PLUGINS_OPERATION,
+        Update::Themes(_) => THEMES_OPERATION,
     };
     let digest = Sha256::digest(req.root.as_os_str().as_encoded_bytes());
     let mut hash = String::new();
@@ -306,6 +360,15 @@ pub fn execute(
                 args.push("--all".into());
             } else {
                 args.extend(plugins.iter().cloned());
+            }
+            args
+        }
+        Update::Themes(themes) => {
+            let mut args = vec!["theme".to_owned(), "update".to_owned()];
+            if themes.is_empty() {
+                args.push("--all".into());
+            } else {
+                args.extend(themes.iter().cloned());
             }
             args
         }
@@ -472,5 +535,10 @@ mod tests {
     fn validates_bounded_plugin_slugs() {
         assert!(Request::parse_plugins(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"plugins":["woocommerce","seo_pack"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_ok());
         assert!(Request::parse_plugins(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"plugins":["bad;id"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_err());
+    }
+    #[test]
+    fn validates_bounded_theme_slugs() {
+        assert!(Request::parse_themes(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"themes":["twentytwentyfive"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_ok());
+        assert!(Request::parse_themes(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"themes":["../theme"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_err());
     }
 }

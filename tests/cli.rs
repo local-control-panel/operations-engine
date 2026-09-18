@@ -79,6 +79,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.cleanup",
             "wordpress.updateCore",
             "wordpress.updatePlugins",
+            "wordpress.updateThemes",
             "agent.activateBruteforceConfig"
         ])
     );

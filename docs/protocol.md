@@ -251,6 +251,14 @@ which maps only to the fixed `--all` flag, or at most 128 validated plugin
 slugs. A full site archive and database export must complete before the fixed
 site-UID `wp plugin update` argv runs. Plugin names never enter a shell.
 
+## `wordpress.updateThemes`
+
+`wordpress update-themes` uses the same recovery-first per-site transaction.
+It accepts an empty theme list only as the fixed `--all` mode, or at most 128
+bounded theme slugs. The full site archive and database export must complete
+before the fixed site-UID `wp theme update` argv runs; no theme name is
+interpreted by a shell.
+
 ## `agent.activateBruteforceConfig`
 
 `agent activate-bruteforce-config` accepts a root-owned JSON request with the

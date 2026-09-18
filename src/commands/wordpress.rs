@@ -19,7 +19,20 @@ pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => update_plugins(&request_file, &request_id, idempotency_key.as_deref()),
+        WordpressCommand::UpdateThemes {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => update_themes(&request_file, &request_id, idempotency_key.as_deref()),
     }
+}
+
+fn update_themes(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    update(path, request_id, key, false, true)
 }
 
 fn update_plugins(
@@ -27,7 +40,7 @@ fn update_plugins(
     request_id: &str,
     key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
-    update(path, request_id, key, true)
+    update(path, request_id, key, true, false)
 }
 
 fn update_core(
@@ -35,7 +48,7 @@ fn update_core(
     request_id: &str,
     key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
-    update(path, request_id, key, false)
+    update(path, request_id, key, false, false)
 }
 
 fn update(
@@ -43,9 +56,12 @@ fn update(
     request_id: &str,
     key: Option<&str>,
     plugins: bool,
+    themes: bool,
 ) -> Result<Response, ResponseBuildError> {
     let operation = if plugins {
         wordpress_update::PLUGINS_OPERATION
+    } else if themes {
+        wordpress_update::THEMES_OPERATION
     } else {
         wordpress_update::OPERATION
     };
@@ -76,6 +92,8 @@ fn update(
         };
         let parsed = if plugins {
             wordpress_update::Request::parse_plugins(&json, request_id, key)
+        } else if themes {
+            wordpress_update::Request::parse_themes(&json, request_id, key)
         } else {
             wordpress_update::Request::parse(&json, request_id, key)
         };
@@ -151,7 +169,7 @@ fn update(
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, request_id, key, plugins);
+        let _ = (path, request_id, key, plugins, themes);
         Ok(Response::failure(
             operation,
             ErrorCode::UnsupportedPlatform,

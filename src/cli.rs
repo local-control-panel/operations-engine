@@ -164,6 +164,15 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Snapshot and update selected WordPress themes (or all themes).
+    UpdateThemes {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl WordpressCommand {
@@ -172,6 +181,7 @@ impl WordpressCommand {
             Self::Cleanup { .. } => "wordpress.cleanup",
             Self::UpdateCore { .. } => "wordpress.updateCore",
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
+            Self::UpdateThemes { .. } => "wordpress.updateThemes",
         }
     }
 }
