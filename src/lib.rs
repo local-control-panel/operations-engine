@@ -35,6 +35,7 @@ pub mod site;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;
+pub mod wordpress_update;
 
 use cli::{Cli, Command};
 use error::ErrorCode;

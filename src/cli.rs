@@ -146,12 +146,22 @@ pub enum WordpressCommand {
         #[arg(long = "request-file")]
         request_file: PathBuf,
     },
+    /// Snapshot and update WordPress core through fixed WP-CLI argv.
+    UpdateCore {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl WordpressCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Cleanup { .. } => "wordpress.cleanup",
+            Self::UpdateCore { .. } => "wordpress.updateCore",
         }
     }
 }

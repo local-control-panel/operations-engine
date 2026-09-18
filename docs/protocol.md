@@ -232,6 +232,17 @@ engine invokes `docker exec` with a fixed argv and passes the developer-owned
 PHP fragment as one argument to `wp eval`; no caller-controlled command text
 is interpreted by a shell.
 
+## `wordpress.updateCore`
+
+`wordpress update-core` accepts a root-owned typed request containing the
+validated runtime container, WordPress root, site UID/GID and an optional
+bounded version. Under a per-site lock, the engine first streams a complete
+site archive and `wp db export -` into a request-specific recovery directory
+beneath `/root/db-backups/wordpress-updates`. Only after both recovery
+artifacts complete does it invoke the fixed `wp core update` argv as the site
+UID/GID. The operation is idempotent and transaction/audit recorded; no shell
+command or free-form WP-CLI argument is accepted.
+
 ## `agent.activateBruteforceConfig`
 
 `agent activate-bruteforce-config` accepts a root-owned JSON request with the
