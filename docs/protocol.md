@@ -243,6 +243,14 @@ artifacts complete does it invoke the fixed `wp core update` argv as the site
 UID/GID. The operation is idempotent and transaction/audit recorded; no shell
 command or free-form WP-CLI argument is accepted.
 
+## `wordpress.updatePlugins`
+
+`wordpress update-plugins` reuses the recovery-first, per-site transaction
+boundary of `wordpress.updateCore`. It accepts either an empty plugin list,
+which maps only to the fixed `--all` flag, or at most 128 validated plugin
+slugs. A full site archive and database export must complete before the fixed
+site-UID `wp plugin update` argv runs. Plugin names never enter a shell.
+
 ## `agent.activateBruteforceConfig`
 
 `agent activate-bruteforce-config` accepts a root-owned JSON request with the

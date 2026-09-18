@@ -14,7 +14,20 @@ pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => update_core(&request_file, &request_id, idempotency_key.as_deref()),
+        WordpressCommand::UpdatePlugins {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => update_plugins(&request_file, &request_id, idempotency_key.as_deref()),
     }
+}
+
+fn update_plugins(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    update(path, request_id, key, true)
 }
 
 fn update_core(
@@ -22,6 +35,20 @@ fn update_core(
     request_id: &str,
     key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
+    update(path, request_id, key, false)
+}
+
+fn update(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+    plugins: bool,
+) -> Result<Response, ResponseBuildError> {
+    let operation = if plugins {
+        wordpress_update::PLUGINS_OPERATION
+    } else {
+        wordpress_update::OPERATION
+    };
     #[cfg(unix)]
     {
         use crate::{backup_delete::BACKUP_ROOT, filesystem::ManagedRoot, site::TrustedRoot};
@@ -31,7 +58,7 @@ fn update_core(
             Ok(v) => v,
             Err(_) => {
                 return Ok(Response::failure(
-                    wordpress_update::OPERATION,
+                    operation,
                     ErrorCode::Internal,
                     crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
                 ));
@@ -41,17 +68,22 @@ fn update_core(
             Ok(v) => v,
             Err(_) => {
                 return Ok(Response::failure(
-                    wordpress_update::OPERATION,
+                    operation,
                     ErrorCode::InvalidInput,
                     "request-file must be a root-owned regular file",
                 ));
             }
         };
-        let request = match wordpress_update::Request::parse(&json, request_id, key) {
+        let parsed = if plugins {
+            wordpress_update::Request::parse_plugins(&json, request_id, key)
+        } else {
+            wordpress_update::Request::parse(&json, request_id, key)
+        };
+        let request = match parsed {
             Ok(v) => v,
             Err(_) => {
                 return Ok(Response::failure(
-                    wordpress_update::OPERATION,
+                    operation,
                     ErrorCode::InvalidInput,
                     "request-file is not a valid WordPress core update plan",
                 ));
@@ -63,7 +95,7 @@ fn update_core(
             .any(|root| request.root().starts_with(root.as_path()))
         {
             return Ok(Response::failure(
-                wordpress_update::OPERATION,
+                operation,
                 ErrorCode::InvalidInput,
                 "WordPress root is outside configured content roots",
             ));
@@ -72,7 +104,7 @@ fn update_core(
             Ok(v) => v,
             Err(_) => {
                 return Ok(Response::failure(
-                    wordpress_update::OPERATION,
+                    operation,
                     ErrorCode::Internal,
                     "engine state root is unavailable",
                 ));
@@ -80,7 +112,7 @@ fn update_core(
         };
         if std::fs::create_dir_all(BACKUP_ROOT).is_err() {
             return Ok(Response::failure(
-                wordpress_update::OPERATION,
+                operation,
                 ErrorCode::Internal,
                 "backup root is unavailable",
             ));
@@ -91,7 +123,7 @@ fn update_core(
             Ok(v) => v,
             Err(_) => {
                 return Ok(Response::failure(
-                    wordpress_update::OPERATION,
+                    operation,
                     ErrorCode::Internal,
                     "backup root is unavailable",
                 ));
@@ -109,23 +141,19 @@ fn update_core(
             &crate::process::CancellationToken::default(),
         ) {
             Ok(v) | Err(wordpress_update::Error::PostCommit { result: v }) => {
-                Response::success(wordpress_update::OPERATION, v)
+                Response::success(operation, v)
             }
             Err(e) => {
                 let (code, message) = e.protocol();
-                Ok(Response::failure(
-                    wordpress_update::OPERATION,
-                    code,
-                    &message,
-                ))
+                Ok(Response::failure(operation, code, &message))
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, request_id, key);
+        let _ = (path, request_id, key, plugins);
         Ok(Response::failure(
-            wordpress_update::OPERATION,
+            operation,
             ErrorCode::UnsupportedPlatform,
             "wordpress.updateCore requires a Unix host",
         ))

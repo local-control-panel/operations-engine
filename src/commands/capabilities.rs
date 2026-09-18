@@ -64,6 +64,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "permissions.fixWorldWritable",
                 "wordpress.cleanup",
                 "wordpress.updateCore",
+                "wordpress.updatePlugins",
                 "agent.activateBruteforceConfig",
             ],
             output_formats: ["json"],

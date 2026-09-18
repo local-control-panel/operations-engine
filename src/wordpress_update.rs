@@ -20,6 +20,7 @@ use std::{
 };
 
 pub const OPERATION: &str = "wordpress.updateCore";
+pub const PLUGINS_OPERATION: &str = "wordpress.updatePlugins";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -31,12 +32,27 @@ struct Plan {
     version: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PluginsPlan {
+    container: String,
+    root: String,
+    uid: u32,
+    gid: u32,
+    plugins: Vec<String>,
+}
+
+enum Update {
+    Core(Option<String>),
+    Plugins(Vec<String>),
+}
+
 pub struct Request {
     container: ContainerName,
     root: PathBuf,
     uid: u32,
     gid: u32,
-    version: Option<String>,
+    update: Update,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -71,7 +87,47 @@ impl Request {
             root,
             uid: plan.uid,
             gid: plan.gid,
-            version: plan.version,
+            update: Update::Core(plan.version),
+            request_id: RequestId::parse(request_id).map_err(|_| RequestError)?,
+            idempotency_key: key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| RequestError)?,
+        })
+    }
+    pub fn parse_plugins(
+        json: &str,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        let plan: PluginsPlan = serde_json::from_str(json).map_err(|_| RequestError)?;
+        if plan.plugins.len() > 128
+            || plan.plugins.iter().any(|slug| {
+                slug.is_empty()
+                    || slug.len() > 200
+                    || !slug.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+            })
+        {
+            return Err(RequestError);
+        }
+        let root = PathBuf::from(plan.root);
+        if !root.is_absolute()
+            || root.as_os_str().len() > 4096
+            || root
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(RequestError);
+        }
+        Ok(Self {
+            container: ContainerName::parse(&plan.container)
+                .map_err(|_: RestoreRequestError| RequestError)?,
+            root,
+            uid: plan.uid,
+            gid: plan.gid,
+            update: Update::Plugins(plan.plugins),
             request_id: RequestId::parse(request_id).map_err(|_| RequestError)?,
             idempotency_key: key
                 .map(IdempotencyKey::parse)
@@ -115,7 +171,7 @@ impl Error {
         match self {
             Self::Preflight(preflight::Error::Lock(_)) => (
                 ErrorCode::Conflict,
-                "another WordPress core update is in progress for this site".into(),
+                "another WordPress update is in progress for this site".into(),
             ),
             Self::ReplayInProgress => (
                 ErrorCode::Conflict,
@@ -123,20 +179,17 @@ impl Error {
             ),
             Self::Run(error) => (
                 process::spawn_error_code(error),
-                "could not run WordPress core update prerequisite".into(),
+                "could not run WordPress update prerequisite".into(),
             ),
-            Self::Rejected(code) => (
-                *code,
-                "WordPress recovery snapshot or core update failed".into(),
-            ),
+            Self::Rejected(code) => (*code, "WordPress recovery snapshot or update failed".into()),
             Self::InvalidOutput => (
                 ErrorCode::Internal,
-                "WordPress core update output was invalid".into(),
+                "WordPress update output was invalid".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             _ => (
                 ErrorCode::Internal,
-                "internal WordPress core update error".into(),
+                "internal WordPress update error".into(),
             ),
         }
     }
@@ -147,6 +200,10 @@ pub fn execute(
     req: &Request,
     cancel: &CancellationToken,
 ) -> Result<UpdateResult, Error> {
+    let operation = match req.update {
+        Update::Core(_) => OPERATION,
+        Update::Plugins(_) => PLUGINS_OPERATION,
+    };
     let digest = Sha256::digest(req.root.as_os_str().as_encoded_bytes());
     let mut hash = String::new();
     for byte in digest {
@@ -169,11 +226,11 @@ pub fn execute(
         &scope,
         req.request_id,
         req.idempotency_key.as_ref(),
-        OPERATION,
+        operation,
     )
     .map_err(Error::Preflight)?
     {
-        preflight::Outcome::Replay(id) => return replay(&scope, id),
+        preflight::Outcome::Replay(id) => return replay(&scope, id, operation),
         preflight::Outcome::Proceed(value) => value,
     };
     let preflight::Admitted { lock, mut state } = admitted;
@@ -235,10 +292,24 @@ pub fn execute(
         cancel,
     )
     .map_err(|e| fail(&scope, &state_path, &audit_path, state.clone(), e))?;
-    let mut update = vec!["core".to_owned(), "update".to_owned()];
-    if let Some(version) = &req.version {
-        update.push(format!("--version={version}"));
-    }
+    let update = match &req.update {
+        Update::Core(version) => {
+            let mut args = vec!["core".to_owned(), "update".to_owned()];
+            if let Some(version) = version {
+                args.push(format!("--version={version}"));
+            }
+            args
+        }
+        Update::Plugins(plugins) => {
+            let mut args = vec!["plugin".to_owned(), "update".to_owned()];
+            if plugins.is_empty() {
+                args.push("--all".into());
+            } else {
+                args.extend(plugins.iter().cloned());
+            }
+            args
+        }
+    };
     let output = process::run(
         &ProcessRequest::new(ctx.docker_program).args(wp_args(req, update)),
         &ProcessLimits {
@@ -345,13 +416,13 @@ fn run_to_file(
     let _ = program;
     Ok(())
 }
-fn replay(scope: &ManagedRoot, id: RequestId) -> Result<UpdateResult, Error> {
+fn replay(scope: &ManagedRoot, id: RequestId, operation: &str) -> Result<UpdateResult, Error> {
     let loaded = state::load(
         scope,
         &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
     )
     .map_err(|e| Error::Io(std::io::Error::other(format!("{e:?}"))))?;
-    if loaded.operation != OPERATION {
+    if loaded.operation != operation {
         return Err(Error::Io(std::io::Error::other(
             "transaction operation mismatch",
         )));
@@ -396,5 +467,10 @@ mod tests {
     fn validates_version_without_shell_fragments() {
         assert!(Request::parse(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"version":"6.8.2"}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_ok());
         assert!(Request::parse(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"version":"6.8;id"}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_err());
+    }
+    #[test]
+    fn validates_bounded_plugin_slugs() {
+        assert!(Request::parse_plugins(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"plugins":["woocommerce","seo_pack"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_ok());
+        assert!(Request::parse_plugins(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"plugins":["bad;id"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_err());
     }
 }

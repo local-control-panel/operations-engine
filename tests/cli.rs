@@ -78,6 +78,7 @@ fn capabilities_describe_only_implemented_operations() {
             "permissions.fixWorldWritable",
             "wordpress.cleanup",
             "wordpress.updateCore",
+            "wordpress.updatePlugins",
             "agent.activateBruteforceConfig"
         ])
     );
