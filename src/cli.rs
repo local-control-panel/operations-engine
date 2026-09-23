@@ -146,6 +146,31 @@ pub enum WordpressCommand {
         #[arg(long = "request-file")]
         request_file: PathBuf,
     },
+    /// Create a new WordPress site's content: core download, wp-config.php,
+    /// object-cache wiring and `wp core install`, under one lock/
+    /// idempotency/transaction/audit-backed request. The site's own
+    /// directory must already exist beneath a configured content root
+    /// (`website-control-panel`'s `create_site` creates and owns it).
+    Install {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Clone a WordPress site's content and database into a fresh staging
+    /// directory on the same server: content copy, database export/import
+    /// and an ownership fix, under one lock/idempotency/transaction/audit-
+    /// backed request.
+    Clone {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Snapshot and update WordPress core through fixed WP-CLI argv.
     UpdateCore {
         #[arg(long = "request-file")]
@@ -179,6 +204,8 @@ impl WordpressCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Cleanup { .. } => "wordpress.cleanup",
+            Self::Install { .. } => "wordpress.install",
+            Self::Clone { .. } => "wordpress.clone",
             Self::UpdateCore { .. } => "wordpress.updateCore",
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
             Self::UpdateThemes { .. } => "wordpress.updateThemes",

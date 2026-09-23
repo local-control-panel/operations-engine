@@ -8,7 +8,7 @@ matrix, redaction review, docs, opt-in rollout procedure) is done and
 tested, but the phase is not complete — see its own section for what
 remains (the control-plane half of pinned installation, and rotating off
 the TEST-ONLY signing key before a real release).
-Last updated: 2026-09-08
+Last updated: 2026-09-24
 
 This file is the shared implementation plan for Operations Engine. It is the
 authoritative source for what we build next, in what order, and what must be
@@ -859,6 +859,68 @@ when container removal fails. See the docs repo milestones
 `db.provisionPostgres` operation and migrates `pg_create_db` away from raw SSH
 SQL construction. See the docs repo milestone `010-postgres-provisioning.md`.
 
+**WordPress site-content install shipped.** New `wordpress.install`
+operation (`src/wordpress_install.rs`) covers the site-content half of
+standing up a new WordPress site: a fixed WP-CLI sequence (`core
+download` with a `bg_BG`/`en_US` locale fallback, `config create`, `core
+install` as the critical path; object-cache wiring, the bundled cache
+plugin and disabling native WP-Cron as best-effort, matching the raw-shell
+code it replaces) under one per-site lock/idempotency/transaction/audit
+request, modeled directly on `wordpress_update.rs`. Database provisioning
+stays out of scope — `website-control-panel` already calls
+`db.provisionMariaDb` itself before this operation runs. This closes the
+gap `raw-mutation-risk-audit.md` and the docs repo's milestone
+`031-wordpress-install.md` had recorded: `website-control-panel`'s client
+wiring (`ops_engine_wordpress_install`, `wp_install`) was built and merged
+first, against an engine-side operation that did not actually exist yet;
+this milestone is the engine side catching up to that already-fixed wire
+contract. One deviation from `031`'s original text, corrected in the same
+change: the site's own directory is *not* created (or removed on a WP-CLI
+failure) by this operation, unlike what that milestone doc originally
+described. `create_site` (`website-control-panel`'s `runtime_pool.rs`)
+already creates and chowns that directory, as a distinct, still-raw-shell
+step, before `wordpress.install` ever runs — so this operation only
+requires the directory to already exist beneath a configured content root
+without escaping it through a symlink (`TrustedRoot::resolve_existing`),
+and never deletes it on failure, since deleting a directory this operation
+did not create would destroy `create_site`'s own prior work (including its
+`.user.ini`). See the 2026-09-24 decision log entry. 433 tests passing (0
+failed, 3 pre-existing ignored), clippy and fmt clean.
+
+**WordPress site clone shipped.** New `wordpress.clone` operation
+(`src/wordpress_clone.rs`), closing backlog item 5's remaining half (the
+site-content-install half closed above): content copy, database
+export/import and an ownership fix, as one lock/idempotency/transaction/
+audit request scoped to the staging root, replacing `wp_clone`'s raw
+`sudo rsync --delete` plus manual `docker cp`-shuttled `wp db export`/
+`mariadb` import plus raw `chown -R`. No `rsync` — the staging directory is
+freshly (re)created (mirror semantics preserved: any prior contents are
+removed first) and populated with a fixed, bounded `cp -a`, dropping the
+extra dependency `docs repo`'s backlog note assumed would carry over.
+Reuses two existing primitives directly rather than nesting their own
+independent operations inside this one: `db_restore::execute::run_restore`
+(bumped to `pub(crate)`) runs the same bounded restore-client call
+`db.restore` uses, under *this* operation's own lock/transaction instead of
+opening a second one; `permissions::execute::repair_tree` (bumped to
+`pub(crate)`) is `permissions.fixOwnership`'s own fd-relative,
+`AT_SYMLINK_NOFOLLOW` repair walk for exactly one directory, reused instead
+of going through that operation's whole-content-root default/targets/
+exclusions plan, which is shaped for a fleet-wide sweep this single-
+directory case is not. One deviation from the backlog note's phrasing
+("`wp_clone` can now reuse `wordpress.install`'s directory-creation ...
+primitives"): `wordpress.install` (above) turned out not to create any
+directory at all — `create_site` already does, before `wp_install` ever
+runs. `wordpress.clone` has no such predecessor (the raw code it replaces
+created the staging directory itself with `mkdir -p`), so it genuinely does
+its own directory creation, the same `ManagedRoot`/`TrustedRoot` technique
+`wordpress.install`'s milestone doc originally described. Any failure
+removes the staging directory this request itself (re)created — safe here,
+unlike `wordpress.install`, because this operation actually owns that
+directory's lifecycle for the duration of the request. `wp-config.php`'s DB
+credentials and the source→staging domain search-replace stay outside this
+operation, unchanged, exactly as before. 11 new tests (`cargo test`: 444
+passing, 0 failed, 3 pre-existing ignored), clippy and fmt clean.
+
 **"Atomic Caddy and site configuration changes" — pilot, a second
 migration batch, and engine-side maintenance-mode modeling all
 shipped; 7 of ~28 call sites migrated.**
@@ -1002,6 +1064,8 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-07 | `runtime.activateConfig` locks per `runtime_id` (`runtime-config/<id>/locks/mutation.lock`), not host-wide like `ingress.activateConfig`. | The resource a reload actually shares is everything imported by *that one runtime-service container's* Caddyfile — every domain currently on that same runtime pool — the same "the lock must match what a reload really touches" reasoning behind `ingress`'s own host-wide lock. But unlike ingress's single shared container, two different runtime pools (`fp1-php83` vs `fp1-php84`) share nothing: serializing activations across them would cost throughput for a race that cannot occur. Per-`runtime_id` is coarser than per-domain (matches what a reload touches) and finer than host-wide (matches what it does not) — deliberately diverges from both `ingress.activateConfig`'s and the client's own granularity, recorded here for the same reason the ingress lock choice was. |
 | 2026-09-08 | `runtime.reconcile` takes `--runtime-id` and sweeps only that pool's `<runtime_id>/` subdirectory of `runtimeRoot`, reusing `runtime_config::execute::open_runtime_config_state` verbatim — not a whole-`runtimeRoot` sweep across every pool in one call with a new, coarser lock. | `runtimeRoot` nests one subdirectory per pool (unlike `ingressRoot`, which `ingress.reconcile` sweeps flat), so some scoping decision was unavoidable. A host-wide reconcile lock would serialize a sweep of one pool against a concurrent `runtime.activateConfig` on a completely unrelated pool — exactly the throughput-for-no-correctness-benefit cost the 2026-09-07 per-`runtime_id` lock entry above already rejected for `activateConfig` itself; introducing it here for reconcile would contradict that reasoning for no new benefit. Per-`runtime_id` costs the caller having to loop the call across every known pool to sweep a whole host, but that enumeration is site-registry knowledge (`website-control-panel`'s SQLite) this engine already deliberately doesn't have — the same reason `IdlePool` reconciliation stays client-side per `002`'s "out of scope" section. Full reasoning in `docs repo milestone 003-runtime-reconcile.md`. |
 | 2026-09-08 | Idempotency-key retention (open since Phase 3) is a 7-day age-based sweep (`transaction::prune::DEFAULT_COMPLETED_RETENTION`), run from `mutation::preflight::run` rather than per-operation. Transaction state files (`transactions/<requestId>.json`, never addressed as an open decision at all) get the same fix in the same change — both had grown unbounded, forever, since Phase 3/4 with nobody noticing until an explicit audit. | `preflight::run` is the one place every mutating operation (site- and engine-scoped alike) already passes through, so wiring the sweep there — not in each of the 9 operation modules — makes it structurally impossible for a future operation to add unbounded per-request state by forgetting to call a prune function; see the new "Definition of done" bullet. 7 days covers a plausible offline-client retry without letting state accumulate over a server's real lifetime. Pruning a transaction with an idempotency key removes the idempotency-index entry *before* the transaction state file, not after: if a retry ever races the sweep, the failure mode is "treated as a fresh request" (mirrors work) rather than "`StateError::NotFound`" (hard error) — the friendlier of the two, and consistent with this engine's general preference for graceful degradation over failing closed on a stale-but-recoverable condition. `audit/events.jsonl` is deliberately not addressed here: append-only audit trails are unbounded by design, and bounding one is a real, separate decision (rotate vs. cap vs. leave it), not a prune loop. |
+| 2026-09-24 | `wordpress.install` does not create the site's WordPress-root directory, and never deletes it on a WP-CLI failure — a deviation from the docs repo's original `031-wordpress-install.md`, which described fd-relative directory creation and a failure path that removes the directory this request itself created. | `website-control-panel`'s `create_site` (`runtime_pool.rs`) already creates that directory, chowns it to the site's own numeric UID/GID and writes its `.user.ini` (`open_basedir`) *before* `wp_install`/`wordpress.install` ever runs — a fact only visible by reading that client's call order, not from this repo's own milestone doc, which was written to describe the intended end state rather than the real one. Requiring this operation to also create the directory would make it redundant with `create_site`; requiring it to delete the directory on failure would delete `create_site`'s own already-completed prior work (including `.user.ini`) on every install that fails after `create_site` succeeded — actively unsafe, not merely superfluous. Instead this operation only verifies the directory already exists beneath a configured content root and does not escape it through a symlink (`TrustedRoot::resolve_existing`) before running any WP-CLI step. `031-wordpress-install.md` was updated in `website-control-panel` in the same change to describe what was actually built. |
+| 2026-09-24 | `wordpress.clone` copies content with a fixed `cp -a` subprocess instead of `rsync`, and reuses `db_restore::execute::run_restore`/`permissions::execute::repair_tree` directly (both bumped `pub(crate)`) rather than invoking `db.restore`/`permissions.fixOwnership` as separate nested operations. | `rsync --delete`'s semantics were exactly the ambiguous, hard-to-reason-about part `raw-mutation-risk-audit.md` flagged `wp_clone` for; a plain recursive archive copy needs no extra dependency and no argument surface beyond a fixed `-a -- <src>/. <dst>`, and a same-host copy has no bandwidth-efficiency reason to prefer rsync's delta algorithm over it. Invoking `db.restore`/`permissions.fixOwnership` as separate operations would each open their own lock/transaction/audit record, splitting what the risk audit explicitly asked be "one transaction wrapping copy + DB import + ownership" into three; calling their already-tested inner functions directly keeps exactly one lock/transaction/audit envelope for the whole clone while still reusing the identical bounded-subprocess and fd-relative-chown logic instead of duplicating it. |
 
 ## Open decisions
 

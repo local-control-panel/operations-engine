@@ -209,7 +209,13 @@ fn client_request(context: &RestoreContext<'_>, request: &RestoreRequest) -> Pro
     ProcessRequest::new(context.docker_program).args(args)
 }
 
-fn run_restore(
+/// Runs the bounded restore-client subprocess for `request` against
+/// `context` - the same call `execute` makes under `db.restore`'s own
+/// lock/transaction/audit boundary, exposed at crate visibility so
+/// `wordpress_clone` can run an import as one step inside its own single
+/// transaction (content copy + DB import + ownership fix) instead of
+/// nesting a second, independent `db.restore` transaction inside it.
+pub(crate) fn run_restore(
     context: &RestoreContext<'_>,
     request: &RestoreRequest,
     cancellation: &CancellationToken,

@@ -63,6 +63,8 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "permissions.fixOwnership",
                 "permissions.fixWorldWritable",
                 "wordpress.cleanup",
+                "wordpress.install",
+                "wordpress.clone",
                 "wordpress.updateCore",
                 "wordpress.updatePlugins",
                 "wordpress.updateThemes",

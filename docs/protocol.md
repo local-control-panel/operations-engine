@@ -232,6 +232,44 @@ engine invokes `docker exec` with a fixed argv and passes the developer-owned
 PHP fragment as one argument to `wp eval`; no caller-controlled command text
 is interpreted by a shell.
 
+## `wordpress.install`
+
+`wordpress install` accepts a root-owned JSON request containing the
+validated runtime container, WordPress root, site UID/GID, domain, site
+title, admin credentials and already-provisioned database/cache connection
+details. The WordPress root must already exist beneath a configured content
+root (the control plane's own site-creation step creates and owns it) and
+must not escape that root through a symlink; this operation never creates
+or removes that directory itself. Under a per-site lock, it runs a fixed
+WP-CLI sequence as the site's own UID/GID: `wp core download` (with a fixed
+`bg_BG`, falling back to `en_US`, locale), `wp config create` and `wp core
+install` are the critical path — any failure fails the whole request, with
+no partial WP-CLI argument accepted from the caller. Object-cache wiring,
+the bundled cache plugin and disabling native WP-Cron run afterward as
+best-effort steps whose own output is not checked, matching the raw-shell
+behavior this operation replaces. The operation is idempotent and
+transaction/audit recorded like every other WordPress mutation here.
+
+## `wordpress.clone`
+
+`wordpress clone` accepts a root-owned JSON request naming the source and
+staging WordPress roots (each validated beneath a configured content root,
+neither nested inside the other), their runtime containers/UID-GID pairs,
+the MariaDB container, the already-provisioned staging database name and
+the MariaDB root password. Under one lock scoped to the staging root, the
+engine (re)creates the staging directory fresh - any prior contents are
+removed first, mirroring the `rsync --delete` this replaces - and populates
+it with a fixed, bounded `cp -a` subprocess; exports the source database
+with `wp db export -` into a request-scoped file beneath the fixed backup
+root; imports it into the staging database with the same bounded restore
+client `db.restore` uses, deleting the dump immediately afterward either
+way; and finally re-chowns the copied tree to the staging site's own
+UID/GID with `permissions.fixOwnership`'s own fd-relative repair walk. Any
+failure removes the staging directory this request itself (re)created. The
+operation is idempotent and transaction/audit recorded; `wp-config.php`'s
+DB credentials and the source→staging domain search-replace remain outside
+it, run by the client afterward.
+
 ## `wordpress.updateCore`
 
 `wordpress update-core` accepts a root-owned typed request containing the

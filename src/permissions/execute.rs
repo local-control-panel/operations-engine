@@ -146,7 +146,21 @@ pub fn execute(
     Ok(result)
 }
 
-fn repair_tree(path: &Path, uid: u32, gid: u32, exclusions: &[&Path]) -> io::Result<u64> {
+/// Opens `path` (fd-relative, refusing a symlink at the final component),
+/// fixes its own ownership if needed, then recursively fixes every entry
+/// beneath it that shares its filesystem and is not itself a symlink -
+/// exactly `permissions.fixOwnership`'s per-target repair, exposed at
+/// crate visibility so a single-directory caller (`wordpress_clone`, fixing
+/// up a freshly copied staging site) can reuse the identical safe walk
+/// without going through `execute`'s multi-target default/targets/
+/// exclusions plan, which is shaped for the whole-content-root sweep this
+/// single-directory case is not.
+pub(crate) fn repair_tree(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    exclusions: &[&Path],
+) -> io::Result<u64> {
     let root = open_directory(path)?;
     let root_stat = stat_fd(root.as_raw_fd())?;
     let relative_exclusions: Vec<Vec<OsString>> = exclusions
