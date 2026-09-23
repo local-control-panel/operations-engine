@@ -115,8 +115,13 @@ pub enum Error {
         rollback_succeeded: bool,
     },
     State(state::StateError),
+    // Boxed: `UpgradeResult` alone made this the crate's largest `Error`
+    // variant by a wide margin, which is what `clippy::result_large_err`
+    // was flagging on every function returning `Result<UpgradeResult,
+    // Error>` - a pre-existing issue unrelated to any particular
+    // operation, fixed the way clippy's own diagnostic suggests.
     PostCommit {
-        result: UpgradeResult,
+        result: Box<UpgradeResult>,
     },
     Replayed {
         code: ErrorCode,
@@ -334,7 +339,9 @@ pub fn execute<D: Driver>(
         .mark_committed(serde_json::to_value(&result).expect("upgrade result serializes"))
         .expect("transaction is in progress");
     if state::save(&scope, &state_path, &state).is_err() {
-        return Err(Error::PostCommit { result });
+        return Err(Error::PostCommit {
+            result: Box::new(result),
+        });
     }
     let _ = audit::append(
         &scope,
