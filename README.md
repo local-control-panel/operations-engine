@@ -9,8 +9,14 @@ scripts remotely, a client calls a versioned operation and receives a
 machine-readable result.
 
 > [!IMPORTANT]
-> This project is in the planning and early development stage. The command-line
-> interface, protocol, and installation process are not stable yet.
+> Phases 0-6 (foundation, transaction framework, Git deploy/rollback,
+> client integration) are complete. Phase 7 (release and production
+> hardening) is functionally done and tested, with a small remainder before
+> a real release — see [PLAN.md](./PLAN.md) for the authoritative current
+> status and test count. Dozens of typed operations beyond the original Git
+> deploy/rollback pilot now ship (WordPress lifecycle, database, permissions,
+> ingress/runtime, backups). The protocol and installation process are
+> stabilizing but not yet frozen.
 
 Development follows the shared [implementation plan](./PLAN.md). It records the
 current phase, agreed decisions, completion criteria, and the next work item.
@@ -48,24 +54,23 @@ performs a local server operation, and returns a structured result.
 The first version will be a CLI, not a continuously running daemon or a
 general-purpose remote agent.
 
-## Proposed command surface
+## Command surface
 
-The initial command surface is expected to be small:
+The original small surface (`version`, `capabilities`, `doctor`, `stack
+status`, `site inspect/deploy/rollback`, `reconcile`) shipped first as the
+Git deploy/rollback pilot — it was a useful test of locking, filesystem
+staging, Git state, progress reporting, recovery, and compatibility between
+client and engine versions.
 
-```console
-ops-engine version --output json
-ops-engine capabilities --output json
-ops-engine doctor --output json
-ops-engine stack status --output json
-ops-engine site inspect --site-id <uuid> --output json
-ops-engine site deploy --site-id <uuid> --revision <full-object-id> --output json
-ops-engine site rollback --site-id <uuid> --release <release-id> --output json
-ops-engine reconcile --output json
-```
-
-Git deploy and rollback are the proposed first end-to-end workflow. They provide
-a useful test of locking, filesystem staging, Git state, progress reporting,
-recovery, and compatibility between client and engine versions.
+Selective expansion (Phase 8) has since added typed, capability-gated
+operations well beyond that pilot: WordPress lifecycle (`wordpress.install`,
+`wordpress.clone`, `wordpress.updateCore`/`updatePlugins`/`updateThemes`,
+`wordpress.cleanup`), database operations (`db.provisionMariaDb`,
+`db.restore`, `db.export`, MariaDB/PostgreSQL/Valkey lifecycle),
+`permissions.fixOwnership`, backup workflows, and ingress/runtime
+reconciliation, among others. `ops-engine capabilities --output json` lists
+what a given build actually supports; see [PLAN.md](./PLAN.md) for the full,
+current list and the criteria each migration must meet.
 
 ## Protocol direction
 
@@ -181,13 +186,16 @@ cancellation contract in [docs/subprocess.md](./docs/subprocess.md).
 
 ## Roadmap
 
-1. Define the protocol, privilege model, and threat model.
-2. Build `version`, `capabilities`, and `doctor` with Linux releases for AMD64
-   and ARM64.
-3. Implement and test a Git deploy/rollback pilot.
-4. Add signed releases, atomic upgrades, audit logging, and recovery procedures.
+1. ~~Define the protocol, privilege model, and threat model.~~ Done.
+2. ~~Build `version`, `capabilities`, and `doctor` with Linux releases for
+   AMD64 and ARM64.~~ Done.
+3. ~~Implement and test a Git deploy/rollback pilot.~~ Done.
+4. Signed releases, atomic upgrades, audit logging, and recovery procedures —
+   done and tested; rotating off the TEST-ONLY signing key remains before a
+   real release.
 5. Migrate additional operations only where the structured boundary provides a
-   measurable benefit.
+   measurable benefit — in progress (Phase 8); see [PLAN.md](./PLAN.md) for
+   what has shipped and what's next.
 
 Detailed implementation milestones live in the docs repository's
 [`operations-engine/milestones`](https://github.com/local-control-panel/docs/tree/main/operations-engine/milestones).
