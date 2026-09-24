@@ -1,43 +1,7 @@
-//! The `wordpress.clone` operation: clone a WordPress site's content and
-//! database into a fresh staging directory on the same server, as one
-//! lock/idempotency/transaction/audit-backed request - the same shape as
-//! `wordpress_install`, and the follow-up the risk audit (`wp_clone`,
-//! Critical: "`rsync --delete`, DB creation/import, ownership and config
-//! changes lack one transaction. Decompose, then orchestrate.") called for.
-//!
-//! Three steps, all critical, run in this fixed order under one lock scoped
-//! to the *staging* root (the resource actually being mutated; the source
-//! is only ever read from):
-//!
-//! 1. **Content copy** - the staging directory is freshly (re)created (any
-//!    prior contents are removed first, matching the mirror semantics of
-//!    the raw `rsync --delete` this replaces) under a configured content
-//!    root, then populated with a fixed, bounded `cp -a` subprocess. No
-//!    `rsync` - a plain recursive archive copy is enough for a same-host,
-//!    same-filesystem-class copy, and drops an extra dependency together
-//!    with `rsync --delete`'s harder-to-reason-about semantics.
-//! 2. **Database export + import** - `wp db export -` streams the source
-//!    database (run as the source site's own UID/GID, exactly like
-//!    `wordpress.updateCore`'s own recovery snapshot) into a request-scoped
-//!    file beneath the fixed backup root, then the same bounded restore
-//!    client `db.restore` uses (`db_restore::execute::run_restore`) imports
-//!    it into the already-provisioned staging database. The dump is
-//!    deleted immediately after the import attempt, success or failure -
-//!    it is transient working state, not a recovery artifact.
-//! 3. **Ownership fix** - `permissions.fixOwnership`'s own fd-relative,
-//!    `AT_SYMLINK_NOFOLLOW`, same-filesystem repair walk
-//!    (`permissions::execute::repair_tree`) re-chowns the freshly copied
-//!    tree to the staging site's own UID/GID; `cp -a` preserves the
-//!    *source*'s ownership, exactly like `rsync -a` did before it.
-//!
-//! Any failure removes the staging directory this request itself just
-//! (re)created - unlike `wordpress.install`, this operation genuinely owns
-//! that directory's lifecycle for the duration of the request, so cleaning
-//! it up on failure does not risk destroying another component's prior
-//! work. `wp-config.php`'s DB credentials and the source→staging
-//! domain search-replace remain outside this operation, run by the client
-//! afterward exactly as before - see `raw-mutation-risk-audit.md`'s backlog
-//! item 5.
+//! Complete same-server WordPress clone. Files and the target database are
+//! snapshotted before mutation. Credentials, domain replacement and a health
+//! probe run before commit; handled failures restore the target. Interrupted
+//! or failed recovery leaves a durable marker and artifacts for manual repair.
 
 use crate::{
     db_restore::{
@@ -49,7 +13,7 @@ use crate::{
     mutation::preflight,
     permissions::execute::repair_tree,
     process::{self, CancellationToken, ProcessLimits, ProcessRequest, ProcessRunError},
-    site::{SiteRelativePath, TrustedRoot},
+    site::{Domain, SiteRelativePath, TrustedRoot},
     transaction::{
         IdempotencyKey, RequestId,
         audit::{self, AuditRecord},
@@ -68,7 +32,6 @@ pub const OPERATION: &str = "wordpress.clone";
 
 const MAX_DB_PASSWORD_BYTES: usize = 256;
 const COPY_TIMEOUT: Duration = Duration::from_secs(1800);
-const EXPORT_TIMEOUT: Duration = Duration::from_secs(1800);
 const MAX_STEP_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -79,6 +42,11 @@ struct Plan {
     source_uid: u32,
     source_gid: u32,
     staging_root: String,
+    staging_container: String,
+    source_domain: String,
+    staging_domain: String,
+    db_user: String,
+    db_password: String,
     staging_uid: u32,
     staging_gid: u32,
     mariadb_container: String,
@@ -92,6 +60,11 @@ pub struct Request {
     source_uid: u32,
     source_gid: u32,
     staging_root: PathBuf,
+    staging_container: ContainerName,
+    source_domain: Domain,
+    staging_domain: Domain,
+    db_user: DatabaseName,
+    db_password: String,
     staging_uid: u32,
     staging_gid: u32,
     mariadb_container: ContainerName,
@@ -141,6 +114,17 @@ impl Request {
             return Err(RequestError);
         }
         validate_db_password(&plan.db_root_password)?;
+        validate_db_password(&plan.db_password)?;
+        if [
+            plan.source_uid,
+            plan.source_gid,
+            plan.staging_uid,
+            plan.staging_gid,
+        ]
+        .contains(&0)
+        {
+            return Err(RequestError);
+        }
 
         Ok(Self {
             source_container: ContainerName::parse(&plan.source_container)
@@ -149,6 +133,12 @@ impl Request {
             source_uid: plan.source_uid,
             source_gid: plan.source_gid,
             staging_root,
+            staging_container: ContainerName::parse(&plan.staging_container)
+                .map_err(|_| RequestError)?,
+            source_domain: Domain::parse(&plan.source_domain).map_err(|_| RequestError)?,
+            staging_domain: Domain::parse(&plan.staging_domain).map_err(|_| RequestError)?,
+            db_user: DatabaseName::parse(&plan.db_user).map_err(|_| RequestError)?,
+            db_password: plan.db_password,
             staging_uid: plan.staging_uid,
             staging_gid: plan.staging_gid,
             mariadb_container: ContainerName::parse(&plan.mariadb_container)
@@ -176,6 +166,7 @@ impl Request {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloneResult {
+    pub recovery_id: String,
     pub completed_at_unix_secs: u64,
 }
 
@@ -201,6 +192,8 @@ pub enum Error {
     Run(ProcessRunError),
     Rejected(ErrorCode),
     SourceUnavailable,
+    UnsafeTarget,
+    RecoveryRequired,
     Import(RestoreError),
     PostCommit { result: CloneResult },
     Replayed { code: ErrorCode, message: String },
@@ -223,13 +216,15 @@ impl Error {
             ),
             Self::Rejected(code) => (
                 *code,
-                "WordPress site copy or database export failed".into(),
+                "WordPress clone step failed".into(),
             ),
             Self::SourceUnavailable => (
                 ErrorCode::InvalidInput,
                 "WordPress source root does not exist or is outside the configured content root"
                     .into(),
             ),
+            Self::UnsafeTarget => (ErrorCode::InvalidInput, "clone target overlaps the source or has an unsafe configuration".into()),
+            Self::RecoveryRequired => (ErrorCode::Conflict, "WordPress clone requires manual recovery; retained artifacts and pending.json identify the target".into()),
             Self::Import(error) => error.protocol(),
             Self::Replayed { code, message } => (*code, message.clone()),
             _ => (ErrorCode::Internal, "internal WordPress clone error".into()),
@@ -325,137 +320,21 @@ pub fn execute(
         None => fail_now!(Error::SourceUnavailable),
     };
 
-    // Fresh, mirror-equivalent staging directory: drop anything already
-    // there (a prior clone attempt, most likely), then recreate it empty.
-    let _ = staging_managed.remove_dir_all(&staging_relative);
-    if let Err(error) = staging_managed.create_dir_all(&staging_relative) {
-        fail_now!(Error::Io(error));
-    }
-    let staging_absolute = match staging_content_root.resolve_existing(&staging_relative) {
-        Ok(value) => value,
-        Err(_) => fail_now!(Error::SourceUnavailable),
-    };
-    let staging_str = match staging_absolute.to_str() {
-        Some(value) => value.to_owned(),
-        None => fail_now!(Error::SourceUnavailable),
-    };
-
-    // ── Step 1: content copy ──
-    let copy = process::run(
-        &ProcessRequest::new(ctx.cp_program).args([
-            "-a",
-            "--",
-            &format!("{source_str}/."),
-            &staging_str,
-        ]),
-        &ProcessLimits {
-            timeout: COPY_TIMEOUT,
-            max_stdout_bytes: MAX_STEP_OUTPUT_BYTES,
-            max_stderr_bytes: MAX_STEP_OUTPUT_BYTES,
-        },
+    if let Err(error) = clone_with_recovery(
+        ctx,
+        req,
+        &scope,
+        &staging_managed,
+        staging_content_root,
+        &staging_relative,
+        &source_str,
         cancel,
-    );
-    if let Err(error) = critical(copy) {
-        let _ = staging_managed.remove_dir_all(&staging_relative);
+    ) {
         fail_now!(error);
-    }
-
-    // ── Step 2a: export the source database to a request-scoped dump ──
-    let dump_dir = SiteRelativePath::parse(format!("wordpress-clone/{}", req.request_id)).unwrap();
-    if let Err(error) = ctx.dump_managed.create_dir_all(&dump_dir) {
-        let _ = staging_managed.remove_dir_all(&staging_relative);
-        fail_now!(Error::Io(error));
-    }
-    let dump_relative =
-        SiteRelativePath::parse(format!("wordpress-clone/{}/dump.sql", req.request_id)).unwrap();
-    let dump_file = match ctx.dump_managed.create_new_file(&dump_relative) {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = staging_managed.remove_dir_all(&staging_relative);
-            fail_now!(Error::Io(error));
-        }
-    };
-    let export_args = [
-        "exec".to_owned(),
-        "-i".to_owned(),
-        "--user".to_owned(),
-        format!("{}:{}", req.source_uid, req.source_gid),
-        req.source_container.as_str().to_owned(),
-        "wp".to_owned(),
-        format!("--path={source_str}"),
-        "--allow-root".to_owned(),
-        "db".to_owned(),
-        "export".to_owned(),
-        "-".to_owned(),
-        "--add-drop-table".to_owned(),
-    ];
-    let export = process::run_with_stdout_file(
-        &ProcessRequest::new(ctx.docker_program).args(export_args),
-        dump_file,
-        &ProcessLimits {
-            timeout: EXPORT_TIMEOUT,
-            max_stdout_bytes: 0,
-            max_stderr_bytes: MAX_STEP_OUTPUT_BYTES,
-        },
-        cancel,
-    );
-    if let Err(error) = critical(export) {
-        let _ = ctx.dump_managed.remove_file(&dump_relative);
-        let _ = staging_managed.remove_dir_all(&staging_relative);
-        fail_now!(error);
-    }
-
-    // ── Step 2b: import the dump into the already-provisioned staging DB ──
-    let dump_absolute = match ctx.dump_root.resolve_existing(&dump_relative) {
-        Ok(value) => value,
-        Err(_) => {
-            let _ = ctx.dump_managed.remove_file(&dump_relative);
-            let _ = staging_managed.remove_dir_all(&staging_relative);
-            fail_now!(Error::Io(std::io::Error::other(
-                "exported dump escaped the dump root"
-            )));
-        }
-    };
-    let dump_path_str = match dump_absolute.to_str() {
-        Some(value) => value.to_owned(),
-        None => {
-            let _ = ctx.dump_managed.remove_file(&dump_relative);
-            let _ = staging_managed.remove_dir_all(&staging_relative);
-            fail_now!(Error::Io(std::io::Error::other(
-                "exported dump path is not valid UTF-8"
-            )));
-        }
-    };
-    let restore_request = crate::db_restore::RestoreRequest {
-        db_type: DbType::Mariadb,
-        database: req.db_name.clone(),
-        container: req.mariadb_container.clone(),
-        file_path: dump_path_str,
-        root_password: req.db_root_password.clone(),
-        request_id: req.request_id,
-        idempotency_key: req.idempotency_key.clone(),
-    };
-    let restore_context = RestoreContext {
-        engine_state: ctx.engine_state,
-        docker_program: ctx.docker_program,
-        // Never reached: the dump this operation writes is always `.sql`,
-        // never `.gz`, so `run_restore`'s gzip branch never runs.
-        gunzip_program: "gunzip",
-    };
-    let import_result = run_restore(&restore_context, &restore_request, cancel);
-    let _ = ctx.dump_managed.remove_file(&dump_relative);
-    if let Err(error) = import_result {
-        let _ = staging_managed.remove_dir_all(&staging_relative);
-        fail_now!(Error::Import(error));
-    }
-
-    // ── Step 3: ownership fix ──
-    if let Err(error) = repair_tree(&staging_absolute, req.staging_uid, req.staging_gid, &[]) {
-        let _ = staging_managed.remove_dir_all(&staging_relative);
-        fail_now!(Error::Io(error));
     }
 
     let result = CloneResult {
+        recovery_id: req.request_id.to_string(),
         completed_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -468,6 +347,8 @@ pub fn execute(
         drop(lock);
         return Err(Error::PostCommit { result });
     }
+    // A crash before this point leaves pending.json and prevents a blind retry.
+    let _ = scope.remove_file(&SiteRelativePath::parse("pending.json").unwrap());
     let _ = audit::append(
         &scope,
         &audit_path,
@@ -475,6 +356,323 @@ pub fn execute(
     );
     drop(lock);
     Ok(result)
+}
+
+fn step_limits() -> ProcessLimits {
+    ProcessLimits {
+        timeout: COPY_TIMEOUT,
+        max_stdout_bytes: MAX_STEP_OUTPUT_BYTES,
+        max_stderr_bytes: MAX_STEP_OUTPUT_BYTES,
+    }
+}
+
+fn wp_command(ctx: &Context<'_>, req: &Request, source: bool) -> ProcessRequest {
+    let (container, root, uid, gid) = if source {
+        (
+            &req.source_container,
+            &req.source_root,
+            req.source_uid,
+            req.source_gid,
+        )
+    } else {
+        (
+            &req.staging_container,
+            &req.staging_root,
+            req.staging_uid,
+            req.staging_gid,
+        )
+    };
+    ProcessRequest::new(ctx.docker_program).args([
+        "exec".to_owned(),
+        "-i".into(),
+        "--user".into(),
+        format!("{uid}:{gid}"),
+        container.as_str().into(),
+        "wp".into(),
+        format!("--path={}", root.display()),
+        "--skip-plugins".into(),
+        "--skip-themes".into(),
+    ])
+}
+
+// The bounded process runner deliberately excludes argv/output from errors.
+fn wp_step(
+    ctx: &Context<'_>,
+    req: &Request,
+    args: &[&str],
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    critical(process::run(
+        &wp_command(ctx, req, false).args(args),
+        &step_limits(),
+        cancel,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clone_with_recovery(
+    ctx: &Context<'_>,
+    req: &Request,
+    scope: &ManagedRoot,
+    staging: &ManagedRoot,
+    content_root: &TrustedRoot,
+    relative: &SiteRelativePath,
+    source: &str,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    // Reject symlinked targets/parents and overlapping canonical paths before
+    // snapshotting or executing any application code against the destination.
+    let parent = relative
+        .as_path()
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty());
+    let parent_absolute = match parent {
+        Some(p) => content_root
+            .resolve_existing(&SiteRelativePath::parse(p).map_err(|_| Error::UnsafeTarget)?)
+            .map_err(|_| Error::UnsafeTarget)?,
+        None => content_root.as_path().canonicalize().map_err(Error::Io)?,
+    };
+    let target = parent_absolute.join(relative.as_path().file_name().ok_or(Error::UnsafeTarget)?);
+    let source = std::path::Path::new(source);
+    if target.starts_with(source) || source.starts_with(&target) {
+        return Err(Error::UnsafeTarget);
+    }
+    match staging.open_dir(relative) {
+        Ok(_) => {
+            let resolved = content_root
+                .resolve_existing(relative)
+                .map_err(|_| Error::UnsafeTarget)?;
+            if resolved != target {
+                return Err(Error::UnsafeTarget);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(Error::UnsafeTarget),
+    }
+
+    let identity = process::run(
+        &wp_command(ctx, req, true).args(["config", "get", "DB_NAME", "--type=constant"]),
+        &step_limits(),
+        cancel,
+    )
+    .map_err(Error::Run)?;
+    if let Some(code) = process::error_code(&identity.termination) {
+        return Err(Error::Rejected(code));
+    }
+    let source_db = String::from_utf8(identity.stdout.bytes).map_err(|_| Error::UnsafeTarget)?;
+    if identity.stdout.truncated
+        || DatabaseName::parse(source_db.trim()).is_err()
+        || source_db.trim() == req.db_name.as_str()
+    {
+        return Err(Error::UnsafeTarget);
+    }
+
+    let pending = SiteRelativePath::parse("pending.json").unwrap();
+    let recovery_dir =
+        SiteRelativePath::parse(format!("wordpress-clone/{}", req.request_id)).unwrap();
+    let recovery_sql =
+        SiteRelativePath::parse(format!("wordpress-clone/{}/target.sql", req.request_id)).unwrap();
+    let source_sql =
+        SiteRelativePath::parse(format!("wordpress-clone/{}/dump.sql", req.request_id)).unwrap();
+    let saved_dir = SiteRelativePath::parse(format!(".wcp-clone-{}", req.request_id)).unwrap();
+    let saved_files =
+        SiteRelativePath::parse(format!(".wcp-clone-{}/site", req.request_id)).unwrap();
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "requestId": req.request_id, "stagingRoot": req.staging_root,
+        "database": req.db_name.as_str(), "databaseContainer": req.mariadb_container.as_str(),
+        "databaseSnapshot": ctx.dump_root.join(&recovery_sql),
+        "savedFiles": content_root.join(&saved_files),
+    }))
+    .map_err(|_| Error::UnsafeTarget)?;
+    scope
+        .create_new(&pending, &manifest)
+        .map_err(|_| Error::RecoveryRequired)?;
+
+    let mut moved_files = false;
+    let mut created_target = false;
+    let mut database_mutated = false;
+    let work = (|| -> Result<(), Error> {
+        ctx.dump_managed
+            .create_dir_all(&recovery_dir)
+            .map_err(Error::Io)?;
+        ctx.dump_managed
+            .set_mode(&recovery_dir, 0o700)
+            .map_err(Error::Io)?;
+        ctx.dump_managed
+            .create_new(
+                &SiteRelativePath::parse(format!(
+                    "wordpress-clone/{}/manifest.json",
+                    req.request_id
+                ))
+                .unwrap(),
+                &manifest,
+            )
+            .map_err(Error::Io)?;
+        let snapshot = ctx
+            .dump_managed
+            .create_new_file(&recovery_sql)
+            .map_err(Error::Io)?;
+        ctx.dump_managed
+            .set_mode(&recovery_sql, 0o600)
+            .map_err(Error::Io)?;
+        // Include DROP/CREATE DATABASE so rollback also removes tables newly
+        // introduced by the clone. The target database already exists.
+        critical(process::run_with_stdout_file(
+            &ProcessRequest::new(ctx.docker_program)
+                .env("MYSQL_PWD", &req.db_root_password)
+                .args([
+                    "exec",
+                    "-i",
+                    "-e",
+                    "MYSQL_PWD",
+                    req.mariadb_container.as_str(),
+                    "mariadb-dump",
+                    "-uroot",
+                    "--single-transaction",
+                    "--routines",
+                    "--triggers",
+                    "--events",
+                    "--add-drop-database",
+                    "--databases",
+                    req.db_name.as_str(),
+                ]),
+            snapshot,
+            &step_limits(),
+            cancel,
+        ))?;
+        staging.create_dir(&saved_dir).map_err(Error::Io)?;
+        staging.set_mode(&saved_dir, 0o700).map_err(Error::Io)?;
+        match staging.rename(relative, &saved_files) {
+            Ok(()) => moved_files = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+        staging.create_dir(relative).map_err(Error::Io)?;
+        created_target = true;
+        let absolute = content_root
+            .resolve_existing(relative)
+            .map_err(|_| Error::UnsafeTarget)?;
+        critical(process::run(
+            &ProcessRequest::new(ctx.cp_program).args([
+                "-a",
+                "--",
+                &format!("{}/.", source.display()),
+                absolute.to_str().ok_or(Error::UnsafeTarget)?,
+            ]),
+            &step_limits(),
+            cancel,
+        ))?;
+        // A symlinked wp-config could make `wp config set` modify the source.
+        let config = staging
+            .open_dir(relative)
+            .map_err(Error::Io)?
+            .symlink_metadata("wp-config.php")
+            .map_err(Error::Io)?;
+        if !config.is_file() {
+            return Err(Error::UnsafeTarget);
+        }
+        repair_tree(&absolute, req.staging_uid, req.staging_gid, &[]).map_err(Error::Io)?;
+        for (key, value) in [
+            ("DB_NAME", req.db_name.as_str()),
+            ("DB_USER", req.db_user.as_str()),
+            ("DB_PASSWORD", req.db_password.as_str()),
+            ("DB_HOST", req.mariadb_container.as_str()),
+        ] {
+            // WP-CLI reads the value from stdin, keeping credentials out of argv.
+            critical(process::run_with_stdin_bytes(
+                &wp_command(ctx, req, false).args([
+                    "config",
+                    "set",
+                    key,
+                    "--type=constant",
+                    "--prompt=value",
+                ]),
+                format!("{value}\n").as_bytes(),
+                &step_limits(),
+                cancel,
+            ))?;
+        }
+        let dump = ctx
+            .dump_managed
+            .create_new_file(&source_sql)
+            .map_err(Error::Io)?;
+        ctx.dump_managed
+            .set_mode(&source_sql, 0o600)
+            .map_err(Error::Io)?;
+        critical(process::run_with_stdout_file(
+            &wp_command(ctx, req, true).args(["db", "export", "-", "--add-drop-table"]),
+            dump,
+            &step_limits(),
+            cancel,
+        ))?;
+        database_mutated = true; // Even a failed import may have changed tables.
+        restore(ctx, req, &source_sql, cancel)?;
+        wp_step(
+            ctx,
+            req,
+            &[
+                "search-replace",
+                req.source_domain.as_str(),
+                req.staging_domain.as_str(),
+                "--all-tables",
+                "--report-changed-only",
+            ],
+            cancel,
+        )?;
+        wp_step(ctx, req, &["core", "is-installed"], cancel)?;
+        Ok(())
+    })();
+    let _ = ctx.dump_managed.remove_file(&source_sql);
+    if let Err(error) = work {
+        // A cancelled forward operation must still be allowed to recover.
+        let recovered_db = !database_mutated
+            || restore(ctx, req, &recovery_sql, &CancellationToken::default()).is_ok();
+        let removed = !created_target || staging.remove_dir_all(relative).is_ok();
+        let recovered_files = if moved_files && recovered_db && removed {
+            staging.rename(&saved_files, relative).is_ok()
+        } else {
+            !moved_files
+        };
+        if !recovered_db || !removed || !recovered_files {
+            return Err(Error::RecoveryRequired);
+        }
+        scope.remove_file(&pending).map_err(Error::Io)?;
+        return Err(error);
+    }
+    // Keep target.sql, manifest.json and old files for explicit recovery.
+    // pending.json is cleared only after execute() durably records commit.
+    Ok(())
+}
+
+fn restore(
+    ctx: &Context<'_>,
+    req: &Request,
+    file: &SiteRelativePath,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let absolute = ctx
+        .dump_root
+        .resolve_existing(file)
+        .map_err(|_| Error::UnsafeTarget)?;
+    let request = crate::db_restore::RestoreRequest {
+        db_type: DbType::Mariadb,
+        database: req.db_name.clone(),
+        container: req.mariadb_container.clone(),
+        file_path: absolute.to_str().ok_or(Error::UnsafeTarget)?.into(),
+        root_password: req.db_root_password.clone(),
+        request_id: req.request_id,
+        idempotency_key: req.idempotency_key.clone(),
+    };
+    run_restore(
+        &RestoreContext {
+            engine_state: ctx.engine_state,
+            docker_program: ctx.docker_program,
+            gunzip_program: "gunzip",
+        },
+        &request,
+        cancel,
+    )
+    .map_err(Error::Import)
 }
 
 fn critical(output: Result<process::ProcessOutput, ProcessRunError>) -> Result<(), Error> {
@@ -545,6 +743,11 @@ mod tests {
                 "sourceUid": 5000,
                 "sourceGid": 5000,
                 "stagingRoot": "{staging}",
+                "stagingContainer": "runtime-staging",
+                "sourceDomain": "source.example.com",
+                "stagingDomain": "staging.example.com",
+                "dbUser": "staging_user",
+                "dbPassword": "staging-secret",
                 "stagingUid": {uid},
                 "stagingGid": {gid},
                 "mariadbContainer": "mariadb-1",
@@ -559,11 +762,11 @@ mod tests {
     }
 
     fn current_uid() -> u32 {
-        unsafe { libc::getuid() }
+        unsafe { libc::getuid().max(1) }
     }
 
     fn current_gid() -> u32 {
-        unsafe { libc::getgid() }
+        unsafe { libc::getgid().max(1) }
     }
 
     #[test]
@@ -646,15 +849,33 @@ mod tests {
     const FAKE_CP: &str =
         "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/cp-calls.log\"\nexec cp \"$@\"\n";
 
-    /// A fake `docker` standing in for both WP-CLI (`db export -`, prints a
-    /// fixed dump to stdout) and the MariaDB client (`exec -i ... mariadb
-    /// ...`, reads stdin into `received.sql`) - matching `db_restore::
-    /// execute`'s own test fake. A `REJECT` marker file makes the import
-    /// branch fail, simulating the database rejecting the dump.
+    // Simulates the bounded Docker/WP-CLI boundary; file copy stays real.
     fn fake_docker(reject_import: bool) -> String {
-        format!(
-            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/docker-calls.log\"\ncase \"$*\" in\n  *\"db export\"*)\n    printf '%s\\n' '-- dump --' \"INSERT INTO wp_options VALUES (1,'x');\"\n    exit 0\n    ;;\n  *)\n    {reject}\n    cat > \"$(dirname \"$0\")/received.sql\"\n    exit 0\n    ;;\nesac\n",
-            reject = if reject_import { "exit 1" } else { ":" }
+        let script = r#"#!/bin/sh
+base="$(dirname "$0")"
+echo "$@" >> "$base/docker-calls.log"
+case "$*" in
+  *"config get DB_NAME"*) echo source_db ;;
+  *"mariadb-dump"*) echo '-- original target database --' ;;
+  *"config set"*) cat >> "$base/config-inputs" ;;
+  *"db export"*) printf '%s\n' '-- dump --' "INSERT INTO wp_options VALUES (1,'x');" ;;
+  *"search-replace"*) test ! -f "$base/REJECT_REPLACE" ;;
+  *"core is-installed"*) test ! -f "$base/REJECT_HEALTH" ;;
+  *"mariadb "*)
+    cat > "$base/last-import.sql"
+    if grep -q 'original target' "$base/last-import.sql"; then
+      cp "$base/last-import.sql" "$base/recovered.sql"
+      test ! -f "$base/REJECT_RECOVERY"
+    else
+      cp "$base/last-import.sql" "$base/received.sql"
+      REJECT_IMPORT
+    fi ;;
+  *) exit 2 ;;
+esac
+"#;
+        script.replace(
+            "REJECT_IMPORT",
+            if reject_import { "exit 1" } else { "exit 0" },
         )
     }
 
@@ -867,5 +1088,182 @@ mod tests {
             "a replayed idempotency key must not re-run the clone"
         );
         assert!(!docker_log.exists());
+    }
+    #[test]
+    fn finalization_failure_restores_old_files_and_database_and_keeps_secrets_out_of_state() {
+        for failure in ["REJECT_REPLACE", "REJECT_HEALTH"] {
+            let fx = fixture(&fake_docker(false), Some("original.txt"));
+            fs::write(fx.docker.parent().unwrap().join(failure), "").unwrap();
+            let req = request_for(&fx, REQUEST_ID, None);
+            let err = execute(
+                &context(&fx),
+                &fx.content_root,
+                &fx.content_root,
+                &req,
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+            assert_eq!(err.protocol().0, ErrorCode::SubprocessFailed);
+            assert_eq!(
+                fs::read_to_string(fx.staging_root.join("original.txt")).unwrap(),
+                "stale content"
+            );
+            assert!(!fx.staging_root.join("wp-config.php").exists());
+            assert!(fx.docker.parent().unwrap().join("recovered.sql").exists());
+            let manifest = fs::read_to_string(
+                fx.dump_root
+                    .as_path()
+                    .join(format!("wordpress-clone/{REQUEST_ID}/manifest.json")),
+            )
+            .unwrap();
+            assert!(!manifest.contains("staging-secret"));
+            assert!(!manifest.contains("rootpw"));
+        }
+    }
+
+    #[test]
+    fn successful_clone_finalizes_on_staging_runtime_before_health_check() {
+        let fx = fixture(&fake_docker(false), None);
+        let req = request_for(&fx, REQUEST_ID, None);
+        execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &req,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let log = fs::read_to_string(fx.docker.parent().unwrap().join("docker-calls.log")).unwrap();
+        assert!(log.contains("runtime-staging wp"));
+        assert!(log.contains("config set DB_HOST --type=constant --prompt=value"));
+        assert!(log.contains("search-replace source.example.com staging.example.com --all-tables"));
+        assert!(log.find("config set DB_PASSWORD").unwrap() < log.find("search-replace").unwrap());
+        assert!(log.find("search-replace").unwrap() < log.find("core is-installed").unwrap());
+        assert!(!log.contains("staging-secret"));
+        assert!(
+            fs::read_to_string(fx.docker.parent().unwrap().join("config-inputs"))
+                .unwrap()
+                .contains("staging-secret")
+        );
+    }
+
+    #[test]
+    fn recovery_failure_retains_artifacts_and_blocks_another_clone() {
+        let fx = fixture(&fake_docker(false), Some("original.txt"));
+        for marker in ["REJECT_REPLACE", "REJECT_RECOVERY"] {
+            fs::write(fx.docker.parent().unwrap().join(marker), "").unwrap();
+        }
+        let req = request_for(&fx, REQUEST_ID, None);
+        let err = execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &req,
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.protocol().0, ErrorCode::Conflict);
+        assert!(
+            fx.content_root
+                .as_path()
+                .join(format!(".wcp-clone-{REQUEST_ID}/site/original.txt"))
+                .exists()
+        );
+        assert!(
+            fx.dump_root
+                .as_path()
+                .join(format!("wordpress-clone/{REQUEST_ID}/target.sql"))
+                .exists()
+        );
+        assert!(!fx.staging_root.exists());
+        let req2 = request_for(&fx, "223e4567-e89b-12d3-a456-426614174000", None);
+        assert_eq!(
+            execute(
+                &context(&fx),
+                &fx.content_root,
+                &fx.content_root,
+                &req2,
+                &CancellationToken::default()
+            )
+            .unwrap_err()
+            .protocol()
+            .0,
+            ErrorCode::Conflict
+        );
+    }
+
+    #[test]
+    fn refuses_source_database_as_target_and_symlinked_wp_config() {
+        let fx = fixture(&fake_docker(false), Some("original.txt"));
+        let mut req = request_for(&fx, REQUEST_ID, None);
+        req.db_name = DatabaseName::parse("source_db").unwrap();
+        assert!(
+            execute(
+                &context(&fx),
+                &fx.content_root,
+                &fx.content_root,
+                &req,
+                &CancellationToken::default()
+            )
+            .is_err()
+        );
+        assert!(fx.staging_root.join("original.txt").exists());
+        assert!(!fx.docker.parent().unwrap().join("received.sql").exists());
+
+        let fx = fixture(&fake_docker(false), Some("original.txt"));
+        fs::remove_file(fx.source_root.join("wp-config.php")).unwrap();
+        std::os::unix::fs::symlink(
+            "wp-content/plugin.php",
+            fx.source_root.join("wp-config.php"),
+        )
+        .unwrap();
+        let req = request_for(&fx, REQUEST_ID, None);
+        assert!(
+            execute(
+                &context(&fx),
+                &fx.content_root,
+                &fx.content_root,
+                &req,
+                &CancellationToken::default()
+            )
+            .is_err()
+        );
+        assert!(fx.staging_root.join("original.txt").exists());
+        assert!(!fx.docker.parent().unwrap().join("received.sql").exists());
+    }
+
+    #[test]
+    fn rejects_missing_finalization_fields_root_identity_and_invalid_domain() {
+        let json = valid_json(
+            std::path::Path::new("/var/www/source"),
+            std::path::Path::new("/var/www/target"),
+        );
+        for field in [
+            "stagingContainer",
+            "sourceDomain",
+            "stagingDomain",
+            "dbUser",
+            "dbPassword",
+        ] {
+            let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(Request::parse(&value.to_string(), REQUEST_ID, None).is_err());
+        }
+        assert!(
+            Request::parse(
+                &json.replace("source.example.com", "--evil"),
+                REQUEST_ID,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            Request::parse(
+                &json.replace("\"sourceUid\": 5000", "\"sourceUid\": 0"),
+                REQUEST_ID,
+                None
+            )
+            .is_err()
+        );
     }
 }
