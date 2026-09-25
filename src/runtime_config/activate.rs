@@ -10,7 +10,13 @@
 //! this is also a port of), just parameterized by which container and
 //! which subdirectory of `runtime_root` a request names, since — unlike
 //! `ingress`'s single, fixed `INGRESS_SERVICE` — the target runtime pool
-//! varies per request.
+//! varies per request. One difference from `ingress` is not structural but
+//! does matter here: `ingress_root` is bind-mounted into its container at
+//! an identical path, so a host path doubles as the container path. A
+//! runtime-<id> container's mount drops the `<runtime_id>` segment
+//! (`RUNTIME_CONTAINER_CONFIG_DIR`'s doc comment), so the path `caddy
+//! validate` is given is built from that fixed prefix, not resolved from
+//! `runtime_root`.
 
 use std::io;
 
@@ -19,6 +25,7 @@ use crate::{
     filesystem::ManagedRoot,
     ingress::{HashGuard, LIVE_CONFIG_PATH},
     process::{ProcessOutput, ProcessTermination, SubprocessDiagnostics},
+    runtime_config::RUNTIME_CONTAINER_CONFIG_DIR,
     site::{Domain, RuntimeId, SiteRelativePath, TrustedRoot, ValidationError},
 };
 
@@ -150,27 +157,25 @@ pub(crate) fn activate(
     root.write_atomic(&paths.staged, content.as_bytes())
         .map_err(Error::Io)?;
 
-    // The one path this operation has to name to something outside its own
-    // process. `resolve_existing` canonicalizes it and proves it is really
-    // inside `runtime_root` — a symlink planted at the fragment name cannot
-    // get a file elsewhere on the host validated (or, below, replaced). The
-    // container sees this exact path: the runtime-service bind-mounts its
-    // config directory at the identical location inside the container
-    // (mirroring the ingress container's own bind-mount), which is why
-    // `activate_caddyfile`'s runtime call sites also pass one value as both
-    // `host_dest` and `container_dest`.
-    let staged_path = match runtime_root.resolve_existing(&paths.staged) {
-        Ok(path) => path,
-        Err(error) => {
-            discard(&root, &paths.staged);
-            return Err(Error::Path(error));
-        }
-    };
-    let Some(staged_path) = staged_path.to_str() else {
+    // `resolve_existing` canonicalizes the staged path and proves it is
+    // really inside `runtime_root` — a symlink planted at the fragment name
+    // cannot get a file elsewhere on the host validated (or, below,
+    // replaced). Unlike `ingress::activate::activate_live`'s route files,
+    // the resolved *host* path is not what the container sees: a
+    // runtime-<id> container only ever bind-mounts its own
+    // `runtime_root/<runtime_id>` at the fixed `RUNTIME_CONTAINER_CONFIG_DIR`
+    // (see that constant's doc comment), dropping the `<runtime_id>`
+    // segment. So the path `caddy validate` is given is built from that
+    // fixed prefix and the fragment's own name — the same way
+    // `website-control-panel`'s `activate_caddyfile` call sites build
+    // `exec_container_dest` alongside (not from) `exec_host_dest`
+    // (`runtime_pool/lifecycle.rs:122-131`).
+    if let Err(error) = runtime_root.resolve_existing(&paths.staged) {
         discard(&root, &paths.staged);
-        return Err(Error::Path(ValidationError::PathResolutionFailed));
-    };
-    if let Err(failure) = validate(compose, &service, staged_path) {
+        return Err(Error::Path(error));
+    }
+    let staged_path = format!("{RUNTIME_CONTAINER_CONFIG_DIR}/{domain}.caddyfile.tmp");
+    if let Err(failure) = validate(compose, &service, &staged_path) {
         discard(&root, &paths.staged);
         return Err(Error::ValidateFailed(failure));
     }
@@ -315,12 +320,13 @@ fn check(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{fs, path::Path};
+    use std::fs;
 
     use super::{Activation, ComposeFailure, Error, RestoreFailure, activate};
     use crate::{
         compose,
         ingress::{ConfigHash, HashGuard, fake_docker::FakeDocker},
+        runtime_config::RUNTIME_CONTAINER_CONFIG_DIR,
         site::{Domain, RuntimeId, TrustedRoot},
     };
 
@@ -423,6 +429,14 @@ mod tests {
     /// Validation and reload must run against the runtime-service container
     /// this `runtime_id` actually names, not a fixed one — the whole reason
     /// this operation exists separately from `ingress.activateConfig`.
+    ///
+    /// The validate path is asserted against `RUNTIME_CONTAINER_CONFIG_DIR`
+    /// directly, not against anything derived from `root.dir` — a
+    /// regression test for the bug where this used the resolved *host*
+    /// path (`runtime_root/<runtime_id>/...`), which does not exist inside
+    /// the container: `runtime-<id>` only ever bind-mounts its own
+    /// `runtime_root/<runtime_id>` at the fixed, `<runtime_id>`-less
+    /// `RUNTIME_CONTAINER_CONFIG_DIR`.
     #[test]
     fn validation_and_reload_target_the_named_runtime_service() {
         let root = runtime_root(None);
@@ -430,21 +444,20 @@ mod tests {
 
         run(&root, &docker, UPDATED, HashGuard::Absent).expect("activation should apply");
 
-        let expected = root
-            .dir
-            .path()
-            .canonicalize()
-            .expect("runtime root should canonicalize")
-            .join(format!("{ROUTE}.tmp"));
         let call = docker.calls("validate").remove(0);
         assert!(
             call.contains(&format!(
-                "exec -T runtime-{RUNTIME_ID} caddy validate --config {} --adapter caddyfile",
-                expected.display()
+                "exec -T runtime-{RUNTIME_ID} caddy validate --config \
+                 {RUNTIME_CONTAINER_CONFIG_DIR}/{DOMAIN}.caddyfile.tmp --adapter caddyfile"
             )),
             "unexpected validate argv: {call}"
         );
-        assert!(Path::new(&expected).is_absolute());
+        assert!(
+            !call.contains(&format!("{RUNTIME_CONTAINER_CONFIG_DIR}/{RUNTIME_ID}")),
+            "the container-side config path must not nest the runtime_id under \
+             RUNTIME_CONTAINER_CONFIG_DIR, since the bind-mount already scopes the \
+             container to one runtime pool: {call}"
+        );
         assert!(
             docker.calls("reload")[0].contains(&format!(
                 "exec -T runtime-{RUNTIME_ID} caddy reload --config /etc/caddy/Caddyfile \

@@ -42,6 +42,22 @@ use crate::{
 /// `TransactionState::operation` for every activation attempt.
 pub const OPERATION: &str = "runtime.activateConfig";
 
+/// Where a runtime-service container sees its config fragments, regardless
+/// of which `runtime_id` it is: `website-control-panel`'s
+/// `RUNTIME_CONTAINER_CONFIG_DIR` (`runtime_pool/mod.rs`), reproduced here
+/// rather than shared across the process boundary. `runtime_root` on the
+/// host nests one directory per `runtime_id`
+/// (`runtime_root/<runtime_id>/<domain>.caddyfile`), but each runtime-<id>
+/// container only ever bind-mounts its own `runtime_root/<runtime_id>` at
+/// this fixed path (`images/stack/docker-compose.v2.yml`:
+/// `/etc/wcp/runtimes/<runtime_id>:/etc/wcp/runtime.d:ro`) — the
+/// `<runtime_id>` segment is consumed by which host directory is mounted,
+/// not present in the container-side path. `activate::activate` uses this
+/// to build the path `caddy validate` is given, since — unlike
+/// `ingress::activate_live`'s route files — the host and container paths
+/// here are not identical.
+pub const RUNTIME_CONTAINER_CONFIG_DIR: &str = "/etc/wcp/runtime.d";
+
 /// Upper bound on a submitted config fragment. Reuses `ingress`'s bound
 /// rather than defining a fresh one: a runtime-service Caddyfile fragment
 /// (one site's `reverse_proxy`/worker block) is the same order of size as
