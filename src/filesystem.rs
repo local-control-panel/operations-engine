@@ -107,6 +107,20 @@ impl ManagedRoot {
             .map(cap_std::fs::File::into_std)
     }
 
+    /// Opens `path` for reading and writing, creating it if absent but
+    /// never truncating or replacing an existing file - the counterpart to
+    /// `create_new_file` for callers that need one persistent file reused
+    /// across calls (an OS-level advisory lock target) rather than a fresh
+    /// artifact every time.
+    pub fn open_or_create_file(&self, path: &SiteRelativePath) -> io::Result<std::fs::File> {
+        self.directory
+            .open_with(
+                path.as_path(),
+                OpenOptions::new().read(true).write(true).create(true),
+            )
+            .map(cap_std::fs::File::into_std)
+    }
+
     pub fn modified(&self, path: &SiteRelativePath) -> io::Result<std::time::SystemTime> {
         self.directory
             .metadata(path.as_path())?
@@ -231,7 +245,12 @@ fn temp_sibling_path(path: &SiteRelativePath) -> io::Result<SiteRelativePath> {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{fs, os::unix::fs::symlink, path::Path};
+    use std::{
+        fs,
+        io::{Read, Seek, SeekFrom, Write},
+        os::unix::fs::symlink,
+        path::Path,
+    };
 
     use crate::site::{SiteRelativePath, TrustedRoot};
 
@@ -437,5 +456,32 @@ mod tests {
             b"second binary, longer than the first"
         );
         assert!(!directory.path().join("ops-engine.tmp").exists());
+    }
+
+    #[test]
+    fn open_or_create_file_creates_once_and_reuses_the_same_file_on_later_calls() {
+        let directory = tempfile::tempdir().expect("temporary directory should exist");
+        let root = TrustedRoot::parse(directory.path()).expect("root should be valid");
+        let managed = ManagedRoot::open(&root).expect("root should open");
+        let path = SiteRelativePath::parse("reused").expect("path should be valid");
+
+        {
+            let mut file = managed
+                .open_or_create_file(&path)
+                .expect("first open should create the file");
+            file.write_all(b"first").expect("write should succeed");
+        }
+
+        let mut file = managed
+            .open_or_create_file(&path)
+            .expect("second open should reuse the existing file, not fail or truncate it");
+        file.seek(SeekFrom::Start(0)).expect("seek should succeed");
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)
+            .expect("read should succeed");
+        assert_eq!(
+            contents, "first",
+            "open_or_create_file must not truncate an existing file"
+        );
     }
 }
