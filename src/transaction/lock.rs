@@ -34,11 +34,26 @@ impl std::fmt::Debug for SiteLockGuard<'_> {
     }
 }
 
+/// Exposes the guard's underlying file descriptor so external callers (e.g.
+/// integration tests outside this crate's module tree, which cannot reach
+/// the private `_file` field) can perform a faithful crash simulation - an
+/// explicit `close` on this fd, not just dropping or forgetting the guard -
+/// the same way `std::fs::File` itself exposes its own fd.
+impl std::os::fd::AsRawFd for SiteLockGuard<'_> {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self._file.as_raw_fd()
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum LockError {
-    /// Another request holds the lock right now.
+    /// Another request holds the lock right now. `holder` is `None` when
+    /// the lock is genuinely held (the kernel's `flock` proved it) but this
+    /// holder's own diagnostic record could not be read back - e.g. it is
+    /// mid-write - which is still ordinary contention, not an internal
+    /// failure.
     Held {
-        holder: RequestId,
+        holder: Option<RequestId>,
         held_for: Duration,
     },
     /// The lock file could not be opened, locked, read, or written as
@@ -65,10 +80,15 @@ pub fn acquire<'a>(
     if result != 0 {
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::WouldBlock {
-            let existing = read_lock(root, path)?;
-            return Err(LockError::Held {
-                holder: existing.record.holder,
-                held_for: existing.held_for,
+            return Err(match read_lock(root, path) {
+                Ok(existing) => LockError::Held {
+                    holder: Some(existing.record.holder),
+                    held_for: existing.held_for,
+                },
+                Err(_) => LockError::Held {
+                    holder: None,
+                    held_for: Duration::ZERO,
+                },
             });
         }
         return Err(LockError::Io);
@@ -166,8 +186,11 @@ mod tests {
         let _guard = acquire(&managed, &path, first).expect("first acquire should succeed");
 
         match acquire(&managed, &path, second) {
-            Err(LockError::Held { holder, held_for: _ }) => {
-                assert_eq!(holder, first);
+            Err(LockError::Held {
+                holder,
+                held_for: _,
+            }) => {
+                assert_eq!(holder, Some(first));
             }
             other => panic!("expected Held, got {other:?}"),
         }
@@ -220,7 +243,11 @@ mod tests {
         std::fs::write(directory.path().join("locks/mutation.lock"), b"not json")
             .expect("corrupt lock file should be written");
 
-        let outcome = acquire(&managed, &path, holder("550e8400-e29b-41d4-a716-446655440000"));
+        let outcome = acquire(
+            &managed,
+            &path,
+            holder("550e8400-e29b-41d4-a716-446655440000"),
+        );
         assert!(
             outcome.is_ok(),
             "corrupt content with no live OS-level holder must not block acquisition \
@@ -234,8 +261,14 @@ mod tests {
             holder("123e4567-e89b-12d3-a456-426614174000"),
         );
         match second {
-            Err(LockError::Held { holder, .. }) => {
-                assert_eq!(holder.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+            Err(LockError::Held {
+                holder: found_holder,
+                ..
+            }) => {
+                assert_eq!(
+                    found_holder,
+                    Some(holder("550e8400-e29b-41d4-a716-446655440000"))
+                );
             }
             other => panic!("expected the repaired record to report the new holder: {other:?}"),
         }

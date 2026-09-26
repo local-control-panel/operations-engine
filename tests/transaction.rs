@@ -6,7 +6,7 @@
 //! mutual exclusion, idempotent retries, recoverable interruption, and a
 //! commit point cancellation cannot cross.
 
-use std::{thread, time::Duration};
+use std::{os::fd::AsRawFd, thread, time::Duration};
 
 use operations_engine::{
     error::ErrorCode,
@@ -21,7 +21,7 @@ use operations_engine::{
         IdempotencyKey, RequestId, audit,
         commit::PreCommit,
         idempotency::{self, Resolution},
-        lock::{self, DEFAULT_STALE_AFTER},
+        lock::{self},
         state::{self, TransactionState},
     },
 };
@@ -64,8 +64,7 @@ fn concurrent_requests_cannot_hold_the_same_site_lock_at_once() {
     let first = request_id("550e8400-e29b-41d4-a716-446655440000");
     let second = request_id("123e4567-e89b-12d3-a456-426614174000");
 
-    let guard =
-        lock::acquire(&managed, &path, first, DEFAULT_STALE_AFTER).expect("first should acquire");
+    let guard = lock::acquire(&managed, &path, first).expect("first should acquire");
 
     // A genuinely concurrent attempt from another OS thread, while `guard`
     // is still held on this one.
@@ -73,8 +72,8 @@ fn concurrent_requests_cannot_hold_the_same_site_lock_at_once() {
         scope
             .spawn(|| {
                 matches!(
-                    lock::acquire(&managed, &path, second, DEFAULT_STALE_AFTER),
-                    Err(lock::LockError::Held { holder, .. }) if holder == first
+                    lock::acquire(&managed, &path, second),
+                    Err(lock::LockError::Held { holder, .. }) if holder == Some(first)
                 )
             })
             .join()
@@ -86,7 +85,7 @@ fn concurrent_requests_cannot_hold_the_same_site_lock_at_once() {
     );
 
     drop(guard);
-    lock::acquire(&managed, &path, second, DEFAULT_STALE_AFTER)
+    lock::acquire(&managed, &path, second)
         .expect("lock should be free once the first guard is dropped");
 }
 
@@ -98,7 +97,7 @@ fn full_lifecycle_persists_state_emits_progress_and_releases_the_lock_on_success
     let state_file = state_path(id);
     let audit_log = audit_path();
 
-    let guard = lock::acquire(&managed, &lock_file, id, DEFAULT_STALE_AFTER)
+    let guard = lock::acquire(&managed, &lock_file, id)
         .expect("lock should be free at the start of a lifecycle");
     audit::append(
         &managed,
@@ -170,7 +169,6 @@ fn full_lifecycle_persists_state_emits_progress_and_releases_the_lock_on_success
         &managed,
         &lock_file,
         request_id("123e4567-e89b-12d3-a456-426614174000"),
-        DEFAULT_STALE_AFTER,
     )
     .expect("lock should be free once the guard was dropped");
 }
@@ -182,8 +180,7 @@ fn cancellation_before_commit_aborts_without_crossing_the_commit_point() {
     let lock_file = lock_path();
     let state_file = state_path(id);
 
-    let guard =
-        lock::acquire(&managed, &lock_file, id, DEFAULT_STALE_AFTER).expect("lock should acquire");
+    let guard = lock::acquire(&managed, &lock_file, id).expect("lock should acquire");
     let mut transaction_state = TransactionState::start(id, None, OPERATION);
     state::create(&managed, &state_file, &transaction_state).expect("state should be created");
 
@@ -211,7 +208,6 @@ fn cancellation_before_commit_aborts_without_crossing_the_commit_point() {
         &managed,
         &lock_file,
         request_id("123e4567-e89b-12d3-a456-426614174000"),
-        DEFAULT_STALE_AFTER,
     )
     .expect("aborting before commit must leave the lock free for the next attempt");
 }
@@ -250,16 +246,22 @@ fn a_crashed_holder_leaves_recoverable_state_for_the_next_attempt() {
     let recovering = request_id("123e4567-e89b-12d3-a456-426614174000");
     let state_file = state_path(crashed);
 
-    let guard =
-        lock::acquire(&managed, &lock_file, crashed, Duration::ZERO).expect("lock should acquire");
+    let guard = lock::acquire(&managed, &lock_file, crashed).expect("lock should acquire");
     let transaction_state = TransactionState::start(crashed, None, OPERATION);
     state::create(&managed, &state_file, &transaction_state).expect("state should be created");
-    // Simulate a crash: the process exits without releasing the lock or
-    // ever transitioning the state out of `InProgress`.
+    // Simulate a crash: the kernel closes every fd the process held,
+    // including this one, without running any of the guard's own Drop
+    // logic. `mem::forget` skips Drop but leaves the fd open, so an
+    // explicit `close` here is what actually reproduces "the fd is gone",
+    // the only thing that releases an flock.
+    let fd = guard.as_raw_fd();
     std::mem::forget(guard);
+    unsafe {
+        libc::close(fd);
+    }
 
-    let reclaimed = lock::acquire(&managed, &lock_file, recovering, Duration::ZERO)
-        .expect("stale lock should be reclaimed by the next attempt");
+    let reclaimed = lock::acquire(&managed, &lock_file, recovering)
+        .expect("a crashed holder's lock must be immediately available to the next attempt");
     audit::append(
         &managed,
         &audit_path(),
