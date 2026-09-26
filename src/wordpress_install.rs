@@ -30,6 +30,7 @@ use crate::{
     transaction::{
         IdempotencyKey, RequestId,
         audit::{self, AuditRecord},
+        resource_lock,
         state::{self, TransactionStatus},
     },
 };
@@ -207,6 +208,7 @@ pub enum Error {
     Run(ProcessRunError),
     Rejected(ErrorCode),
     RootUnavailable,
+    ResourceBusy,
     PostCommit { result: InstallResult },
     Replayed { code: ErrorCode, message: String },
 }
@@ -233,6 +235,10 @@ impl Error {
             Self::RootUnavailable => (
                 ErrorCode::InvalidInput,
                 "WordPress root does not exist or is outside the configured content root".into(),
+            ),
+            Self::ResourceBusy => (
+                ErrorCode::Conflict,
+                "another WordPress operation is already in progress for this site".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             _ => (
@@ -282,6 +288,19 @@ pub fn execute(
     let state_path =
         SiteRelativePath::parse(format!("transactions/{}.json", req.request_id)).unwrap();
     let audit_path = SiteRelativePath::parse("audit/events.jsonl").unwrap();
+
+    let _resource_lock = match resource_lock::acquire(ctx.engine_state, &req.root, req.request_id) {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(fail(
+                &scope,
+                &state_path,
+                &audit_path,
+                state,
+                Error::ResourceBusy,
+            ));
+        }
+    };
 
     let relative = match req.root.strip_prefix(content_root.as_path()) {
         Ok(value) if !value.as_os_str().is_empty() => value,
@@ -885,6 +904,33 @@ mod tests {
             calls_log(&fx).len(),
             calls_after_first,
             "a replayed idempotency key must not run WP-CLI again"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_operation_holding_the_resource_lock_blocks_install() {
+        let fx = fixture(ALWAYS_SUCCEED);
+        let other_holder = RequestId::parse("223e4567-e89b-12d3-a456-426614174000")
+            .expect("test UUID should be canonical");
+        let _held = resource_lock::acquire(&fx.state, &fx.site_root, other_holder)
+            .expect("resource lock should be free to acquire");
+
+        let context = Context {
+            engine_state: &fx.state,
+            docker_program: fx.docker.to_str().unwrap(),
+        };
+        let request = request_for(&fx.site_root, REQUEST_ID, None);
+
+        let outcome = execute(
+            &context,
+            &fx.content_root,
+            &request,
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(outcome, Err(Error::ResourceBusy)),
+            "an install must not proceed while another operation holds this root's resource \
+             lock: {outcome:?}"
         );
     }
 }
