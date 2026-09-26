@@ -40,6 +40,8 @@ struct IndexRecord {
     schema_version: u32,
     idempotency_key: String,
     request_id: RequestId,
+    #[serde(default)]
+    claimed_at_unix_secs: u64,
 }
 
 fn idempotency_dir() -> SiteRelativePath {
@@ -72,6 +74,7 @@ pub fn claim(
         schema_version: INDEX_SCHEMA_VERSION,
         idempotency_key: key.as_str().to_owned(),
         request_id,
+        claimed_at_unix_secs: unix_now_secs(),
     };
     let bytes = serde_json::to_vec(&record).map_err(|_| IndexError::Io)?;
 
@@ -99,6 +102,79 @@ pub fn remove(root: &ManagedRoot, key: &IdempotencyKey) -> Result<(), IndexError
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(IndexError::Io),
     }
+}
+
+/// Overwrites the claim for `key` to point at `request_id`, regardless of
+/// what (if anything) was recorded there before. Used only to recover an
+/// orphaned claim - one whose `RequestId` has no backing transaction state,
+/// typically because the original attempt crashed between claiming the key
+/// and creating its transaction record. Callers must only call this after
+/// independently establishing exclusivity (the site lock), never as a
+/// substitute for `claim`'s atomic create-if-absent.
+pub fn reclaim(
+    root: &ManagedRoot,
+    key: &IdempotencyKey,
+    request_id: RequestId,
+) -> Result<(), IndexError> {
+    let path = index_path(key);
+    let record = IndexRecord {
+        schema_version: INDEX_SCHEMA_VERSION,
+        idempotency_key: key.as_str().to_owned(),
+        request_id,
+        claimed_at_unix_secs: unix_now_secs(),
+    };
+    let bytes = serde_json::to_vec(&record).map_err(|_| IndexError::Io)?;
+    root.write_atomic(&path, &bytes).map_err(|_| IndexError::Io)
+}
+
+/// One idempotency claim on disk, as much detail as a retention sweep
+/// needs to decide whether it is orphaned.
+pub struct ClaimEntry {
+    pub path: SiteRelativePath,
+    pub request_id: RequestId,
+    pub claimed_at_unix_secs: u64,
+}
+
+/// Lists every idempotency claim on disk, for `transaction::prune`'s
+/// orphaned-claim sweep. Not for ordinary lookup - use `claim`/`lookup` for
+/// that. Best-effort: an entry this cannot list, read, or parse is
+/// silently skipped, matching `transaction::prune`'s existing tolerance for
+/// a directory sweep.
+pub fn list(root: &ManagedRoot) -> Vec<ClaimEntry> {
+    let Ok(dir) = root.open_managed_dir(&idempotency_dir()) else {
+        return Vec::new();
+    };
+    let Ok(names) = dir.file_names() else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for name in names {
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(path) = SiteRelativePath::parse(format!("transactions/idempotency/{name}")) else {
+            continue;
+        };
+        let Ok(json) = root.read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<IndexRecord>(&json) else {
+            continue;
+        };
+        entries.push(ClaimEntry {
+            path,
+            request_id: record.request_id,
+            claimed_at_unix_secs: record.claimed_at_unix_secs,
+        });
+    }
+    entries
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Looks up an existing claim for `key` without creating one.
@@ -214,5 +290,39 @@ mod tests {
             lookup(&managed, &colliding_key).unwrap_err(),
             IndexError::HashCollision
         );
+    }
+
+    #[test]
+    fn reclaim_overwrites_an_existing_claim_regardless_of_its_current_target() {
+        let (_directory, managed) = managed_root();
+        let deploy_key = key("deploy-2026-09-02-01");
+        let orphan = id("550e8400-e29b-41d4-a716-446655440000");
+        let reclaimer = id("123e4567-e89b-12d3-a456-426614174000");
+
+        claim(&managed, &deploy_key, orphan).unwrap();
+        super::reclaim(&managed, &deploy_key, reclaimer).unwrap();
+
+        assert_eq!(lookup(&managed, &deploy_key).unwrap(), Some(reclaimer));
+    }
+
+    #[test]
+    fn list_reports_every_claim_with_its_request_id_and_claimed_at_time() {
+        let (_directory, managed) = managed_root();
+        let first_key = key("deploy-2026-09-02-01");
+        let second_key = key("deploy-2026-09-02-02");
+        let first_id = id("550e8400-e29b-41d4-a716-446655440000");
+        let second_id = id("123e4567-e89b-12d3-a456-426614174000");
+        claim(&managed, &first_key, first_id).unwrap();
+        claim(&managed, &second_key, second_id).unwrap();
+
+        let mut entries = super::list(&managed);
+        entries.sort_by_key(|entry| entry.request_id.to_string());
+        let mut expected = [first_id, second_id];
+        expected.sort_by_key(|id| id.to_string());
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].request_id, expected[0]);
+        assert_eq!(entries[1].request_id, expected[1]);
+        assert!(entries.iter().all(|entry| entry.claimed_at_unix_secs > 0));
     }
 }
