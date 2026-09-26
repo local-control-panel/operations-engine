@@ -10,17 +10,19 @@
 //! all, discover a proxy from the ambient environment, and permit a
 //! redirect to downgrade to plain HTTP. All three contradict rules this
 //! project has written down: fetches happen while the engine-global lock
-//! is held (`transaction::lock::DEFAULT_STALE_AFTER` is 15 minutes, so an
-//! unbounded fetch can have its own lock stolen out from under it), and
+//! is held (`transaction::lock::acquire` holds that lock for as long as
+//! this process is alive, with no time-based expiry, so an unbounded fetch
+//! would otherwise keep every other mutation locked out indefinitely), and
 //! the design spec's "no ambient discovery" rule excludes taking a
 //! network destination from `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`.
 
 use std::{sync::OnceLock, time::Duration};
 
-/// Total wall-clock bound on one fetch, comfortably under
-/// `transaction::lock::DEFAULT_STALE_AFTER` (15 minutes) so a stalled
-/// download can never outlive the lock protecting the install it belongs
-/// to. An install makes three of these calls in sequence.
+/// Total wall-clock bound on one fetch, keeping a stalled download from
+/// holding up the engine-global lock indefinitely - the lock itself has no
+/// timeout, so this bound (not the lock) is what keeps a hung fetch from
+/// blocking every other mutation forever. An install makes three of these
+/// calls in sequence.
 const TIMEOUT_GLOBAL: Duration = Duration::from_secs(120);
 const TIMEOUT_CONNECT: Duration = Duration::from_secs(15);
 const TIMEOUT_RECV_BODY: Duration = Duration::from_secs(90);

@@ -17,7 +17,7 @@ use crate::{
         IdempotencyKey, RequestId,
         audit::{self, AuditError, AuditRecord},
         idempotency::{self, IndexError, Resolution},
-        lock::{self, DEFAULT_STALE_AFTER, LockError, SiteLockGuard},
+        lock::{self, LockError, SiteLockGuard},
         prune::{self, DEFAULT_COMPLETED_RETENTION},
         state::{self, StateError, TransactionState},
     },
@@ -82,8 +82,7 @@ pub fn run<'a>(
         }
     }
 
-    let lock = lock::acquire(site_state, &lock_path(), request_id, DEFAULT_STALE_AFTER)
-        .map_err(Error::Lock)?;
+    let lock = lock::acquire(site_state, &lock_path(), request_id).map_err(Error::Lock)?;
 
     let transaction_state =
         TransactionState::start(request_id, idempotency_key.cloned(), operation);
@@ -137,7 +136,7 @@ mod tests {
         site::{SiteId, TrustedRoot},
         transaction::{
             IdempotencyKey, RequestId,
-            lock::{self, DEFAULT_STALE_AFTER},
+            lock::{self},
             state::{self, TransactionState, TransactionStatus},
         },
     };
@@ -174,12 +173,7 @@ mod tests {
 
         // The lock is genuinely held: a second attempt for the same site
         // must observe it, not silently acquire it too.
-        let contended = lock::acquire(
-            &site_state,
-            &lock_path(),
-            request_id(RETRY_REQUEST_ID),
-            DEFAULT_STALE_AFTER,
-        );
+        let contended = lock::acquire(&site_state, &lock_path(), request_id(RETRY_REQUEST_ID));
         assert!(matches!(contended, Err(lock::LockError::Held { .. })));
     }
 

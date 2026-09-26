@@ -350,7 +350,7 @@ mod tests {
         site::TrustedRoot,
         transaction::{
             RequestId,
-            lock::{self, DEFAULT_STALE_AFTER},
+            lock::{self},
         },
     };
 
@@ -517,7 +517,6 @@ mod tests {
             &crate::site::SiteRelativePath::parse("locks/mutation.lock")
                 .expect("literal path is valid"),
             RequestId::parse(RETRY_REQUEST_ID).expect("test UUID should be canonical"),
-            DEFAULT_STALE_AFTER,
         )
         .expect("the contending lock should be acquired");
 

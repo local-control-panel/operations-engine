@@ -370,7 +370,7 @@ mod tests {
         site::{RuntimeId, TrustedRoot},
         transaction::{
             RequestId,
-            lock::{self, DEFAULT_STALE_AFTER},
+            lock::{self},
         },
     };
 
@@ -559,7 +559,6 @@ mod tests {
                 .expect("literal path is valid"),
             RequestId::parse("9b2f1c34-5678-4abc-9def-0123456789ab")
                 .expect("test UUID should be canonical"),
-            DEFAULT_STALE_AFTER,
         )
         .expect("the other runtime id's lock should be acquired");
 
@@ -583,7 +582,6 @@ mod tests {
                 .expect("literal path is valid"),
             RequestId::parse("9b2f1c34-5678-4abc-9def-0123456789ab")
                 .expect("test UUID should be canonical"),
-            DEFAULT_STALE_AFTER,
         )
         .expect("the contending lock should be acquired");
 

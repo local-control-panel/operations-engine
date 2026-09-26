@@ -1,5 +1,6 @@
 use std::{
-    io,
+    io::{self, Seek, SeekFrom, Write},
+    os::fd::AsRawFd,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -9,94 +10,80 @@ use crate::{filesystem::ManagedRoot, site::SiteRelativePath, transaction::Reques
 
 const LOCK_SCHEMA_VERSION: u32 = 1;
 
-/// Default bound after which an unreleased lock is treated as abandoned and
-/// reclaimed by the next request, regardless of whether its original holder
-/// process is still running.
-// ponytail: staleness is purely time-based; it does not check whether the
-// holder's process is still alive (e.g. via /proc/<pid> on Linux). Add that
-// check if recovery needs to be faster than this bound without shortening it
-// for every caller.
-pub const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(15 * 60);
-
-/// Holds an exclusive per-site mutation lock. Dropping it releases the lock.
+/// Holds an exclusive per-site mutation lock, backed by an OS `flock` on
+/// the lock file's file descriptor rather than the file's mere existence
+/// or age. The kernel releases the lock the instant every file descriptor
+/// referring to it closes - including on process crash or `SIGKILL`, with
+/// no code here needing to run - so a live holder stays exclusive
+/// indefinitely and a dead one's lock is available to the very next
+/// `acquire` call, with no time-based staleness bound at all. Dropping the
+/// guard closes the file descriptor (releasing the lock) and deliberately
+/// never unlinks the file: unlinking on drop was the previous design's
+/// actual bug (a guard whose lock had already been reclaimed by a later
+/// holder would delete *that* holder's lock file out from under it).
+/// Reusing the same file forever means an old guard has nothing left to
+/// delete.
 pub struct SiteLockGuard<'a> {
-    root: &'a ManagedRoot,
-    path: SiteRelativePath,
+    _root: &'a ManagedRoot,
+    _file: std::fs::File,
 }
 
 impl std::fmt::Debug for SiteLockGuard<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SiteLockGuard")
-            .field("path", &self.path)
-            .finish()
-    }
-}
-
-impl Drop for SiteLockGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.root.remove_file(&self.path);
+        formatter.debug_struct("SiteLockGuard").finish()
     }
 }
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum LockError {
-    /// Another request holds the lock and it is not yet stale.
+    /// Another request holds the lock right now.
     Held {
         holder: RequestId,
         held_for: Duration,
     },
-    /// The lock file could not be created, read, or removed as expected.
+    /// The lock file could not be opened, locked, read, or written as
+    /// expected.
     Io,
 }
 
-/// Acquires the lock at `path` beneath `root` for `holder`, reclaiming it
-/// first if the existing lock is older than `stale_after`.
-///
-/// Reclaiming makes exactly one retry attempt: if another request wins that
-/// retry, this call reports the lock as held rather than retrying further.
+/// Acquires the OS-level exclusive lock on the file at `path` beneath
+/// `root` for `holder`. Never blocks: if another live process holds the
+/// lock, this returns `LockError::Held` immediately with that holder's
+/// identity and how long it has held the lock, read from the file's own
+/// content (best-effort diagnostics only - it plays no part in whether the
+/// lock is granted).
 pub fn acquire<'a>(
     root: &'a ManagedRoot,
     path: &SiteRelativePath,
     holder: RequestId,
-    stale_after: Duration,
 ) -> Result<SiteLockGuard<'a>, LockError> {
-    let record = lock_record_bytes(holder)?;
+    let mut file = root.open_or_create_file(path).map_err(|_| LockError::Io)?;
 
-    match root.create_new(path, &record) {
-        Ok(()) => {
-            return Ok(SiteLockGuard {
-                root,
-                path: path.clone(),
-            });
-        }
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(_) => return Err(LockError::Io),
-    }
-
-    let existing = read_lock(root, path)?;
-    if existing.held_for < stale_after {
-        return Err(LockError::Held {
-            holder: existing.record.holder,
-            held_for: existing.held_for,
-        });
-    }
-
-    let _ = root.remove_file(path);
-    match root.create_new(path, &record) {
-        Ok(()) => Ok(SiteLockGuard {
-            root,
-            path: path.clone(),
-        }),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+    // SAFETY: `file`'s raw fd is open and valid for the duration of this
+    // call, which is all `flock` needs.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
             let existing = read_lock(root, path)?;
-            Err(LockError::Held {
+            return Err(LockError::Held {
                 holder: existing.record.holder,
                 held_for: existing.held_for,
-            })
+            });
         }
-        Err(_) => Err(LockError::Io),
+        return Err(LockError::Io);
     }
+
+    let record = lock_record_bytes(holder)?;
+    file.set_len(0).map_err(|_| LockError::Io)?;
+    file.seek(SeekFrom::Start(0)).map_err(|_| LockError::Io)?;
+    file.write_all(&record).map_err(|_| LockError::Io)?;
+    file.sync_all().map_err(|_| LockError::Io)?;
+
+    Ok(SiteLockGuard {
+        _root: root,
+        _file: file,
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -141,9 +128,9 @@ fn unix_now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{mem, time::Duration};
+    use std::os::fd::AsRawFd;
 
-    use super::{DEFAULT_STALE_AFTER, LockError, acquire};
+    use super::{LockError, acquire};
     use crate::{
         filesystem::ManagedRoot,
         site::{SiteRelativePath, TrustedRoot},
@@ -176,13 +163,11 @@ mod tests {
         let first = holder("550e8400-e29b-41d4-a716-446655440000");
         let second = holder("123e4567-e89b-12d3-a456-426614174000");
 
-        let _guard = acquire(&managed, &path, first, DEFAULT_STALE_AFTER)
-            .expect("first acquire should succeed");
+        let _guard = acquire(&managed, &path, first).expect("first acquire should succeed");
 
-        match acquire(&managed, &path, second, DEFAULT_STALE_AFTER) {
-            Err(LockError::Held { holder, held_for }) => {
+        match acquire(&managed, &path, second) {
+            Err(LockError::Held { holder, held_for: _ }) => {
                 assert_eq!(holder, first);
-                assert!(held_for < DEFAULT_STALE_AFTER);
             }
             other => panic!("expected Held, got {other:?}"),
         }
@@ -195,45 +180,64 @@ mod tests {
         let first = holder("550e8400-e29b-41d4-a716-446655440000");
         let second = holder("123e4567-e89b-12d3-a456-426614174000");
 
-        drop(acquire(&managed, &path, first, DEFAULT_STALE_AFTER).expect("acquire should succeed"));
+        drop(acquire(&managed, &path, first).expect("acquire should succeed"));
 
-        acquire(&managed, &path, second, DEFAULT_STALE_AFTER)
-            .expect("lock should be free after release");
+        acquire(&managed, &path, second).expect("lock should be free after release");
     }
 
     #[test]
-    fn abandoned_lock_is_reclaimed_once_it_is_older_than_the_stale_bound() {
+    fn a_crashed_holders_lock_is_immediately_available_to_the_next_acquire() {
         let (_directory, managed) = managed_root();
         let path = lock_path();
         let first = holder("550e8400-e29b-41d4-a716-446655440000");
         let second = holder("123e4567-e89b-12d3-a456-426614174000");
 
-        // Lock staleness has whole-second resolution, so a zero bound is the
-        // deterministic way to exercise "older than the bound" without a
-        // real sleep: as soon as it exists, its age (>= 0s) is >= 0s.
-        let guard =
-            acquire(&managed, &path, first, Duration::ZERO).expect("first acquire should succeed");
-        // Simulate a crashed holder: the lock file stays behind without ever
-        // running the release-on-drop path.
-        mem::forget(guard);
+        let guard = acquire(&managed, &path, first).expect("first acquire should succeed");
+        // Simulate the holder process dying: the kernel closes every file
+        // descriptor the process held - including this one - without
+        // running any of this guard's own Drop logic. `mem::forget` skips
+        // Drop but leaves the fd open, so an explicit `close` here is what
+        // actually reproduces "the fd is gone", the only thing that
+        // releases an flock.
+        let fd = guard._file.as_raw_fd();
+        std::mem::forget(guard);
+        unsafe {
+            libc::close(fd);
+        }
 
-        let reclaimed = acquire(&managed, &path, second, Duration::ZERO);
-        assert!(reclaimed.is_ok(), "expected reclaim, got {reclaimed:?}");
+        let reclaimed = acquire(&managed, &path, second);
+        assert!(
+            reclaimed.is_ok(),
+            "a lock left by a crashed holder must be immediately available, not merely \
+             stale-eligible after a timeout: {reclaimed:?}"
+        );
     }
 
     #[test]
-    fn corrupt_lock_file_is_reported_instead_of_silently_reclaimed() {
+    fn a_corrupt_but_unheld_lock_file_is_acquired_and_repaired_instead_of_permanently_blocked() {
         let (directory, managed) = managed_root();
         let path = lock_path();
         std::fs::write(directory.path().join("locks/mutation.lock"), b"not json")
             .expect("corrupt lock file should be written");
 
-        let outcome = acquire(
+        let outcome = acquire(&managed, &path, holder("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(
+            outcome.is_ok(),
+            "corrupt content with no live OS-level holder must not block acquisition \
+             (exclusivity is the kernel's flock, never the file's content): {outcome:?}"
+        );
+
+        // The record is now valid again for the next caller's diagnostics.
+        let second = acquire(
             &managed,
             &path,
-            holder("550e8400-e29b-41d4-a716-446655440000"),
-            DEFAULT_STALE_AFTER,
+            holder("123e4567-e89b-12d3-a456-426614174000"),
         );
-        assert_eq!(outcome.unwrap_err(), LockError::Io);
+        match second {
+            Err(LockError::Held { holder, .. }) => {
+                assert_eq!(holder.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+            }
+            other => panic!("expected the repaired record to report the new holder: {other:?}"),
+        }
     }
 }
