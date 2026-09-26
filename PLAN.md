@@ -179,13 +179,14 @@ Completed:
 - added validated `RequestId` (canonical, non-nil UUID; names transaction
   state files) and `IdempotencyKey` (bounded, printable-ASCII, caller-supplied
   retry token) types in `src/transaction/mod.rs`;
-- implemented per-site locking (`src/transaction/lock.rs`): atomic
-  create-if-absent lock files via a new `ManagedRoot::create_new`
-  (exclusive-create) primitive, a default 15-minute time-based stale bound
-  (`DEFAULT_STALE_AFTER`), one bounded reclaim retry, and an RAII guard that
-  releases on drop. Staleness is purely time-based (no holder-process
-  liveness check); see the `ponytail:` note in `lock.rs` for the upgrade
-  path if faster recovery is ever needed;
+- implemented per-site locking (`src/transaction/lock.rs`): an OS `flock`
+  (`LOCK_EX | LOCK_NB`) held on a persistent file descriptor opened via
+  `ManagedRoot::open_or_create_file`. A live holder stays exclusive
+  indefinitely; a crashed holder's lock is released immediately when the
+  kernel closes its file descriptors, with no time-based staleness bound,
+  no reclaim retry, and no manual unlink-on-drop (the guard's `Drop` just
+  lets the underlying file's own `Drop` close the fd — 2026-09-26 superseded
+  the original 15-minute `DEFAULT_STALE_AFTER` design below);
 - implemented persisted transaction state (`src/transaction/state.rs`):
   `TransactionState` (request ID, idempotency key, operation, status,
   timestamps, outcome) with guarded `InProgress` -> `Committed`/`Failed`
@@ -1042,6 +1043,7 @@ may later live under `docs/decisions/` and be linked from this table.
 | 2026-09-02 | Activate releases by renaming a prepared relative symlink over a stable `current` path. | Caddy and runtime consumers keep one document root while activation has one explicit commit point. |
 | 2026-09-02 | Invoke the daemonless mutation CLI through a dedicated sudo entry and drop Git/build children to the site UID/GID. | The engine needs bounded privileged coordination without granting a privileged shell or running application code as root. |
 | 2026-09-02 | Per-site lock staleness is a pure 15-minute time bound (`DEFAULT_STALE_AFTER`), not a holder-process liveness check. | Keeps recovery deterministic and portable (no `/proc` dependency) for a first pass; revisit only if a real workflow needs faster recovery than 15 minutes. |
+| 2026-09-26 | Superseded the above: per-site lock exclusivity is now an OS `flock` on a persistent file descriptor (`ManagedRoot::open_or_create_file` + `libc::flock(LOCK_EX \| LOCK_NB)`), not a time-based stale bound. | A live holder stays exclusive indefinitely and a crashed holder's lock releases immediately (kernel-managed on fd close) — no `/proc` dependency, no reclaim-retry window, and the previous design's real bug (an old guard unlinking a lock file a newer holder had since recreated) is structurally impossible once nothing is ever unlinked. |
 | 2026-09-02 | Idempotency-key lookup is a per-site, on-disk FNV-1a hash index with a stored-key check on read; key *retention* is not yet decided. | The exit criterion "retrying an idempotent request cannot create duplicate work" was blocking in Phase 3 itself, so the lookup half had to be resolved now; retention has no forcing operation yet and stays open for Phase 4. |
 | 2026-09-02 | A deployed release's `ReleaseId` equals the `RequestId` of the transaction that created it, rather than a separately generated identifier. | Deploy makes at most one release per transaction; reusing the ID keeps the release directory, transaction state, and audit trail joinable on one value instead of three. |
 | 2026-09-02 | Site UID/GID is resolved via the `id` subprocess, and privilege-dropping lives on `ProcessRequest` (`run_as`) in the shared runner, not only in deploy code. | Keeps every subprocess call — including future build steps — on the same bounded, argv-only, no-shell, no-raw-FFI discipline instead of a one-off mechanism per operation. |
