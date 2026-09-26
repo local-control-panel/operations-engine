@@ -27,11 +27,13 @@ use crate::{
 /// work: the held site lock (dropping it releases the site for the next
 /// attempt) and the `InProgress` transaction state to keep transitioning
 /// and saving.
+#[derive(Debug)]
 pub struct Admitted<'a> {
     pub lock: SiteLockGuard<'a>,
     pub state: TransactionState,
 }
 
+#[derive(Debug)]
 pub enum Outcome<'a> {
     Proceed(Admitted<'a>),
     /// This request's idempotency key was already claimed by
@@ -75,14 +77,25 @@ pub fn run<'a>(
     // remove anything just leaves old state for the next call to retry.
     prune::prune_completed(site_state, DEFAULT_COMPLETED_RETENTION);
 
+    let mut reclaim_key = None;
     if let Some(key) = idempotency_key {
         match idempotency::claim(site_state, key, request_id).map_err(Error::Idempotency)? {
-            Resolution::AlreadyClaimed(existing) => return Ok(Outcome::Replay(existing)),
             Resolution::Claimed => {}
+            Resolution::AlreadyClaimed(existing) => {
+                match state::load(site_state, &state_path(existing)) {
+                    Ok(_) => return Ok(Outcome::Replay(existing)),
+                    Err(StateError::NotFound) => reclaim_key = Some(key),
+                    Err(other) => return Err(Error::State(other)),
+                }
+            }
         }
     }
 
     let lock = lock::acquire(site_state, &lock_path(), request_id).map_err(Error::Lock)?;
+
+    if let Some(key) = reclaim_key {
+        idempotency::reclaim(site_state, key, request_id).map_err(Error::Idempotency)?;
+    }
 
     let transaction_state =
         TransactionState::start(request_id, idempotency_key.cloned(), operation);
@@ -136,6 +149,7 @@ mod tests {
         site::{SiteId, TrustedRoot},
         transaction::{
             IdempotencyKey, RequestId,
+            idempotency,
             lock::{self},
             state::{self, TransactionState, TransactionStatus},
         },
@@ -261,6 +275,54 @@ mod tests {
         assert!(
             !site_state.exists(&state_path(old_id)),
             "an eight-day-old finished transaction must be swept by the next preflight call"
+        );
+    }
+
+    #[test]
+    fn a_claim_whose_transaction_was_never_created_is_reclaimed_instead_of_replayed_into_nothing() {
+        let (_directory, site_state) = site_state();
+        let key = IdempotencyKey::parse("deploy-2026-09-02-01").expect("key should be valid");
+        let orphan_id = request_id("3f0d5a71-2c48-4f6b-8b21-7d5e9c1a4b60");
+        // Simulate a crash between `idempotency::claim` and `state::create`:
+        // the claim exists, its target transaction was never written.
+        idempotency::claim(&site_state, &key, orphan_id).expect("claim should succeed");
+
+        let outcome = run(&site_state, request_id(REQUEST_ID), Some(&key), OPERATION)
+            .expect("preflight should recover the orphaned claim");
+        let Outcome::Proceed(admitted) = outcome else {
+            panic!("an orphaned claim must be reclaimed as a fresh attempt, not replayed")
+        };
+        assert_eq!(admitted.state.status, TransactionStatus::InProgress);
+        assert_eq!(
+            idempotency::lookup(&site_state, &key),
+            Ok(Some(request_id(REQUEST_ID))),
+            "the claim must now point at the request that reclaimed it"
+        );
+    }
+
+    #[test]
+    fn an_orphaned_claim_is_not_reclaimed_while_the_site_lock_is_already_held() {
+        let (_directory, site_state) = site_state();
+        let key = IdempotencyKey::parse("deploy-2026-09-02-01").expect("key should be valid");
+        let orphan_id = request_id("3f0d5a71-2c48-4f6b-8b21-7d5e9c1a4b60");
+        idempotency::claim(&site_state, &key, orphan_id).expect("claim should succeed");
+
+        // Simulate a concurrent attempt already holding the site lock -
+        // whether it is itself racing to reclaim this same orphan, or is
+        // an unrelated in-flight mutation for this site - either way, a
+        // retry must not race past it and reclaim the key underneath it.
+        let _held = lock::acquire(&site_state, &lock_path(), request_id(RETRY_REQUEST_ID))
+            .expect("lock should be free to acquire");
+
+        let outcome = run(&site_state, request_id(REQUEST_ID), Some(&key), OPERATION);
+        assert!(
+            matches!(outcome, Err(Error::Lock(lock::LockError::Held { .. }))),
+            "an orphaned claim must not be reclaimed while the site lock is held: {outcome:?}"
+        );
+        assert_eq!(
+            idempotency::lookup(&site_state, &key),
+            Ok(Some(orphan_id)),
+            "a rejected reclaim attempt must not have overwritten the claim"
         );
     }
 }
