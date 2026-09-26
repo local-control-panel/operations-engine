@@ -18,7 +18,7 @@ use crate::{
     site::SiteRelativePath,
     transaction::{
         idempotency,
-        state::{self, TransactionStatus},
+        state::{self, StateError, TransactionStatus},
     },
 };
 
@@ -30,8 +30,31 @@ use crate::{
 /// state does not grow without bound over a server's real lifetime.
 pub const DEFAULT_COMPLETED_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// How long an idempotency claim with no backing transaction file is kept
+/// before it is treated as orphaned rather than merely "not yet written"
+/// by a request still inside `mutation::preflight::run`. `claim` and
+/// `state::create` are normally microseconds apart in a live,
+/// uninterrupted request, so this is far larger than that window purely to
+/// make the "never race a live request" property obvious, not because a
+/// live request could plausibly take this long between the two.
+pub const ORPHAN_CLAIM_GRACE: Duration = Duration::from_secs(60);
+
 fn transactions_dir() -> SiteRelativePath {
     SiteRelativePath::parse("transactions").expect("a fixed literal path is always valid")
+}
+
+/// Runs both retention sweeps this module owns: finished transactions past
+/// `retain_for`, and idempotency claims orphaned (no backing transaction)
+/// past `ORPHAN_CLAIM_GRACE`. The orphan sweep never waits longer than
+/// `retain_for` either: the one real caller (`mutation::preflight::run`)
+/// passes `DEFAULT_COMPLETED_RETENTION` (7 days), far past `ORPHAN_CLAIM_GRACE`,
+/// so this bound is a no-op in production; it only matters for a caller that
+/// deliberately asks for aggressive pruning (`Duration::ZERO`), which should
+/// mean "sweep everything eligible now", not "sweep finished transactions
+/// now but still wait 60 more seconds for orphaned claims".
+pub fn prune_completed(root: &ManagedRoot, retain_for: Duration) {
+    prune_finished_transactions(root, retain_for);
+    prune_orphaned_claims(root, retain_for.min(ORPHAN_CLAIM_GRACE));
 }
 
 /// Removes every `Committed`/`Failed` transaction whose `finished_at_unix_secs`
@@ -42,7 +65,7 @@ fn transactions_dir() -> SiteRelativePath {
 /// `install::prune_superseded_version`'s shape: one file this sweep
 /// cannot read, parse, or remove is skipped, not fatal to the sweep or to
 /// the caller's own mutation attempt.
-pub fn prune_completed(root: &ManagedRoot, retain_for: Duration) {
+fn prune_finished_transactions(root: &ManagedRoot, retain_for: Duration) {
     let Ok(transactions) = root.open_managed_dir(&transactions_dir()) else {
         return;
     };
@@ -74,6 +97,32 @@ pub fn prune_completed(root: &ManagedRoot, retain_for: Duration) {
             let _ = idempotency::remove(root, key);
         }
         let _ = root.remove_file(&path);
+    }
+}
+
+/// Removes any idempotency claim whose target `RequestId` has no backing
+/// transaction state and is older than `grace` - the durable half of the
+/// crash recovery `mutation::preflight::run` performs online (reclaiming
+/// an orphaned claim for a retrying request, see that module). A claim
+/// this old with no state means the original attempt crashed before
+/// `state::create` and nothing has retried it with the same idempotency
+/// key; without this sweep, such a claim - and the hash bucket it
+/// occupies - would survive forever.
+pub fn prune_orphaned_claims(root: &ManagedRoot, grace: Duration) {
+    let now = unix_now_secs();
+    for entry in idempotency::list(root) {
+        let age = Duration::from_secs(now.saturating_sub(entry.claimed_at_unix_secs));
+        if age < grace {
+            continue;
+        }
+        let Ok(state_path) =
+            SiteRelativePath::parse(format!("transactions/{}.json", entry.request_id))
+        else {
+            continue;
+        };
+        if matches!(state::load(root, &state_path), Err(StateError::NotFound)) {
+            let _ = root.remove_file(&entry.path);
+        }
     }
 }
 
@@ -208,6 +257,62 @@ mod tests {
         assert_eq!(
             idempotency::claim(&managed, &key, retried_id),
             Ok(Resolution::Claimed)
+        );
+    }
+
+    #[test]
+    fn an_orphaned_claim_older_than_the_grace_period_is_removed() {
+        let (_directory, managed) = managed_root();
+        let key = IdempotencyKey::parse("deploy-2026-09-08-01").expect("key should be valid");
+        let orphan_id = request_id("c41a8e02-9d37-4a55-b8f2-6e0c73d91af8");
+        idempotency::claim(&managed, &key, orphan_id).expect("claim should succeed");
+        // No transaction state is ever created for `orphan_id` - simulating
+        // a crash between claim and state::create.
+
+        // Zero grace is the deterministic way to exercise "older than the
+        // grace period" without a real sleep, same trick this module's
+        // other tests and `transaction::lock`'s tests already use.
+        super::prune_orphaned_claims(&managed, Duration::ZERO);
+
+        assert_eq!(
+            idempotency::lookup(&managed, &key),
+            Ok(None),
+            "an orphaned claim past its grace period must be removed"
+        );
+    }
+
+    #[test]
+    fn a_claim_within_the_grace_period_is_never_pruned_even_with_no_backing_transaction() {
+        let (_directory, managed) = managed_root();
+        let key = IdempotencyKey::parse("deploy-2026-09-08-02").expect("key should be valid");
+        let live_id = request_id("9b2f1c34-5678-4abc-9def-0123456789ab");
+        idempotency::claim(&managed, &key, live_id).expect("claim should succeed");
+
+        // A live, uninterrupted request is normally only microseconds away
+        // from state::create; the default grace period must never sweep a
+        // claim this fresh even though no transaction backs it yet.
+        super::prune_orphaned_claims(&managed, super::ORPHAN_CLAIM_GRACE);
+
+        assert_eq!(
+            idempotency::lookup(&managed, &key),
+            Ok(Some(live_id)),
+            "a claim within the grace period must survive regardless of missing state"
+        );
+    }
+
+    #[test]
+    fn prune_completed_also_sweeps_orphaned_claims() {
+        let (_directory, managed) = managed_root();
+        let key = IdempotencyKey::parse("deploy-2026-09-08-03").expect("key should be valid");
+        let orphan_id = request_id("3f0d5a71-2c48-4f6b-8b21-7d5e9c1a4b60");
+        idempotency::claim(&managed, &key, orphan_id).expect("claim should succeed");
+
+        prune_completed(&managed, Duration::ZERO);
+
+        assert_eq!(
+            idempotency::lookup(&managed, &key),
+            Ok(None),
+            "prune_completed must sweep orphaned claims, not just finished transactions"
         );
     }
 }
