@@ -6,9 +6,18 @@
 //! `wordpress-update/<hash>` hash the identical root to two different
 //! scope paths); it cannot see that two different operation types target
 //! the same physical root. This module is the missing cross-operation
-//! exclusivity: every mutating WordPress operation acquires the lock here
-//! for every canonical root it touches, in a fixed order when it touches
-//! more than one, before doing any of its own operation-specific work.
+//! exclusivity: `wordpress_{install,update,clone}` and
+//! `permissions::{execute,world_writable}` each acquire the lock here for
+//! every canonical root they touch, in a fixed order when more than one, and
+//! before doing any of their own operation-specific work.
+//!
+//! `resource-locks/` is never swept: unlike `transactions/` and
+//! `transactions/idempotency/`, a lock file here is kept forever once
+//! created (deleting it would be unsafe under the current design - see
+//! `transaction::lock`'s module doc for why a lock file is never unlinked).
+//! In practice this is bounded by the number of distinct roots the engine
+//! is ever asked to touch, which content-root validation upstream already
+//! keeps finite.
 
 use std::{fmt::Write as _, path::Path};
 
@@ -30,7 +39,12 @@ fn locks_dir() -> SiteRelativePath {
 /// The path-independent identity two operations must agree on to be
 /// considered "the same resource" - the root path, hashed the same way
 /// regardless of which operation, or which of its own scope directories,
-/// is asking.
+/// is asking. Hashes the raw path bytes only - it does not resolve `.`/`..`,
+/// symlinks, or a trailing separator, so callers are responsible for passing
+/// an already-canonical spelling of a root for cross-operation exclusivity
+/// to actually hold (every current caller does: the same `req.root`/
+/// `req.staging_root`/`req.source_root` string this crate's own preflight
+/// scopes already hash the identical way).
 pub fn canonical_hash(root: &Path) -> String {
     let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
     let mut hash = String::new();
@@ -97,11 +111,39 @@ pub fn acquire_pair<'a>(
     Ok((lower_guard, Some(higher_guard)))
 }
 
+/// Acquires the resource locks for every root in `roots`, deduplicated and
+/// always attempted in canonical-hash order regardless of the input order -
+/// the N-ary generalization of `acquire_pair` for operations that touch an
+/// arbitrary number of roots in one request (e.g. `permissions::execute`'s
+/// per-target ownership repair). If any acquisition fails, every guard
+/// already acquired in this call is dropped (released) before the error
+/// returns, since they are only ever held locally in the returned `Vec`.
+pub fn acquire_many<'a>(
+    engine_state: &'a ManagedRoot,
+    roots: &[&Path],
+    holder: RequestId,
+) -> Result<Vec<SiteLockGuard<'a>>, LockError> {
+    let mut hashed: Vec<(String, &Path)> = Vec::with_capacity(roots.len());
+    for &root in roots {
+        let hash = canonical_hash(root);
+        if !hashed.iter().any(|(existing, _)| existing == &hash) {
+            hashed.push((hash, root));
+        }
+    }
+    hashed.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut guards = Vec::with_capacity(hashed.len());
+    for (_, root) in hashed {
+        guards.push(acquire(engine_state, root, holder)?);
+    }
+    Ok(guards)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{acquire, acquire_pair, canonical_hash};
+    use super::{acquire, acquire_many, acquire_pair, canonical_hash};
     use crate::{
         filesystem::ManagedRoot,
         site::TrustedRoot,
@@ -216,5 +258,94 @@ mod tests {
             acquire(&engine_state_ba, b, racer),
             Err(LockError::Held { .. })
         ));
+    }
+
+    /// Regression test for the E-01/E-03 whole-branch review's Minor #7:
+    /// proves attempt *order* is governed by hash comparison, not argument
+    /// position, using the fact that `acquire` creates the lock file before
+    /// attempting the flock - so a never-attempted root leaves no file
+    /// behind, and an attempted-then-released one does.
+    #[test]
+    fn acquire_pair_attempts_the_lower_hash_root_first_regardless_of_argument_order() {
+        let (directory, engine_state) = managed_root();
+        let a = Path::new("/content/a.example.com");
+        let b = Path::new("/content/b.example.com");
+        let (lower, higher) = if canonical_hash(a) < canonical_hash(b) {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let owner = holder("550e8400-e29b-41d4-a716-446655440000");
+        let racer = holder("123e4567-e89b-12d3-a456-426614174000");
+
+        let _held_higher =
+            acquire(&engine_state, higher, racer).expect("higher lock should be free");
+
+        // `higher` is passed in argument position 1 - the opposite of hash
+        // order. Under argument-ordered attempts this would fail on
+        // `higher` immediately and never touch `lower`; under hash-ordered
+        // attempts (the actual implementation) it tries `lower` first.
+        let outcome = acquire_pair(&engine_state, higher, lower, owner);
+        assert!(
+            matches!(outcome, Err(LockError::Held { .. })),
+            "expected failure on the already-held higher-hash root: {outcome:?}"
+        );
+
+        let lower_lock_path = directory
+            .path()
+            .join(format!("resource-locks/{}.lock", canonical_hash(lower)));
+        assert!(
+            lower_lock_path.exists(),
+            "the lower-hash root must have been attempted (and released) before failing on \
+             the higher-hash root - proving attempt order is hash-based, not argument-based"
+        );
+    }
+
+    #[test]
+    fn acquire_many_locks_every_distinct_root_and_dedups_repeats() {
+        let (_directory, engine_state) = managed_root();
+        let a = Path::new("/content/a.example.com");
+        let b = Path::new("/content/b.example.com");
+        let c = Path::new("/content/c.example.com");
+        let owner = holder("550e8400-e29b-41d4-a716-446655440000");
+        let racer = holder("123e4567-e89b-12d3-a456-426614174000");
+
+        let guards =
+            acquire_many(&engine_state, &[a, b, a, c], owner).expect("acquire_many should succeed");
+        assert_eq!(
+            guards.len(),
+            3,
+            "a repeated root must be locked once, not attempted twice"
+        );
+
+        for root in [a, b, c] {
+            assert!(matches!(
+                acquire(&engine_state, root, racer),
+                Err(LockError::Held { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn acquire_many_releases_already_acquired_guards_when_a_later_one_fails() {
+        let (_directory, engine_state) = managed_root();
+        let a = Path::new("/content/a.example.com");
+        let b = Path::new("/content/b.example.com");
+        let owner = holder("550e8400-e29b-41d4-a716-446655440000");
+        let racer = holder("123e4567-e89b-12d3-a456-426614174000");
+
+        let _held_b = acquire(&engine_state, b, racer).expect("b should be free to acquire");
+
+        let outcome = acquire_many(&engine_state, &[a, b], owner);
+        assert!(matches!(outcome, Err(LockError::Held { .. })));
+
+        // `a` must have been released (not left dangling) once the call
+        // failed on `b` - `acquire_many` never returns partial guards, so
+        // the `Vec` holding `a`'s guard was dropped when `?` returned early.
+        let a_reacquired = acquire(&engine_state, a, owner);
+        assert!(
+            a_reacquired.is_ok(),
+            "a must be released after acquire_many fails on a later root: {a_reacquired:?}"
+        );
     }
 }

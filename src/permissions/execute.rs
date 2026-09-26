@@ -19,6 +19,7 @@ use crate::{
     transaction::{
         audit::{self, AuditRecord},
         commit::PreCommit,
+        resource_lock,
         state::{self, TransactionStatus},
     },
 };
@@ -29,6 +30,7 @@ pub enum FixOwnershipError {
     Preflight(preflight::Error),
     ReplayInProgress,
     Cancelled,
+    ResourceBusy,
     PostCommitRecordFailed { result: FixOwnershipResult },
     Replayed { code: ErrorCode, message: String },
 }
@@ -39,6 +41,10 @@ impl FixOwnershipError {
             Self::Preflight(preflight::Error::Lock(_)) => (
                 ErrorCode::Conflict,
                 "another ownership repair is already in progress".into(),
+            ),
+            Self::ResourceBusy => (
+                ErrorCode::Conflict,
+                "another operation is already in progress for one of these roots".into(),
             ),
             Self::ReplayInProgress => (
                 ErrorCode::Conflict,
@@ -63,6 +69,16 @@ pub fn execute(
     cancellation: &CancellationToken,
 ) -> Result<FixOwnershipResult, FixOwnershipError> {
     let scope = open_state(engine_state).map_err(FixOwnershipError::Io)?;
+
+    let mut roots: Vec<&Path> = request
+        .targets
+        .iter()
+        .map(|target| target.root.as_path())
+        .collect();
+    roots.push(request.default.root.as_path());
+    let _resource_locks = resource_lock::acquire_many(engine_state, &roots, request.request_id)
+        .map_err(|_| FixOwnershipError::ResourceBusy)?;
+
     let admitted = match preflight::run(
         &scope,
         request.request_id,
@@ -386,10 +402,13 @@ fn fail(
 
 #[cfg(test)]
 mod tests {
-    use super::{execute, repair_tree};
+    use super::{FixOwnershipError, execute, repair_tree};
     use crate::{
-        filesystem::ManagedRoot, permissions::FixOwnershipRequest, process::CancellationToken,
+        filesystem::ManagedRoot,
+        permissions::FixOwnershipRequest,
+        process::CancellationToken,
         site::TrustedRoot,
+        transaction::{RequestId, resource_lock},
     };
     use std::os::unix::fs::{MetadataExt, symlink};
 
@@ -449,6 +468,38 @@ mod tests {
         assert_eq!(
             replayed.completed_at_unix_secs,
             first.completed_at_unix_secs
+        );
+    }
+
+    #[test]
+    fn a_concurrent_operation_holding_the_resource_lock_blocks_ownership_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = temp.path().join("content");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&content).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let metadata = std::fs::metadata(&content).unwrap();
+        let json = serde_json::json!({
+            "default": { "root": content, "uid": metadata.uid(), "gid": metadata.gid() },
+            "targets": []
+        })
+        .to_string();
+        let roots = [TrustedRoot::parse(&content).unwrap()];
+        let request =
+            FixOwnershipRequest::parse(&json, &roots, "123e4567-e89b-12d3-a456-426614174000", None)
+                .unwrap();
+        let managed = ManagedRoot::open(&TrustedRoot::parse(&state).unwrap()).unwrap();
+
+        let other_holder =
+            RequestId::parse("223e4567-e89b-12d3-a456-426614174000").expect("valid UUID");
+        let _held = resource_lock::acquire(&managed, &content, other_holder)
+            .expect("resource lock should be free to acquire");
+
+        let outcome = execute(&managed, &request, &CancellationToken::default());
+        assert!(
+            matches!(outcome, Err(FixOwnershipError::ResourceBusy)),
+            "an ownership repair must not proceed while another operation holds this root's \
+             resource lock: {outcome:?}"
         );
     }
 }

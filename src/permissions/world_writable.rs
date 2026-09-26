@@ -21,6 +21,7 @@ use crate::{
     transaction::{
         audit::{self, AuditRecord},
         commit::PreCommit,
+        resource_lock,
         state::{self, TransactionStatus},
     },
 };
@@ -31,6 +32,7 @@ pub enum FixWorldWritableError {
     Preflight(preflight::Error),
     ReplayInProgress,
     Cancelled,
+    ResourceBusy,
     PostCommitRecordFailed { result: FixWorldWritableResult },
     Replayed { code: ErrorCode, message: String },
 }
@@ -41,6 +43,10 @@ impl FixWorldWritableError {
             Self::Preflight(preflight::Error::Lock(_)) => (
                 ErrorCode::Conflict,
                 "another permissions repair is already in progress".into(),
+            ),
+            Self::ResourceBusy => (
+                ErrorCode::Conflict,
+                "another operation is already in progress for this root".into(),
             ),
             Self::ReplayInProgress => (
                 ErrorCode::Conflict,
@@ -65,6 +71,10 @@ pub fn execute(
     cancellation: &CancellationToken,
 ) -> Result<FixWorldWritableResult, FixWorldWritableError> {
     let scope = open_state(engine_state).map_err(FixWorldWritableError::Io)?;
+
+    let _resource_lock = resource_lock::acquire(engine_state, &request.root, request.request_id)
+        .map_err(|_| FixWorldWritableError::ResourceBusy)?;
+
     let admitted = match preflight::run(
         &scope,
         request.request_id,
@@ -309,6 +319,37 @@ mod tests {
         assert_eq!(
             replayed.completed_at_unix_secs,
             first.completed_at_unix_secs
+        );
+    }
+
+    #[test]
+    fn a_concurrent_operation_holding_the_resource_lock_blocks_world_writable_repair() {
+        let temp = tempfile::tempdir().unwrap();
+        let content = temp.path().join("content");
+        let state = temp.path().join("state");
+        std::fs::create_dir_all(&content).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let roots = [TrustedRoot::parse(&content).unwrap()];
+        let request = FixWorldWritableRequest::parse(
+            &content,
+            &roots,
+            "123e4567-e89b-12d3-a456-426614174000",
+            None,
+        )
+        .unwrap();
+        let managed = ManagedRoot::open(&TrustedRoot::parse(&state).unwrap()).unwrap();
+
+        let other_holder =
+            crate::transaction::RequestId::parse("223e4567-e89b-12d3-a456-426614174000")
+                .expect("valid UUID");
+        let _held = resource_lock::acquire(&managed, &content, other_holder)
+            .expect("resource lock should be free to acquire");
+
+        let outcome = execute(&managed, &request, &CancellationToken::default());
+        assert!(
+            matches!(outcome, Err(FixWorldWritableError::ResourceBusy)),
+            "a world-writable repair must not proceed while another operation holds this \
+             root's resource lock: {outcome:?}"
         );
     }
 }
