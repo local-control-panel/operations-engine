@@ -17,6 +17,7 @@ use crate::{
     transaction::{
         IdempotencyKey, RequestId,
         audit::{self, AuditRecord},
+        resource_lock,
         state::{self, TransactionStatus},
     },
 };
@@ -193,6 +194,7 @@ pub enum Error {
     Rejected(ErrorCode),
     SourceUnavailable,
     UnsafeTarget,
+    ResourceBusy,
     RecoveryRequired,
     Import(RestoreError),
     PostCommit { result: CloneResult },
@@ -224,6 +226,10 @@ impl Error {
                     .into(),
             ),
             Self::UnsafeTarget => (ErrorCode::InvalidInput, "clone target overlaps the source or has an unsafe configuration".into()),
+            Self::ResourceBusy => (
+                ErrorCode::Conflict,
+                "another WordPress operation is already in progress for this site".into(),
+            ),
             Self::RecoveryRequired => (ErrorCode::Conflict, "WordPress clone requires manual recovery; retained artifacts and pending.json identify the target".into()),
             Self::Import(error) => error.protocol(),
             Self::Replayed { code, message } => (*code, message.clone()),
@@ -284,6 +290,16 @@ pub fn execute(
             ))
         };
     }
+
+    let _resource_locks = match resource_lock::acquire_pair(
+        ctx.engine_state,
+        &req.source_root,
+        &req.staging_root,
+        req.request_id,
+    ) {
+        Ok(guards) => guards,
+        Err(_) => fail_now!(Error::ResourceBusy),
+    };
 
     let staging_managed = match ManagedRoot::open(staging_content_root) {
         Ok(value) => value,
@@ -1264,6 +1280,50 @@ esac
                 None
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_concurrent_operation_holding_the_source_resource_lock_blocks_clone() {
+        let fx = fixture(&fake_docker(false), None);
+        let request = request_for(&fx, REQUEST_ID, None);
+        let other_holder = RequestId::parse("223e4567-e89b-12d3-a456-426614174000")
+            .expect("test UUID should be canonical");
+        let _held = resource_lock::acquire(&fx.engine_state, &fx.source_root, other_holder)
+            .expect("resource lock should be free to acquire");
+
+        let outcome = execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &request,
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(outcome, Err(Error::ResourceBusy)),
+            "a clone must not read from a source root another operation is mutating: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_concurrent_operation_holding_the_target_resource_lock_blocks_clone() {
+        let fx = fixture(&fake_docker(false), None);
+        let request = request_for(&fx, REQUEST_ID, None);
+        let other_holder = RequestId::parse("223e4567-e89b-12d3-a456-426614174000")
+            .expect("test UUID should be canonical");
+        let _held = resource_lock::acquire(&fx.engine_state, &fx.staging_root, other_holder)
+            .expect("resource lock should be free to acquire");
+
+        let outcome = execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &request,
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(outcome, Err(Error::ResourceBusy)),
+            "a clone must not write to a target root another operation is mutating: {outcome:?}"
         );
     }
 }
