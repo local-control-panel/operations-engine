@@ -8,6 +8,7 @@ use crate::{
     transaction::{
         IdempotencyKey, RequestId,
         audit::{self, AuditRecord},
+        resource_lock,
         state::{self, TransactionStatus},
     },
 };
@@ -216,6 +217,7 @@ pub enum Error {
     Run(process::ProcessRunError),
     Rejected(ErrorCode),
     InvalidOutput,
+    ResourceBusy,
     PostCommit { result: UpdateResult },
     Replayed { code: ErrorCode, message: String },
 }
@@ -225,6 +227,10 @@ impl Error {
             Self::Preflight(preflight::Error::Lock(_)) => (
                 ErrorCode::Conflict,
                 "another WordPress update is in progress for this site".into(),
+            ),
+            Self::ResourceBusy => (
+                ErrorCode::Conflict,
+                "another WordPress operation is already in progress for this site".into(),
             ),
             Self::ReplayInProgress => (
                 ErrorCode::Conflict,
@@ -291,6 +297,18 @@ pub fn execute(
     let state_path =
         SiteRelativePath::parse(format!("transactions/{}.json", req.request_id)).unwrap();
     let audit_path = SiteRelativePath::parse("audit/events.jsonl").unwrap();
+    let _resource_lock = match resource_lock::acquire(ctx.engine_state, &req.root, req.request_id) {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(fail(
+                &scope,
+                &state_path,
+                &audit_path,
+                state,
+                Error::ResourceBusy,
+            ));
+        }
+    };
     let recovery_dir =
         SiteRelativePath::parse(format!("wordpress-updates/{}", req.request_id)).unwrap();
     ctx.backup_root.create_dir_all(&recovery_dir).map_err(|e| {
@@ -526,6 +544,7 @@ fn fail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::site::TrustedRoot;
     #[test]
     fn validates_version_without_shell_fragments() {
         assert!(Request::parse(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"version":"6.8.2"}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_ok());
@@ -540,5 +559,44 @@ mod tests {
     fn validates_bounded_theme_slugs() {
         assert!(Request::parse_themes(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"themes":["twentytwentyfive"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_ok());
         assert!(Request::parse_themes(r#"{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"themes":["../theme"]}"#, "123e4567-e89b-12d3-a456-426614174000", None).is_err());
+    }
+
+    #[test]
+    fn a_concurrent_operation_holding_the_resource_lock_blocks_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let content_dir = directory.path().join("content");
+        let state_dir = directory.path().join("state");
+        let backup_dir = directory.path().join("backup");
+        std::fs::create_dir_all(content_dir.join("example.com")).unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::create_dir_all(&backup_dir).unwrap();
+        let engine_state = ManagedRoot::open(&TrustedRoot::parse(&state_dir).unwrap()).unwrap();
+        let backup_root = ManagedRoot::open(&TrustedRoot::parse(&backup_dir).unwrap()).unwrap();
+        let site_root = content_dir.join("example.com");
+
+        let other_holder = RequestId::parse("223e4567-e89b-12d3-a456-426614174000")
+            .expect("test UUID should be canonical");
+        let _held = resource_lock::acquire(&engine_state, &site_root, other_holder)
+            .expect("resource lock should be free to acquire");
+
+        let request_json = format!(
+            r#"{{"container":"runtime-1","root":"{}","uid":1000,"gid":1000,"version":"6.8.2"}}"#,
+            site_root.display()
+        );
+        let req = Request::parse(&request_json, "123e4567-e89b-12d3-a456-426614174000", None)
+            .expect("request should parse");
+        let ctx = Context {
+            engine_state: &engine_state,
+            backup_root: &backup_root,
+            docker_program: "/bin/true",
+            tar_program: "/bin/true",
+        };
+
+        let outcome = execute(&ctx, &req, &CancellationToken::default());
+        assert!(
+            matches!(outcome, Err(Error::ResourceBusy)),
+            "an update must not proceed while another operation holds this root's resource \
+             lock: {outcome:?}"
+        );
     }
 }
