@@ -3,6 +3,7 @@ pub mod commit;
 pub mod idempotency;
 pub mod lock;
 pub mod prune;
+pub mod resource_lock;
 pub mod state;
 
 use std::{fmt, str::FromStr};
