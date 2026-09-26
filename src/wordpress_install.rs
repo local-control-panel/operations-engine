@@ -273,6 +273,10 @@ pub fn execute(
             .create_dir_all(&SiteRelativePath::parse(child).unwrap())
             .map_err(Error::Io)?;
     }
+
+    let _resource_lock = resource_lock::acquire(ctx.engine_state, &req.root, req.request_id)
+        .map_err(|_| Error::ResourceBusy)?;
+
     let admitted = match preflight::run(
         &scope,
         req.request_id,
@@ -288,19 +292,6 @@ pub fn execute(
     let state_path =
         SiteRelativePath::parse(format!("transactions/{}.json", req.request_id)).unwrap();
     let audit_path = SiteRelativePath::parse("audit/events.jsonl").unwrap();
-
-    let _resource_lock = match resource_lock::acquire(ctx.engine_state, &req.root, req.request_id) {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Err(fail(
-                &scope,
-                &state_path,
-                &audit_path,
-                state,
-                Error::ResourceBusy,
-            ));
-        }
-    };
 
     let relative = match req.root.strip_prefix(content_root.as_path()) {
         Ok(value) if !value.as_os_str().is_empty() => value,
@@ -931,6 +922,59 @@ mod tests {
             matches!(outcome, Err(Error::ResourceBusy)),
             "an install must not proceed while another operation holds this root's resource \
              lock: {outcome:?}"
+        );
+    }
+
+    /// Regression test for the final whole-branch review's Important #1: the
+    /// resource-lock check must run *before* the idempotency key is claimed
+    /// and a transaction is created, so a resource conflict never becomes a
+    /// permanent `Failed` result a later retry with the same key would
+    /// replay forever. If the check ran after preflight (the original bug),
+    /// this test's second `execute` call would return the first call's
+    /// stale `Error::ResourceBusy`-derived failure instead of actually
+    /// running WP-CLI.
+    #[test]
+    fn a_resource_conflict_does_not_prevent_a_later_retry_with_the_same_idempotency_key() {
+        let fx = fixture(ALWAYS_SUCCEED);
+        let other_holder = RequestId::parse("223e4567-e89b-12d3-a456-426614174000")
+            .expect("test UUID should be canonical");
+        let context = Context {
+            engine_state: &fx.state,
+            docker_program: fx.docker.to_str().unwrap(),
+        };
+        let key = Some("install-retry-after-conflict");
+
+        let held = resource_lock::acquire(&fx.state, &fx.site_root, other_holder)
+            .expect("resource lock should be free to acquire");
+        let first_request = request_for(&fx.site_root, REQUEST_ID, key);
+        let first_outcome = execute(
+            &context,
+            &fx.content_root,
+            &first_request,
+            &CancellationToken::default(),
+        );
+        assert!(
+            matches!(first_outcome, Err(Error::ResourceBusy)),
+            "the first attempt must be rejected while the resource lock is held: {first_outcome:?}"
+        );
+        drop(held);
+
+        let second_request_id = "223e4567-e89b-12d3-a456-426614174001";
+        let second_request = request_for(&fx.site_root, second_request_id, key);
+        let second_outcome = execute(
+            &context,
+            &fx.content_root,
+            &second_request,
+            &CancellationToken::default(),
+        );
+        assert!(
+            second_outcome.is_ok(),
+            "a retry with the same idempotency key must actually run once the resource is \
+             free, not replay the earlier resource conflict: {second_outcome:?}"
+        );
+        assert!(
+            !calls_log(&fx).is_empty(),
+            "the retry must have genuinely run WP-CLI, not short-circuited into a replay"
         );
     }
 }

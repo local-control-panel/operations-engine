@@ -263,6 +263,14 @@ pub fn execute(
             .create_dir_all(&SiteRelativePath::parse(child).unwrap())
             .map_err(Error::Io)?;
     }
+    let _resource_locks = resource_lock::acquire_pair(
+        ctx.engine_state,
+        &req.source_root,
+        &req.staging_root,
+        req.request_id,
+    )
+    .map_err(|_| Error::ResourceBusy)?;
+
     let admitted = match preflight::run(
         &scope,
         req.request_id,
@@ -290,16 +298,6 @@ pub fn execute(
             ))
         };
     }
-
-    let _resource_locks = match resource_lock::acquire_pair(
-        ctx.engine_state,
-        &req.source_root,
-        &req.staging_root,
-        req.request_id,
-    ) {
-        Ok(guards) => guards,
-        Err(_) => fail_now!(Error::ResourceBusy),
-    };
 
     let staging_managed = match ManagedRoot::open(staging_content_root) {
         Ok(value) => value,

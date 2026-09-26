@@ -282,6 +282,9 @@ pub fn execute(
             .create_dir_all(&SiteRelativePath::parse(child).unwrap())
             .map_err(Error::Io)?;
     }
+    let _resource_lock = resource_lock::acquire(ctx.engine_state, &req.root, req.request_id)
+        .map_err(|_| Error::ResourceBusy)?;
+
     let admitted = match preflight::run(
         &scope,
         req.request_id,
@@ -297,18 +300,6 @@ pub fn execute(
     let state_path =
         SiteRelativePath::parse(format!("transactions/{}.json", req.request_id)).unwrap();
     let audit_path = SiteRelativePath::parse("audit/events.jsonl").unwrap();
-    let _resource_lock = match resource_lock::acquire(ctx.engine_state, &req.root, req.request_id) {
-        Ok(guard) => guard,
-        Err(_) => {
-            return Err(fail(
-                &scope,
-                &state_path,
-                &audit_path,
-                state,
-                Error::ResourceBusy,
-            ));
-        }
-    };
     let recovery_dir =
         SiteRelativePath::parse(format!("wordpress-updates/{}", req.request_id)).unwrap();
     ctx.backup_root.create_dir_all(&recovery_dir).map_err(|e| {
