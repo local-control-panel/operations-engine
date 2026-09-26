@@ -45,16 +45,27 @@ fn transactions_dir() -> SiteRelativePath {
 
 /// Runs both retention sweeps this module owns: finished transactions past
 /// `retain_for`, and idempotency claims orphaned (no backing transaction)
-/// past `ORPHAN_CLAIM_GRACE`. The orphan sweep never waits longer than
-/// `retain_for` either: the one real caller (`mutation::preflight::run`)
-/// passes `DEFAULT_COMPLETED_RETENTION` (7 days), far past `ORPHAN_CLAIM_GRACE`,
-/// so this bound is a no-op in production; it only matters for a caller that
-/// deliberately asks for aggressive pruning (`Duration::ZERO`), which should
-/// mean "sweep everything eligible now", not "sweep finished transactions
-/// now but still wait 60 more seconds for orphaned claims".
+/// past `ORPHAN_CLAIM_GRACE`. `retain_for == Duration::ZERO` is treated as
+/// an explicit "sweep everything eligible right now" sentinel and applies
+/// to the orphan sweep too (`Duration::ZERO` instead of `ORPHAN_CLAIM_GRACE`);
+/// any other `retain_for` leaves the orphan sweep at exactly
+/// `ORPHAN_CLAIM_GRACE`, regardless of how small or large `retain_for` is.
+/// This is deliberately not a general `retain_for.min(ORPHAN_CLAIM_GRACE)`:
+/// that would let *any* small-but-nonzero `retain_for` a future caller
+/// passes for an unrelated reason silently shrink the orphan safety margin
+/// below 60s. Keeping this to an exact-zero check means the orphan grace is
+/// always either exactly `Duration::ZERO` or exactly `ORPHAN_CLAIM_GRACE`,
+/// never some coincidental in-between value. The one real caller
+/// (`mutation::preflight::run`) passes `DEFAULT_COMPLETED_RETENTION`
+/// (7 days, not zero), so this is a no-op in production.
 pub fn prune_completed(root: &ManagedRoot, retain_for: Duration) {
     prune_finished_transactions(root, retain_for);
-    prune_orphaned_claims(root, retain_for.min(ORPHAN_CLAIM_GRACE));
+    let orphan_grace = if retain_for.is_zero() {
+        Duration::ZERO
+    } else {
+        ORPHAN_CLAIM_GRACE
+    };
+    prune_orphaned_claims(root, orphan_grace);
 }
 
 /// Removes every `Committed`/`Failed` transaction whose `finished_at_unix_secs`
