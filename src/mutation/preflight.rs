@@ -148,8 +148,7 @@ mod tests {
         filesystem::ManagedRoot,
         site::{SiteId, TrustedRoot},
         transaction::{
-            IdempotencyKey, RequestId,
-            idempotency,
+            IdempotencyKey, RequestId, idempotency,
             lock::{self},
             state::{self, TransactionState, TransactionStatus},
         },
