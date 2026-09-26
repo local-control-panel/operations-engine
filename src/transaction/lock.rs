@@ -39,6 +39,7 @@ impl std::fmt::Debug for SiteLockGuard<'_> {
 /// the private `_file` field) can perform a faithful crash simulation - an
 /// explicit `close` on this fd, not just dropping or forgetting the guard -
 /// the same way `std::fs::File` itself exposes its own fd.
+#[doc(hidden)]
 impl std::os::fd::AsRawFd for SiteLockGuard<'_> {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self._file.as_raw_fd()

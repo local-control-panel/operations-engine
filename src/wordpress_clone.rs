@@ -22,9 +22,7 @@ use crate::{
     },
 };
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use std::{
-    fmt::Write as _,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -245,11 +243,7 @@ pub fn execute(
     req: &Request,
     cancel: &CancellationToken,
 ) -> Result<CloneResult, Error> {
-    let digest = Sha256::digest(req.staging_root.as_os_str().as_encoded_bytes());
-    let mut hash = String::new();
-    for byte in digest {
-        write!(&mut hash, "{byte:02x}").unwrap();
-    }
+    let hash = resource_lock::canonical_hash(&req.staging_root);
     let scope_path = SiteRelativePath::parse(format!("wordpress-clone/{hash}")).unwrap();
     ctx.engine_state
         .create_dir_all(&scope_path)
