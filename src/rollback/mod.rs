@@ -9,7 +9,8 @@
 //! care how a release directory came to exist) and
 //! `deploy::activate::activate` (the atomic switch, which only ever needed
 //! a `SiteId` and `ReleaseId` — never anything staging-specific). See
-//! `PLAN.md`'s decision log for why those two were reused verbatim instead
+//! `docs/implementation-history.md`'s decision log for why those two were
+//! reused verbatim instead
 //! of being forked into rollback-owned copies.
 
 pub mod eligibility;

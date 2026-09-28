@@ -313,7 +313,8 @@ An audit pass (not new infrastructure) over:
   fetch, are not (avoid echoing unbounded remote content into logs or
   error messages).
 
-Findings and any resulting fixes are recorded in `PLAN.md`'s decision
+Findings and any resulting fixes are recorded in
+`docs/implementation-history.md`'s decision
 log, not a separate audit document.
 
 ## 12. Documentation

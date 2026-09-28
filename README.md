@@ -18,8 +18,10 @@ machine-readable result.
 > ingress/runtime, backups). The protocol and installation process are
 > stabilizing but not yet frozen.
 
-Development follows the shared [implementation plan](./PLAN.md). It records the
-current phase, agreed decisions, completion criteria, and the next work item.
+Development follows the shared [roadmap](./PLAN.md). It records current
+priorities, release blockers, completion criteria, and the next work items.
+Completed delivery notes and the original decision log are preserved in the
+[implementation history](./docs/implementation-history.md).
 
 ## Why it exists
 
@@ -69,8 +71,8 @@ operations well beyond that pilot: WordPress lifecycle (`wordpress.install`,
 `db.restore`, `db.export`, MariaDB/PostgreSQL/Valkey lifecycle),
 `permissions.fixOwnership`, backup workflows, and ingress/runtime
 reconciliation, among others. `ops-engine capabilities --output json` lists
-what a given build actually supports; see [PLAN.md](./PLAN.md) for the full,
-current list and the criteria each migration must meet.
+what a given build actually supports; see [PLAN.md](./PLAN.md) for current
+priorities and the criteria each migration must meet.
 
 ## Protocol direction
 

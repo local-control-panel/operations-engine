@@ -318,7 +318,7 @@ mod tests {
     /// resolution, exclusive directory creation, chown, a privilege-scoped
     /// `git clone`, and HEAD verification — except the one thing only root
     /// can prove: that a *different* uid/gid is actually enforced. See the
-    /// PLAN.md note for this item.
+    /// `docs/implementation-history.md` note for this item.
     fn own_identity() -> super::SiteIdentity {
         let whoami = Command::new("whoami").output().expect("whoami should run");
         let user = String::from_utf8(whoami.stdout)

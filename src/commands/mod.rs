@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod engine;
 pub mod ingress;
 pub mod meilisearch;
+pub mod operation;
 pub mod permissions;
 pub mod runtime_config;
 pub mod site;

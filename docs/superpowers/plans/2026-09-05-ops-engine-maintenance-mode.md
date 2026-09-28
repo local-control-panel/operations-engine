@@ -1,5 +1,15 @@
 # Plan: Engine-side maintenance-mode modeling (Operations Engine, sub-project 2 of 3)
 
+Status: completed for `operations-engine`; archived 2026-09-28
+
+> Historical execution document. `RouteTarget`, backup activation, and the
+> `ingress.park`/`ingress.unpark` engine operations described here were
+> delivered. The unchecked boxes below preserve the original cross-repository
+> execution sequence; they are not an active backlog. Any current
+> `website-control-panel` integration status must be checked in that repository.
+> Current engine priorities live in
+> [`../../../PLAN.md`](../../../PLAN.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Teach `operations-engine` to model `website-control-panel`'s maintenance-mode `.maintenance-backup` file, so the 6 already-migrated ingress call sites (`disable_basic_auth`, `update_raw_ingress_route`, `enable_access_log`, `set_security_headers`, `set_redirects`, `set_ip_acl`) — and `set_maintenance` itself — can go through the engine instead of falling back to legacy raw-SSH when a site is parked.

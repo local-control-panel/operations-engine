@@ -15,7 +15,8 @@
 //! configured content root and does not escape it through a symlink
 //! (`TrustedRoot::resolve_existing`); it never deletes that directory,
 //! since it did not create it and doing so on a WP-CLI failure would
-//! destroy `create_site`'s own prior work. See `PLAN.md`'s Phase 8 decision
+//! destroy `create_site`'s own prior work. See
+//! `docs/implementation-history.md`'s Phase 8 decision
 //! log for why this deviates from this operation's original milestone doc.
 
 use crate::{

@@ -34,7 +34,7 @@ pub struct DeployContext<'a> {
     /// The specific configured content root this site's manifest resolves
     /// under. Picking the right one when more than one is configured is
     /// the caller's responsibility — not yet solved generically (see the
-    /// `content_roots` note in `PLAN.md`).
+    /// `content_roots` note in `docs/implementation-history.md`).
     pub content_root: &'a TrustedRoot,
     pub credential_root: &'a TrustedRoot,
     /// The engine-wide state root, opened once. `execute` scopes it down

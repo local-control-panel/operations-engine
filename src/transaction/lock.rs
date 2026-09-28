@@ -107,6 +107,29 @@ pub fn acquire<'a>(
     })
 }
 
+/// Reports the live kernel lock holder without changing the diagnostic
+/// record. A free lock returns `None`; stale file contents alone never count
+/// as an active operation.
+pub fn holder(
+    root: &ManagedRoot,
+    path: &SiteRelativePath,
+) -> Result<Option<RequestId>, LockError> {
+    let file = root.open_or_create_file(path).map_err(|_| LockError::Io)?;
+    // SAFETY: `file` remains open for the duration of both flock calls.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        return Ok(None);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::WouldBlock {
+        return Err(LockError::Io);
+    }
+    Ok(read_lock(root, path).ok().map(|existing| existing.record.holder))
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LockRecord {
@@ -151,7 +174,7 @@ fn unix_now_secs() -> u64 {
 mod tests {
     use std::os::fd::AsRawFd;
 
-    use super::{LockError, acquire};
+    use super::{LockError, acquire, holder as current_holder};
     use crate::{
         filesystem::ManagedRoot,
         site::{SiteRelativePath, TrustedRoot},
@@ -207,6 +230,17 @@ mod tests {
         drop(acquire(&managed, &path, first).expect("acquire should succeed"));
 
         acquire(&managed, &path, second).expect("lock should be free after release");
+    }
+
+    #[test]
+    fn holder_uses_the_kernel_lock_not_stale_file_contents() {
+        let (_directory, managed) = managed_root();
+        let path = lock_path();
+        let first = holder("550e8400-e29b-41d4-a716-446655440000");
+        let guard = acquire(&managed, &path, first).unwrap();
+        assert_eq!(current_holder(&managed, &path).unwrap(), Some(first));
+        drop(guard);
+        assert_eq!(current_holder(&managed, &path).unwrap(), None);
     }
 
     #[test]

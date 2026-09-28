@@ -23,6 +23,7 @@ pub mod maria_slow_log;
 pub mod maria_user;
 pub mod meilisearch_upgrade;
 pub mod mutation;
+pub mod operation_status;
 pub mod permissions;
 pub mod pg_drop;
 pub mod pg_provision;
@@ -50,6 +51,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Backup { command } => commands::backup::run(command),
         Command::Capabilities => commands::capabilities::run(),
         Command::Doctor => commands::doctor::run(),
+        Command::Operation { command } => commands::operation::run(command),
         Command::Site { command } => commands::site::run(command),
         Command::Engine { command } => commands::engine::run(command),
         Command::Ingress { command } => commands::ingress::run(command),
