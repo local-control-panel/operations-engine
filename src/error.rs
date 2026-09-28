@@ -127,6 +127,7 @@ mod tests {
             "\"INTERNAL_SERIALIZATION_ERROR\""
         );
         assert_eq!(ErrorCode::Timeout.as_str(), "TIMEOUT");
+        assert_eq!(ErrorCode::NotFound.as_str(), "NOT_FOUND");
     }
 
     #[test]

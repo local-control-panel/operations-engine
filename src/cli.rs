@@ -134,7 +134,13 @@ pub enum OperationCommand {
     /// Return the last durable state for one site-scoped request.
     Status {
         #[arg(long = "site-id")]
-        site_id: String,
+        site_id: Option<String>,
+
+        #[arg(long)]
+        database: Option<String>,
+
+        #[arg(long = "backup-database")]
+        backup_database: Option<String>,
 
         #[arg(long = "request-id")]
         request_id: String,

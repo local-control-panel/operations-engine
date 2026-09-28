@@ -16,12 +16,24 @@ pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
     match command {
         OperationCommand::Status {
             site_id,
+            database,
+            backup_database,
             request_id,
-        } => status(&site_id, &request_id),
+        } => status(
+            site_id.as_deref(),
+            database.as_deref(),
+            backup_database.as_deref(),
+            &request_id,
+        ),
     }
 }
 
-fn status(site_id: &str, request_id: &str) -> Result<Response, ResponseBuildError> {
+fn status(
+    site_id: Option<&str>,
+    database: Option<&str>,
+    backup_database: Option<&str>,
+    request_id: &str,
+) -> Result<Response, ResponseBuildError> {
     #[cfg(unix)]
     {
         let config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
@@ -44,9 +56,24 @@ fn status(site_id: &str, request_id: &str) -> Result<Response, ResponseBuildErro
                 ));
             }
         };
-        match operation_status::load(&root, site_id, request_id) {
+        let state = match (site_id, database, backup_database) {
+            (Some(site_id), None, None) => operation_status::load_site(&root, site_id, request_id),
+            (None, Some(database), None) => {
+                operation_status::load_database(&root, database, request_id)
+            }
+            (None, None, Some(database)) => {
+                operation_status::load_backup(&root, database, request_id)
+            }
+            _ => Err(StatusError::InvalidScope),
+        };
+        match state {
             Ok(state) => Response::success(OPERATION, state),
-            Err(StatusError::InvalidSiteId | StatusError::InvalidRequestId) => Ok(
+            Err(
+                StatusError::InvalidScope
+                | StatusError::InvalidSiteId
+                | StatusError::InvalidDatabase
+                | StatusError::InvalidRequestId,
+            ) => Ok(
                 Response::failure(
                     OPERATION,
                     ErrorCode::InvalidInput,
@@ -67,7 +94,7 @@ fn status(site_id: &str, request_id: &str) -> Result<Response, ResponseBuildErro
     }
     #[cfg(not(unix))]
     {
-        let _ = (site_id, request_id);
+        let _ = (site_id, database, backup_database, request_id);
         Ok(Response::failure(
             OPERATION,
             ErrorCode::UnsupportedPlatform,

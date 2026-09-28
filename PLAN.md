@@ -6,7 +6,7 @@ Release gate: Phase 7 — production release readiness
 
 Parallel work: Phase 8 — selective migration of privileged operations
 
-Last updated: 2026-09-28
+Last updated: 2026-09-29
 
 This file is the authoritative source for current priorities, remaining work,
 and completion criteria. It intentionally does not duplicate completed
@@ -132,9 +132,9 @@ Current follow-up queue:
 
 1. Finish the Phase 7 control-plane release integration before expanding the
    API merely for breadth.
-2. Wire the existing `runtime.activateConfig`, `ingress.reconcile`, and
-   `runtime.reconcile` operations into the control panel where the matching raw
-   paths still exist.
+2. Keep the already-wired `runtime.activateConfig`, `ingress.reconcile`, and
+   `runtime.reconcile` control-panel paths engine-only; their former raw
+   fallbacks are historical and must not return.
 3. Migrate remaining ingress call sites only after checking their multi-file
    and cross-root transaction requirements; do not force them through the
    single-file activation contract.
@@ -154,16 +154,23 @@ or access to a real server.
 - [x] Classify and archive the existing implementation plans; add a status
   index so their historical checkboxes are not mistaken for open work
   (completed 2026-09-28).
-- [ ] Design and implement reconciliation for orphaned
+- [ ] Finish validation of reconciliation for orphaned
   `<domain>.maintenance-backup` files left by interrupted `ingress.park` or
-  `ingress.unpark` operations. Define safe classification and recovery rules
-  before changing `ingress.reconcile`. Implementation and regression tests are
-  present; final local validation is pending because the current environment
-  has no Rust toolchain.
+  `ingress.unpark` operations. Implementation, classification rules and
+  regression tests are present; final `fmt`/Clippy/test validation is pending
+  because the current environment has no Rust toolchain.
 - [ ] Design transactional database-restore safety: pre-restore snapshot,
   post-restore verification, and automatic rollback. Keep this separate from
   the existing bounded-execution/audit-only `db.restore` contract until its
   failure semantics are specified and tested.
+- [ ] Validate the new database-scoped `operation.status` and transactional
+  `backup.createDatabase` implementation with `cargo fmt`, Clippy, unit tests
+  and the real Linux workflow fixture. The implementation and panel wiring are
+  present as of 2026-09-29; this item must remain open until those checks pass.
+- [ ] Add a bounded, redacted remote operation-list contract. Do not expose
+  secret request payloads or scan unbounded transaction directories.
+- [ ] Define explicit recovery actions per operation. Unknown or interrupted
+  state must never trigger an automatic destructive retry.
 
 Implementation-plan status is indexed in
 [`docs/superpowers/plans/README.md`](docs/superpowers/plans/README.md).
