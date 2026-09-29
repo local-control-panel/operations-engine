@@ -84,6 +84,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.updatePlugins",
             "wordpress.updateThemes",
             "wordpress.rotateCredentials",
+            "wordpress.multisiteDeleteSite",
             "agent.activateBruteforceConfig",
             "system.activateAutoupdatesConfig",
             "system.installAutoupdates"

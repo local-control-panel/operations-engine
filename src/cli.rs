@@ -284,6 +284,16 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Delete one subsite from a WordPress multisite network under one
+    /// lock/idempotency/transaction/audit-backed request.
+    MultisiteDeleteSite {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl WordpressCommand {
@@ -296,6 +306,7 @@ impl WordpressCommand {
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
             Self::UpdateThemes { .. } => "wordpress.updateThemes",
             Self::RotateCredentials { .. } => "wordpress.rotateCredentials",
+            Self::MultisiteDeleteSite { .. } => "wordpress.multisiteDeleteSite",
         }
     }
 }

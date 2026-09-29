@@ -70,6 +70,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.updatePlugins",
                 "wordpress.updateThemes",
                 "wordpress.rotateCredentials",
+                "wordpress.multisiteDeleteSite",
                 "agent.activateBruteforceConfig",
                 "system.activateAutoupdatesConfig",
                 "system.installAutoupdates",
