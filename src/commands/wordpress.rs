@@ -3,12 +3,17 @@ use crate::{
     commands::read_root_owned_content_file,
     error::ErrorCode,
     protocol::{Response, ResponseBuildError},
-    wordpress, wordpress_clone, wordpress_install, wordpress_multisite_delete_site,
-    wordpress_rotate_credentials, wordpress_update,
+    wordpress, wordpress_clone, wordpress_import, wordpress_install,
+    wordpress_multisite_delete_site, wordpress_rotate_credentials, wordpress_update,
 };
 
 pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        WordpressCommand::Import {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => import(&request_file, &request_id, idempotency_key.as_deref()),
         WordpressCommand::Cleanup { request_file } => cleanup(&request_file),
         WordpressCommand::Install {
             request_file,
@@ -45,6 +50,102 @@ pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => multisite_delete_site(&request_file, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn import(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::filesystem::ManagedRoot;
+        let config = match crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    wordpress_import::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    wordpress_import::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match wordpress_import::Request::parse(&json, request_id, key) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    wordpress_import::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file is not a valid WordPress import plan",
+                ));
+            }
+        };
+        if !config
+            .content_roots
+            .iter()
+            .any(|root| request.root().starts_with(root.as_path()))
+        {
+            return Ok(Response::failure(
+                wordpress_import::OPERATION,
+                ErrorCode::InvalidInput,
+                "WordPress root is outside configured content roots",
+            ));
+        }
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    wordpress_import::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = wordpress_import::Context {
+            engine_state: &state,
+            artifact_dir: std::path::Path::new("/etc/operations-engine/staging"),
+            artifact_owner_uid: 0,
+            docker_program: "docker",
+        };
+        match wordpress_import::execute(
+            &context,
+            &request,
+            &crate::process::CancellationToken::default(),
+        ) {
+            Ok(v) | Err(wordpress_import::Error::PostCommit { result: v }) => {
+                Response::success(wordpress_import::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(
+                    wordpress_import::OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            wordpress_import::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "wordpress.import requires a Unix host",
+        ))
     }
 }
 
