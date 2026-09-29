@@ -37,6 +37,7 @@ pub mod valkey;
 pub mod wordpress;
 pub mod wordpress_clone;
 pub mod wordpress_install;
+pub mod wordpress_rotate_credentials;
 pub mod wordpress_update;
 
 use cli::{Cli, Command};
