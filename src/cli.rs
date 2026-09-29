@@ -104,6 +104,12 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+
+    /// Host-wide system configuration operations.
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
+    },
 }
 
 impl Command {
@@ -125,6 +131,30 @@ impl Command {
             Self::Permissions { command } => command.operation(),
             Self::Wordpress { command } => command.operation(),
             Self::Agent { command } => command.operation(),
+            Self::System { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SystemCommand {
+    /// Atomically activate the paired `unattended-upgrades` apt
+    /// configuration under one lock/idempotency/transaction/audit-backed
+    /// request.
+    ActivateAutoupdatesConfig {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl SystemCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::ActivateAutoupdatesConfig { .. } => "system.activateAutoupdatesConfig",
         }
     }
 }
