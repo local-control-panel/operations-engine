@@ -691,4 +691,30 @@ exit 0
             "expected RecoveryRequired, got {error:?}"
         );
     }
+
+    #[test]
+    fn replaying_the_same_idempotency_key_returns_the_original_result_without_rerunning() {
+        let fx = fixture(ALWAYS_SUCCEED);
+        let context = Context {
+            engine_state: &fx.state,
+            docker_program: fx.docker.to_str().unwrap(),
+        };
+        let first = request_for(&fx, REQUEST_ID, Some("rotate-once"));
+        let first_result = execute(&context, &first, &CancellationToken::default())
+            .expect("first attempt should succeed");
+        let calls_after_first = calls_log(&fx).len();
+        assert!(calls_after_first > 0);
+
+        let second_request_id = "223e4567-e89b-12d3-a456-426614174000";
+        let second = request_for(&fx, second_request_id, Some("rotate-once"));
+        let second_result = execute(&context, &second, &CancellationToken::default())
+            .expect("replay should return the recorded result, not fail");
+
+        assert_eq!(first_result.db_user, second_result.db_user);
+        assert_eq!(
+            calls_log(&fx).len(),
+            calls_after_first,
+            "a replayed idempotency key must not rotate the password again"
+        );
+    }
 }
