@@ -717,4 +717,24 @@ exit 0
             "a replayed idempotency key must not rotate the password again"
         );
     }
+
+    #[test]
+    fn a_concurrent_operation_holding_the_resource_lock_blocks_rotation() {
+        let fx = fixture(ALWAYS_SUCCEED);
+        let other_holder = RequestId::parse("223e4567-e89b-12d3-a456-426614174000")
+            .expect("test UUID should be canonical");
+        let _held = resource_lock::acquire(&fx.state, &fx.site_root, other_holder)
+            .expect("resource lock should be free to acquire");
+
+        let request = request_for(&fx, REQUEST_ID, None);
+        let context = Context {
+            engine_state: &fx.state,
+            docker_program: fx.docker.to_str().unwrap(),
+        };
+
+        let error = execute(&context, &request, &CancellationToken::default())
+            .expect_err("a held resource lock should block rotation");
+        assert_eq!(error.protocol().0, ErrorCode::Conflict);
+        assert!(calls_log(&fx).is_empty(), "no WP-CLI step should have run");
+    }
 }
