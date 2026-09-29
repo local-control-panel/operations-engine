@@ -40,6 +40,7 @@ fn capabilities_describe_only_implemented_operations() {
             "version",
             "capabilities",
             "doctor",
+            "operation.status",
             "backup.delete",
             "backup.createDatabase",
             "backup.activateConfig",
@@ -82,6 +83,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.updateCore",
             "wordpress.updatePlugins",
             "wordpress.updateThemes",
+            "wordpress.rotateCredentials",
             "agent.activateBruteforceConfig"
         ])
     );

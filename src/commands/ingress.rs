@@ -464,7 +464,7 @@ fn run_reconcile(request: &ReconcileRequest) -> Result<Response, ResponseBuildEr
     match execute_reconcile(&context, request, &CancellationToken::default()) {
         Ok(result) => Response::success(RECONCILE_OPERATION, result),
         Err(ReconcileError::PostCommitRecordFailed { result, .. }) => {
-            Response::success(RECONCILE_OPERATION, result).map(|response| {
+            Response::success(RECONCILE_OPERATION, *result).map(|response| {
                 response.with_warnings(vec![Warning {
                     code: WarningCode::TransactionRecordIncomplete,
                     message: "the sweep completed but its transaction record could not be saved"

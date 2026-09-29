@@ -4,8 +4,7 @@ use crate::{
     filesystem::ManagedRoot,
     site::{SiteId, SiteRelativePath},
     transaction::{
-        RequestId,
-        lock,
+        RequestId, lock,
         state::{self, TransactionState, TransactionStatus},
     },
 };
@@ -91,7 +90,10 @@ fn load_scoped(
     } else {
         false
     };
-    Ok(OperationStatus { transaction, active })
+    Ok(OperationStatus {
+        transaction,
+        active,
+    })
 }
 
 #[cfg(test)]
@@ -150,11 +152,7 @@ mod tests {
             Err(StatusError::InvalidRequestId)
         );
         assert_eq!(
-            load_site(
-                &root,
-                SITE_ID,
-                "9b2f1c34-5678-4abc-9def-0123456789ab"
-            ),
+            load_site(&root, SITE_ID, "9b2f1c34-5678-4abc-9def-0123456789ab"),
             Err(StatusError::NotFound)
         );
     }
@@ -210,7 +208,6 @@ mod tests {
         assert_eq!(loaded.transaction.operation, "db.restore");
         assert!(!loaded.active);
     }
-
 
     #[test]
     fn loads_a_database_scoped_backup_transaction() {

@@ -110,10 +110,7 @@ pub fn acquire<'a>(
 /// Reports the live kernel lock holder without changing the diagnostic
 /// record. A free lock returns `None`; stale file contents alone never count
 /// as an active operation.
-pub fn holder(
-    root: &ManagedRoot,
-    path: &SiteRelativePath,
-) -> Result<Option<RequestId>, LockError> {
+pub fn holder(root: &ManagedRoot, path: &SiteRelativePath) -> Result<Option<RequestId>, LockError> {
     let file = root.open_or_create_file(path).map_err(|_| LockError::Io)?;
     // SAFETY: `file` remains open for the duration of both flock calls.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -127,7 +124,9 @@ pub fn holder(
     if error.kind() != io::ErrorKind::WouldBlock {
         return Err(LockError::Io);
     }
-    Ok(read_lock(root, path).ok().map(|existing| existing.record.holder))
+    Ok(read_lock(root, path)
+        .ok()
+        .map(|existing| existing.record.holder))
 }
 
 #[derive(Serialize, Deserialize)]

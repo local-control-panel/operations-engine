@@ -116,7 +116,7 @@ pub enum ReconcileError {
     /// The sweep itself succeeded, but its `TransactionState` could not be
     /// saved afterward. Carries the result so the caller never loses it.
     PostCommitRecordFailed {
-        result: ReconcileResult,
+        result: Box<ReconcileResult>,
         cause: StateError,
     },
     /// A replayed request whose original attempt failed.
@@ -307,7 +307,10 @@ pub fn execute(
         .expect("state is always InProgress at this point");
 
     if let Err(cause) = state::save(&ingress_state, &state_path, &state) {
-        return Err(ReconcileError::PostCommitRecordFailed { result, cause });
+        return Err(ReconcileError::PostCommitRecordFailed {
+            result: Box::new(result),
+            cause,
+        });
     }
     let _ = audit::append(
         &ingress_state,
@@ -394,8 +397,8 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReconcileContext, ReconcileRequest, execute, is_temp_file,
-        maintenance_backup_live_sibling, rollback_backup_live_sibling,
+        ReconcileContext, ReconcileRequest, execute, is_temp_file, maintenance_backup_live_sibling,
+        rollback_backup_live_sibling,
     };
     use crate::{filesystem::ManagedRoot, process::CancellationToken, site::TrustedRoot};
 
@@ -555,7 +558,11 @@ mod tests {
         let (ingress_dir, ingress_root, _ingress_managed) = managed_root();
         let (_state_dir, _state_root, engine_state) = managed_root();
 
-        write(ingress_dir.path(), "missing.test.maintenance-backup", "previous");
+        write(
+            ingress_dir.path(),
+            "missing.test.maintenance-backup",
+            "previous",
+        );
         write(ingress_dir.path(), "same.test.caddyfile", "same");
         write(ingress_dir.path(), "same.test.maintenance-backup", "same");
         write(ingress_dir.path(), "parked.test.caddyfile", "maintenance");
@@ -595,7 +602,12 @@ mod tests {
             std::fs::read_to_string(ingress_dir.path().join("missing.test.caddyfile")).unwrap(),
             "previous"
         );
-        assert!(!ingress_dir.path().join("same.test.maintenance-backup").exists());
+        assert!(
+            !ingress_dir
+                .path()
+                .join("same.test.maintenance-backup")
+                .exists()
+        );
         assert!(
             ingress_dir
                 .path()

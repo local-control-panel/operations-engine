@@ -73,13 +73,11 @@ fn status(
                 | StatusError::InvalidSiteId
                 | StatusError::InvalidDatabase
                 | StatusError::InvalidRequestId,
-            ) => Ok(
-                Response::failure(
-                    OPERATION,
-                    ErrorCode::InvalidInput,
-                    "invalid operation identity",
-                ),
-            ),
+            ) => Ok(Response::failure(
+                OPERATION,
+                ErrorCode::InvalidInput,
+                "invalid operation identity",
+            )),
             Err(StatusError::NotFound) => Ok(Response::failure(
                 OPERATION,
                 ErrorCode::NotFound,

@@ -134,10 +134,9 @@ impl TransactionError {
                 "cancelled before database backup ran".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
-            Self::Preflight(_) | Self::Io(_) | Self::PostCommit { .. } => (
-                ErrorCode::Internal,
-                "internal database backup error".into(),
-            ),
+            Self::Preflight(_) | Self::Io(_) | Self::PostCommit { .. } => {
+                (ErrorCode::Internal, "internal database backup error".into())
+            }
         }
     }
 }
@@ -149,7 +148,8 @@ pub fn execute_transactional(
     docker_program: &str,
     cancel: &CancellationToken,
 ) -> Result<CreateResult, TransactionError> {
-    let scope = open_backup_state(engine_state, request.database()).map_err(TransactionError::Io)?;
+    let scope =
+        open_backup_state(engine_state, request.database()).map_err(TransactionError::Io)?;
     let admitted = match preflight::run(
         &scope,
         request.request_id,
@@ -232,10 +232,10 @@ fn replay(scope: &ManagedRoot, id: RequestId) -> Result<CreateResult, Transactio
     }
     match loaded.status {
         TransactionStatus::InProgress => Err(TransactionError::ReplayInProgress),
-        TransactionStatus::Committed => serde_json::from_value(
-            loaded.outcome.unwrap().result.unwrap(),
-        )
-        .map_err(|error| TransactionError::Io(std::io::Error::other(error))),
+        TransactionStatus::Committed => {
+            serde_json::from_value(loaded.outcome.unwrap().result.unwrap())
+                .map_err(|error| TransactionError::Io(std::io::Error::other(error)))
+        }
         TransactionStatus::Failed => {
             let outcome = loaded.outcome.unwrap();
             Err(TransactionError::Replayed {
