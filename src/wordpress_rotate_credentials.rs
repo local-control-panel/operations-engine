@@ -657,8 +657,14 @@ exit 0
         let calls = calls_log(&fx);
         // get x2, ALTER (new), config set (new), db check (fails), config set (revert to old), ALTER (revert to old)
         assert_eq!(calls.len(), 7, "unexpected call sequence: {calls:#?}");
-        assert!(calls[5].contains("config set DB_PASSWORD"), "expected a revert config set: {calls:#?}");
-        assert!(calls[6].contains("mariadb-1"), "expected a revert ALTER USER: {calls:#?}");
+        assert!(
+            calls[5].contains("config set DB_PASSWORD"),
+            "expected a revert config set: {calls:#?}"
+        );
+        assert!(
+            calls[6].contains("mariadb-1"),
+            "expected a revert ALTER USER: {calls:#?}"
+        );
     }
 
     #[test]
