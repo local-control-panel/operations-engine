@@ -35,6 +35,7 @@ pub mod runtime_config;
 pub mod site;
 pub mod system_autoupdates;
 pub mod system_autoupdates_install;
+pub mod system_start_docker;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;

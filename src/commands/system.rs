@@ -4,7 +4,7 @@ use crate::{
     error::ErrorCode,
     process::CancellationToken,
     protocol::{Response, ResponseBuildError},
-    system_autoupdates, system_autoupdates_install,
+    system_autoupdates, system_autoupdates_install, system_start_docker,
 };
 
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
@@ -20,6 +20,79 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => install_autoupdates(&request_id, idempotency_key.as_deref()),
+        SystemCommand::StartDocker {
+            request_id,
+            idempotency_key,
+        } => start_docker(&request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn start_docker(request_id: &str, key: Option<&str>) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_start_docker::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let request = match system_start_docker::Request::parse(request_id, key) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_start_docker::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-id or idempotency-key is invalid",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_start_docker::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("open", &["-a", "Docker"])
+        } else {
+            ("systemctl", &["start", "docker"])
+        };
+        let ctx = system_start_docker::Context {
+            engine_state: &state,
+            start_program: program,
+            start_args: args,
+        };
+        match system_start_docker::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) | Err(system_start_docker::Error::PostCommit { result: v }) => {
+                Response::success(system_start_docker::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(
+                    system_start_docker::OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request_id, key);
+        Ok(Response::failure(
+            system_start_docker::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "system.startDocker requires a Unix host",
+        ))
     }
 }
 

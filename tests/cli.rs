@@ -87,7 +87,8 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.multisiteDeleteSite",
             "agent.activateBruteforceConfig",
             "system.activateAutoupdatesConfig",
-            "system.installAutoupdates"
+            "system.installAutoupdates",
+            "system.startDocker"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

@@ -158,6 +158,13 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Start the host Docker service through a fixed platform action.
+    StartDocker {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SystemCommand {
@@ -165,6 +172,7 @@ impl SystemCommand {
         match self {
             Self::ActivateAutoupdatesConfig { .. } => "system.activateAutoupdatesConfig",
             Self::InstallAutoupdates { .. } => "system.installAutoupdates",
+            Self::StartDocker { .. } => "system.startDocker",
         }
     }
 }

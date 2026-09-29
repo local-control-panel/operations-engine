@@ -74,6 +74,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "agent.activateBruteforceConfig",
                 "system.activateAutoupdatesConfig",
                 "system.installAutoupdates",
+                "system.startDocker",
             ],
             output_formats: ["json"],
             features: Features {
