@@ -84,7 +84,8 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.updatePlugins",
             "wordpress.updateThemes",
             "wordpress.rotateCredentials",
-            "agent.activateBruteforceConfig"
+            "agent.activateBruteforceConfig",
+            "system.activateAutoupdatesConfig"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

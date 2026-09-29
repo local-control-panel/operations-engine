@@ -33,6 +33,7 @@ pub mod protocol;
 pub mod rollback;
 pub mod runtime_config;
 pub mod site;
+pub mod system_autoupdates;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;
@@ -64,6 +65,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Permissions { command } => commands::permissions::run(command),
         Command::Wordpress { command } => commands::wordpress::run(command),
         Command::Agent { command } => commands::agent::run(command),
+        Command::System { command } => commands::system::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))
