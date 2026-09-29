@@ -1,9 +1,15 @@
 # Plan: `ingress.activateConfig` — Phase 8 pilot (atomic Caddy/site-config changes)
 
-Status: ready for execution
+Status: completed; archived 2026-09-28
 Date: 2026-09-03
 Milestone doc for: `PLAN.md` Phase 8, candidate "atomic Caddy and site
 configuration changes"
+
+> Historical execution document. The engine operation and pilot migration
+> described here shipped. Remaining ingress migrations require separate
+> milestones because several callers have multi-file or cross-root transaction
+> requirements. Current priorities live in
+> [`../../../PLAN.md`](../../../PLAN.md).
 
 ## Why this, why now, why scoped this way
 
@@ -85,7 +91,8 @@ Two things this engine has never done before, both scoped narrowly:
 
 Add `ingress_root: TrustedRoot` to `EngineConfig` (`src/config.rs`).
 `CONFIG_SCHEMA_VERSION` bumps to `2` (no deployed production config exists
-yet — see `PLAN.md`'s TEST-ONLY-key decision log entries — so this is a
+yet — see `docs/implementation-history.md`'s TEST-ONLY-key decision log
+entries — so this is a
 clean bump, not a compat-breaking one worth agonizing over). `ingress_root`
 must not overlap any `content_roots`/`state_root`/`credential_root`, same
 `roots_overlap` check already applied to the other roots

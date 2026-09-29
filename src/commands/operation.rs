@@ -1,0 +1,104 @@
+use std::path::Path;
+
+use crate::{
+    cli::OperationCommand,
+    config::EngineConfig,
+    error::ErrorCode,
+    filesystem::ManagedRoot,
+    operation_status::{self, StatusError},
+    protocol::{Response, ResponseBuildError},
+};
+
+const OPERATION: &str = "operation.status";
+const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
+
+pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
+    match command {
+        OperationCommand::Status {
+            site_id,
+            database,
+            backup_database,
+            request_id,
+        } => status(
+            site_id.as_deref(),
+            database.as_deref(),
+            backup_database.as_deref(),
+            &request_id,
+        ),
+    }
+}
+
+fn status(
+    site_id: Option<&str>,
+    database: Option<&str>,
+    backup_database: Option<&str>,
+    request_id: &str,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        let config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let root = match ManagedRoot::open(&config.state_root) {
+            Ok(root) => root,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let state = match (site_id, database, backup_database) {
+            (Some(site_id), None, None) => operation_status::load_site(&root, site_id, request_id),
+            (None, Some(database), None) => {
+                operation_status::load_database(&root, database, request_id)
+            }
+            (None, None, Some(database)) => {
+                operation_status::load_backup(&root, database, request_id)
+            }
+            _ => Err(StatusError::InvalidScope),
+        };
+        match state {
+            Ok(state) => Response::success(OPERATION, state),
+            Err(
+                StatusError::InvalidScope
+                | StatusError::InvalidSiteId
+                | StatusError::InvalidDatabase
+                | StatusError::InvalidRequestId,
+            ) => Ok(
+                Response::failure(
+                    OPERATION,
+                    ErrorCode::InvalidInput,
+                    "invalid operation identity",
+                ),
+            ),
+            Err(StatusError::NotFound) => Ok(Response::failure(
+                OPERATION,
+                ErrorCode::NotFound,
+                "operation record was not found",
+            )),
+            Err(StatusError::Corrupt | StatusError::Io) => Ok(Response::failure(
+                OPERATION,
+                ErrorCode::Internal,
+                "operation record is unavailable",
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (site_id, database, backup_database, request_id);
+        Ok(Response::failure(
+            OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "operation.status requires a Unix host",
+        ))
+    }
+}

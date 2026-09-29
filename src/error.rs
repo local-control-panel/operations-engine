@@ -6,6 +6,7 @@ pub enum ErrorCode {
     Internal,
     InternalSerializationError,
     InvalidInput,
+    NotFound,
     UnsupportedPlatform,
     DependencyUnavailable,
     Conflict,
@@ -76,6 +77,7 @@ impl ErrorCode {
             Self::Internal => "INTERNAL",
             Self::InternalSerializationError => "INTERNAL_SERIALIZATION_ERROR",
             Self::InvalidInput => "INVALID_INPUT",
+            Self::NotFound => "NOT_FOUND",
             Self::UnsupportedPlatform => "UNSUPPORTED_PLATFORM",
             Self::DependencyUnavailable => "DEPENDENCY_UNAVAILABLE",
             Self::Conflict => "CONFLICT",
@@ -125,6 +127,7 @@ mod tests {
             "\"INTERNAL_SERIALIZATION_ERROR\""
         );
         assert_eq!(ErrorCode::Timeout.as_str(), "TIMEOUT");
+        assert_eq!(ErrorCode::NotFound.as_str(), "NOT_FOUND");
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "version",
                 "capabilities",
                 "doctor",
+                "operation.status",
                 "backup.delete",
                 "backup.createDatabase",
                 "backup.activateConfig",

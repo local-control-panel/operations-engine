@@ -48,6 +48,21 @@ Neither value substitutes for the other.
 Protocol-breaking changes require a new protocol version. Adding an optional
 result field or a new capability does not necessarily require one.
 
+## `operation.status`
+
+`operation status` accepts exactly one scope selector — `--site-id <uuid>` for
+site deploy/rollback, `--database <name>` for `db.restore`, or
+`--backup-database <name>` for `backup.createDatabase` — plus
+`--request-id <uuid>`. It reads one durable transaction without retrying or
+otherwise executing the mutation.
+The result mirrors the stored transaction (`operation`, `status`, timestamps,
+safe outcome and idempotency key) and adds `active`. For an `IN_PROGRESS`
+transaction, `active` is true only when the same request currently owns the
+site's kernel-backed mutation lock. `IN_PROGRESS` plus `active: false` is an
+interrupted transaction that requires operation-specific recovery; stale lock
+file contents alone never make it active. A missing transaction returns
+`NOT_FOUND` and never creates a replacement transaction.
+
 ## `cron.installTab`
 
 `cron install-tab` atomically replaces a complete crontab with an optimistic

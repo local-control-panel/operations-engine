@@ -229,7 +229,7 @@ fn create_database(
                 ));
             }
         };
-        let _state = match ManagedRoot::open(&config.state_root) {
+        let state = match ManagedRoot::open(&config.state_root) {
             Ok(value) => value,
             Err(_) => {
                 return Ok(Response::failure(
@@ -260,8 +260,9 @@ fn create_database(
                     ));
                 }
             };
-        match backup_create::execute(
+        match backup_create::execute_transactional(
             &request,
+            &state,
             &backup_root,
             "docker",
             &CancellationToken::default(),

@@ -4,7 +4,11 @@
 //! orphaned `.rollback-*` backup siblings left behind by an
 //! `ingress.activateConfig`/`ingress.park`/`ingress.unpark` attempt that
 //! never reached its own commit point (a crash, a killed connection) and
-//! whose domain was never activated again to naturally overwrite them.
+//! whose domain was never activated again to naturally overwrite them. It
+//! also resolves unambiguous `.maintenance-backup` states: restore when the
+//! live route is absent, remove when both files are byte-identical, and
+//! preserve/report when they differ because that is also a normally parked
+//! site and cannot safely be guessed from filesystem state alone.
 //!
 //! A direct behavioral port of `website-control-panel`'s
 //! `reconciliation.rs::sweep`, narrowed to the two orphan classes that need
@@ -83,6 +87,20 @@ pub struct ReconcileResult {
     pub removed_temp_files: Vec<String>,
     pub removed_redundant_backups: Vec<String>,
     pub restored_recoverable_backups: Vec<RestoredBackup>,
+    /// Maintenance backups whose live sibling contained identical bytes.
+    /// These are provably redundant; unlike a different live sibling, no
+    /// parked-state guess is needed before removing them.
+    #[serde(default)]
+    pub removed_redundant_maintenance_backups: Vec<String>,
+    /// Maintenance backups restored because their live sibling was absent.
+    #[serde(default)]
+    pub restored_recoverable_maintenance_backups: Vec<RestoredBackup>,
+    /// Maintenance backups kept because a different live sibling exists.
+    /// This is the normal shape of a parked site and is intentionally
+    /// report-only: filesystem state alone cannot distinguish it from an
+    /// interrupted park/unpark attempt safely.
+    #[serde(default)]
+    pub preserved_maintenance_backups: Vec<String>,
     pub reconciled_at_unix_secs: u64,
 }
 
@@ -215,6 +233,9 @@ pub fn execute(
     let mut removed_temp_files = Vec::new();
     let mut removed_redundant_backups = Vec::new();
     let mut restored_recoverable_backups = Vec::new();
+    let mut removed_redundant_maintenance_backups = Vec::new();
+    let mut restored_recoverable_maintenance_backups = Vec::new();
+    let mut preserved_maintenance_backups = Vec::new();
 
     for name in names {
         let Ok(path) = SiteRelativePath::parse(&name) else {
@@ -223,6 +244,34 @@ pub fn execute(
         if is_temp_file(&name) {
             if ingress_root.remove_file(&path).is_ok() {
                 removed_temp_files.push(name);
+            }
+            continue;
+        }
+        if let Some(live_name) = maintenance_backup_live_sibling(&name) {
+            let Ok(live_path) = SiteRelativePath::parse(&live_name) else {
+                continue;
+            };
+            if !ingress_root.exists(&live_path) {
+                if ingress_root.rename(&path, &live_path).is_ok() {
+                    restored_recoverable_maintenance_backups.push(RestoredBackup {
+                        backup_path: name,
+                        restored_to: live_name,
+                    });
+                }
+            } else {
+                let redundant = ingress_root
+                    .read_bytes(&path)
+                    .and_then(|backup| {
+                        ingress_root
+                            .read_bytes(&live_path)
+                            .map(|live| backup == live)
+                    })
+                    .unwrap_or(false);
+                if redundant && ingress_root.remove_file(&path).is_ok() {
+                    removed_redundant_maintenance_backups.push(name);
+                } else {
+                    preserved_maintenance_backups.push(name);
+                }
             }
             continue;
         }
@@ -247,6 +296,9 @@ pub fn execute(
         removed_temp_files,
         removed_redundant_backups,
         restored_recoverable_backups,
+        removed_redundant_maintenance_backups,
+        restored_recoverable_maintenance_backups,
+        preserved_maintenance_backups,
         reconciled_at_unix_secs: unix_now_secs(),
     };
     let result_value = serde_json::to_value(&result).expect("ReconcileResult always serializes");
@@ -293,6 +345,15 @@ pub(crate) fn rollback_backup_live_sibling(name: &str) -> Option<String> {
         .map(|(live, _suffix)| live.to_owned())
 }
 
+/// Returns the live route sibling of `<domain>.maintenance-backup`.
+/// A live sibling with different bytes is deliberately not called orphaned:
+/// that is also the normal on-disk state of a parked domain.
+fn maintenance_backup_live_sibling(name: &str) -> Option<String> {
+    name.strip_suffix(".maintenance-backup")
+        .filter(|domain| !domain.is_empty())
+        .map(|domain| format!("{domain}.{}", super::ROUTE_EXTENSION))
+}
+
 fn replay(
     ingress_state: &ManagedRoot,
     original: RequestId,
@@ -333,7 +394,8 @@ fn unix_now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ReconcileContext, ReconcileRequest, execute, is_temp_file, rollback_backup_live_sibling,
+        ReconcileContext, ReconcileRequest, execute, is_temp_file,
+        maintenance_backup_live_sibling, rollback_backup_live_sibling,
     };
     use crate::{filesystem::ManagedRoot, process::CancellationToken, site::TrustedRoot};
 
@@ -352,6 +414,16 @@ mod tests {
             Some("a.test.caddyfile".to_owned())
         );
         assert_eq!(rollback_backup_live_sibling("a.test.caddyfile"), None);
+    }
+
+    #[test]
+    fn maintenance_backup_live_sibling_requires_the_exact_suffix() {
+        assert_eq!(
+            maintenance_backup_live_sibling("a.test.maintenance-backup"),
+            Some("a.test.caddyfile".to_owned())
+        );
+        assert_eq!(maintenance_backup_live_sibling(".maintenance-backup"), None);
+        assert_eq!(maintenance_backup_live_sibling("a.test.caddyfile"), None);
     }
 
     fn managed_root() -> (tempfile::TempDir, TrustedRoot, ManagedRoot) {
@@ -473,6 +545,78 @@ mod tests {
         assert!(result.removed_temp_files.is_empty());
         assert!(result.removed_redundant_backups.is_empty());
         assert!(result.restored_recoverable_backups.is_empty());
+        assert!(result.removed_redundant_maintenance_backups.is_empty());
+        assert!(result.restored_recoverable_maintenance_backups.is_empty());
+        assert!(result.preserved_maintenance_backups.is_empty());
+    }
+
+    #[test]
+    fn maintenance_backups_are_recovered_only_when_the_state_is_unambiguous() {
+        let (ingress_dir, ingress_root, _ingress_managed) = managed_root();
+        let (_state_dir, _state_root, engine_state) = managed_root();
+
+        write(ingress_dir.path(), "missing.test.maintenance-backup", "previous");
+        write(ingress_dir.path(), "same.test.caddyfile", "same");
+        write(ingress_dir.path(), "same.test.maintenance-backup", "same");
+        write(ingress_dir.path(), "parked.test.caddyfile", "maintenance");
+        write(
+            ingress_dir.path(),
+            "parked.test.maintenance-backup",
+            "previous",
+        );
+
+        let result = execute(
+            &ReconcileContext {
+                ingress_root: &ingress_root,
+                engine_state: &engine_state,
+            },
+            &request("91a1ad04-fb0f-4c47-98cb-3b477477dc83"),
+            &CancellationToken::default(),
+        )
+        .expect("maintenance backups should reconcile");
+
+        assert_eq!(
+            result.restored_recoverable_maintenance_backups[0].backup_path,
+            "missing.test.maintenance-backup"
+        );
+        assert_eq!(
+            result.restored_recoverable_maintenance_backups[0].restored_to,
+            "missing.test.caddyfile"
+        );
+        assert_eq!(
+            result.removed_redundant_maintenance_backups,
+            vec!["same.test.maintenance-backup"]
+        );
+        assert_eq!(
+            result.preserved_maintenance_backups,
+            vec!["parked.test.maintenance-backup"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(ingress_dir.path().join("missing.test.caddyfile")).unwrap(),
+            "previous"
+        );
+        assert!(!ingress_dir.path().join("same.test.maintenance-backup").exists());
+        assert!(
+            ingress_dir
+                .path()
+                .join("parked.test.maintenance-backup")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn old_reconcile_results_replay_with_empty_maintenance_fields() {
+        let result: super::ReconcileResult = serde_json::from_value(serde_json::json!({
+            "removedTempFiles": [],
+            "removedRedundantBackups": [],
+            "restoredRecoverableBackups": [],
+            "reconciledAtUnixSecs": 1
+        }))
+        .expect("the additive fields must preserve stored replay compatibility");
+
+        assert!(result.removed_redundant_maintenance_backups.is_empty());
+        assert!(result.restored_recoverable_maintenance_backups.is_empty());
+        assert!(result.preserved_maintenance_backups.is_empty());
     }
 
     #[test]

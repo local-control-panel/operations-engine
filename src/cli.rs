@@ -33,6 +33,12 @@ pub enum Command {
     /// Inspect whether the current host can run planned operations.
     Doctor,
 
+    /// Read durable mutation state without retrying the mutation.
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommand,
+    },
+
     /// Site-scoped mutation operations.
     Site {
         #[command(subcommand)]
@@ -106,6 +112,7 @@ impl Command {
             Self::Version => "version",
             Self::Capabilities => "capabilities",
             Self::Doctor => "doctor",
+            Self::Operation { command } => command.operation(),
             Self::Backup { command } => command.operation(),
             Self::Site { command } => command.operation(),
             Self::Engine { command } => command.operation(),
@@ -118,6 +125,32 @@ impl Command {
             Self::Permissions { command } => command.operation(),
             Self::Wordpress { command } => command.operation(),
             Self::Agent { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OperationCommand {
+    /// Return the last durable state for one site-scoped request.
+    Status {
+        #[arg(long = "site-id")]
+        site_id: Option<String>,
+
+        #[arg(long)]
+        database: Option<String>,
+
+        #[arg(long = "backup-database")]
+        backup_database: Option<String>,
+
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
+}
+
+impl OperationCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Status { .. } => "operation.status",
         }
     }
 }

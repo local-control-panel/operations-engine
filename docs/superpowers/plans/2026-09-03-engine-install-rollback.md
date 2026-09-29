@@ -1,5 +1,14 @@
 # Engine Install/Rollback Implementation Plan
 
+Status: completed for `operations-engine`; archived 2026-09-28
+
+> Historical execution document. The engine implementation, tests, release
+> workflow, and documentation described here were delivered. The unchecked
+> boxes below preserve the original task sequence; they are not an active
+> backlog and must not be used to infer current completion. Production-key
+> rotation, the first real release, control-plane integration, and test-server
+> rollout are tracked in [`../../../PLAN.md`](../../../PLAN.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give `ops-engine` a new `engine install`/`engine rollback` command pair that fetches a specific, signed release from GitHub, cryptographically verifies it, and atomically activates it at `/usr/local/bin/ops-engine` — with a no-network fallback to the one retained previous binary — plus the CI release pipeline that produces those signed artifacts in the first place.
