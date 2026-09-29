@@ -198,6 +198,18 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Rotate a WordPress site's database user password: `ALTER USER` and
+    /// `wp config set DB_PASSWORD` run under one lock/idempotency/
+    /// transaction/audit-backed request, with automatic rollback of
+    /// whichever side already changed if the other fails.
+    RotateCredentials {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl WordpressCommand {
@@ -209,6 +221,7 @@ impl WordpressCommand {
             Self::UpdateCore { .. } => "wordpress.updateCore",
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
             Self::UpdateThemes { .. } => "wordpress.updateThemes",
+            Self::RotateCredentials { .. } => "wordpress.rotateCredentials",
         }
     }
 }

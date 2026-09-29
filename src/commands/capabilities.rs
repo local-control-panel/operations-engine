@@ -68,6 +68,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.updateCore",
                 "wordpress.updatePlugins",
                 "wordpress.updateThemes",
+                "wordpress.rotateCredentials",
                 "agent.activateBruteforceConfig",
             ],
             output_formats: ["json"],
