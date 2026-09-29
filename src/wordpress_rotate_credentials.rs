@@ -12,7 +12,6 @@
 //! rollback is always the value actually in effect at the moment this
 //! operation runs.
 
-#[allow(unused_imports)]
 use crate::{
     db_restore::{ContainerName, RestoreRequestError},
     error::ErrorCode,
@@ -46,7 +45,6 @@ struct Plan {
     new_password: String,
 }
 
-#[allow(dead_code)]
 pub struct Request {
     container: ContainerName,
     root: PathBuf,
@@ -113,6 +111,336 @@ impl Request {
     pub fn root(&self) -> &std::path::Path {
         &self.root
     }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotateResult {
+    pub db_user: String,
+    pub completed_at_unix_secs: u64,
+}
+
+pub struct Context<'a> {
+    pub engine_state: &'a ManagedRoot,
+    pub docker_program: &'a str,
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Io(std::io::Error),
+    Preflight(preflight::Error),
+    ReplayInProgress,
+    Run(ProcessRunError),
+    Rejected(ErrorCode),
+    ResourceBusy,
+    InvalidCredentials,
+    RecoveryRequired,
+    PostCommit { result: RotateResult },
+    Replayed { code: ErrorCode, message: String },
+}
+
+impl Error {
+    pub fn protocol(&self) -> (ErrorCode, String) {
+        match self {
+            Self::Preflight(preflight::Error::Lock(_)) => (
+                ErrorCode::Conflict,
+                "another WordPress credential rotation is in progress for this site".into(),
+            ),
+            Self::ReplayInProgress => (
+                ErrorCode::Conflict,
+                "the original request is still in progress".into(),
+            ),
+            Self::Run(error) => (
+                process::spawn_error_code(error),
+                "could not run a WordPress credential rotation prerequisite".into(),
+            ),
+            Self::Rejected(code) => (*code, "WordPress credential rotation step failed".into()),
+            Self::ResourceBusy => (
+                ErrorCode::Conflict,
+                "another WordPress operation is already in progress for this site".into(),
+            ),
+            Self::InvalidCredentials => (
+                ErrorCode::Internal,
+                "the site's wp-config did not report usable database credentials".into(),
+            ),
+            Self::RecoveryRequired => (
+                ErrorCode::Conflict,
+                "WordPress credential rotation requires manual recovery; the database and wp-config may disagree on the current password".into(),
+            ),
+            Self::Replayed { code, message } => (*code, message.clone()),
+            _ => (
+                ErrorCode::Internal,
+                "internal WordPress credential rotation error".into(),
+            ),
+        }
+    }
+}
+
+fn wp_command(ctx: &Context<'_>, req: &Request) -> ProcessRequest {
+    ProcessRequest::new(ctx.docker_program).args([
+        "exec".to_owned(),
+        "-i".into(),
+        "--user".into(),
+        format!("{}:{}", req.uid, req.gid),
+        req.container.as_str().into(),
+        "wp".into(),
+        format!("--path={}", req.root.display()),
+        "--skip-plugins".into(),
+        "--skip-themes".into(),
+    ])
+}
+
+fn mariadb_command(ctx: &Context<'_>, req: &Request) -> ProcessRequest {
+    ProcessRequest::new(ctx.docker_program).args([
+        "exec",
+        "-i",
+        req.mariadb_container.as_str(),
+        "sh",
+        "-c",
+        "IFS= read -r MYSQL_PWD; export MYSQL_PWD; exec mariadb -uroot --batch",
+    ])
+}
+
+fn sql_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "''")
+}
+
+fn alter_user_stdin(root_password: &str, user: &str, password: &str) -> Vec<u8> {
+    format!(
+        "{root_password}\nALTER USER '{}'@'%' IDENTIFIED BY '{}'; FLUSH PRIVILEGES;\n",
+        sql_string(user),
+        sql_string(password)
+    )
+    .into_bytes()
+}
+
+fn critical(output: Result<process::ProcessOutput, ProcessRunError>) -> Result<(), Error> {
+    let output = output.map_err(Error::Run)?;
+    if let Some(code) = process::error_code(&output.termination) {
+        return Err(Error::Rejected(code));
+    }
+    Ok(())
+}
+
+fn read_config(
+    ctx: &Context<'_>,
+    req: &Request,
+    key: &str,
+    cancel: &CancellationToken,
+) -> Result<String, Error> {
+    let output = process::run(
+        &wp_command(ctx, req).args(["config", "get", key, "--format=json"]),
+        &ProcessLimits::default(),
+        cancel,
+    )
+    .map_err(Error::Run)?;
+    if let Some(code) = process::error_code(&output.termination) {
+        return Err(Error::Rejected(code));
+    }
+    let value: String =
+        serde_json::from_slice(&output.stdout.bytes).map_err(|_| Error::InvalidCredentials)?;
+    if value.is_empty() || value.len() > MAX_SECRET_BYTES {
+        return Err(Error::InvalidCredentials);
+    }
+    Ok(value)
+}
+
+pub fn execute(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<RotateResult, Error> {
+    let hash = resource_lock::canonical_hash(&req.root);
+    let scope_path =
+        SiteRelativePath::parse(format!("wordpress-rotate-credentials/{hash}")).unwrap();
+    ctx.engine_state
+        .create_dir_all(&scope_path)
+        .map_err(Error::Io)?;
+    let scope = ctx
+        .engine_state
+        .open_managed_dir(&scope_path)
+        .map_err(Error::Io)?;
+    for child in ["locks", "transactions", "audit"] {
+        scope
+            .create_dir_all(&SiteRelativePath::parse(child).unwrap())
+            .map_err(Error::Io)?;
+    }
+
+    let _resource_lock = resource_lock::acquire(ctx.engine_state, &req.root, req.request_id)
+        .map_err(|_| Error::ResourceBusy)?;
+
+    let admitted = match preflight::run(
+        &scope,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        OPERATION,
+    )
+    .map_err(Error::Preflight)?
+    {
+        preflight::Outcome::Replay(id) => return replay(&scope, id),
+        preflight::Outcome::Proceed(value) => value,
+    };
+    let preflight::Admitted { lock, mut state } = admitted;
+    let state_path =
+        SiteRelativePath::parse(format!("transactions/{}.json", req.request_id)).unwrap();
+    let audit_path = SiteRelativePath::parse("audit/events.jsonl").unwrap();
+
+    macro_rules! fail_now {
+        ($error:expr) => {
+            return Err(fail(
+                &scope,
+                &state_path,
+                &audit_path,
+                state.clone(),
+                $error,
+            ))
+        };
+    }
+
+    let old_user = match read_config(ctx, req, "DB_USER", cancel) {
+        Ok(value) => value,
+        Err(error) => fail_now!(error),
+    };
+    let old_password = match read_config(ctx, req, "DB_PASSWORD", cancel) {
+        Ok(value) => value,
+        Err(error) => fail_now!(error),
+    };
+
+    let mut credential_mutated = false;
+    let mut config_mutated = false;
+    let work = (|| -> Result<(), Error> {
+        critical(process::run_with_stdin_bytes(
+            &mariadb_command(ctx, req),
+            &alter_user_stdin(&req.db_root_password, &old_user, &req.new_password),
+            &ProcessLimits::default(),
+            cancel,
+        ))?;
+        credential_mutated = true;
+
+        critical(process::run_with_stdin_bytes(
+            &wp_command(ctx, req).args([
+                "config",
+                "set",
+                "DB_PASSWORD",
+                "--type=constant",
+                "--prompt=value",
+            ]),
+            format!("{}\n", req.new_password).as_bytes(),
+            &ProcessLimits::default(),
+            cancel,
+        ))?;
+        config_mutated = true;
+
+        critical(process::run(
+            &wp_command(ctx, req).args(["db", "check", "--quiet"]),
+            &ProcessLimits::default(),
+            cancel,
+        ))?;
+        Ok(())
+    })();
+
+    if let Err(error) = work {
+        let mut recovered = true;
+        if config_mutated {
+            recovered &= critical(process::run_with_stdin_bytes(
+                &wp_command(ctx, req).args([
+                    "config",
+                    "set",
+                    "DB_PASSWORD",
+                    "--type=constant",
+                    "--prompt=value",
+                ]),
+                format!("{old_password}\n").as_bytes(),
+                &ProcessLimits::default(),
+                &CancellationToken::default(),
+            ))
+            .is_ok();
+        }
+        if credential_mutated {
+            recovered &= critical(process::run_with_stdin_bytes(
+                &mariadb_command(ctx, req),
+                &alter_user_stdin(&req.db_root_password, &old_user, &old_password),
+                &ProcessLimits::default(),
+                &CancellationToken::default(),
+            ))
+            .is_ok();
+        }
+        if recovered {
+            fail_now!(error);
+        } else {
+            fail_now!(Error::RecoveryRequired);
+        }
+    }
+
+    let result = RotateResult {
+        db_user: old_user,
+        completed_at_unix_secs: {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        },
+    };
+    state
+        .mark_committed(serde_json::to_value(&result).unwrap())
+        .unwrap();
+    if state::save(&scope, &state_path, &state).is_err() {
+        drop(lock);
+        return Err(Error::PostCommit { result });
+    }
+    let _ = audit::append(
+        &scope,
+        &audit_path,
+        &AuditRecord::result(req.request_id, true, None),
+    );
+    drop(lock);
+    Ok(result)
+}
+
+fn replay(scope: &ManagedRoot, id: RequestId) -> Result<RotateResult, Error> {
+    let loaded = state::load(
+        scope,
+        &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+    )
+    .map_err(|e| Error::Io(std::io::Error::other(format!("{e:?}"))))?;
+    if loaded.operation != OPERATION {
+        return Err(Error::Io(std::io::Error::other(
+            "transaction operation mismatch",
+        )));
+    }
+    match loaded.status {
+        TransactionStatus::InProgress => Err(Error::ReplayInProgress),
+        TransactionStatus::Committed => {
+            serde_json::from_value(loaded.outcome.unwrap().result.unwrap())
+                .map_err(|e| Error::Io(std::io::Error::other(e)))
+        }
+        TransactionStatus::Failed => {
+            let outcome = loaded.outcome.unwrap();
+            Err(Error::Replayed {
+                code: outcome.error_code.unwrap_or(ErrorCode::Internal),
+                message: outcome.error_message.unwrap_or_default(),
+            })
+        }
+    }
+}
+
+fn fail(
+    scope: &ManagedRoot,
+    path: &SiteRelativePath,
+    audit_path: &SiteRelativePath,
+    mut state: crate::transaction::state::TransactionState,
+    error: Error,
+) -> Error {
+    let (code, message) = error.protocol();
+    let _ = state.mark_failed(code, message);
+    let _ = state::save(scope, path, &state);
+    let _ = audit::append(
+        scope,
+        audit_path,
+        &AuditRecord::result(state.request_id, false, Some(code)),
+    );
+    error
 }
 
 #[cfg(test)]
@@ -229,5 +557,82 @@ mod tests {
         let long_password = "x".repeat(257);
         let json = valid_json().replace("\"new-secret-value\"", &format!("\"{}\"", long_password));
         assert!(Request::parse(&json, REQUEST_ID, None).is_err());
+    }
+
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+
+    fn write_script(directory: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    struct Fixture {
+        _directory: tempfile::TempDir,
+        state: ManagedRoot,
+        docker: PathBuf,
+        site_root: PathBuf,
+    }
+
+    fn fixture(script_body: &str) -> Fixture {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let state =
+            ManagedRoot::open(&crate::site::TrustedRoot::parse(&state_dir).unwrap()).unwrap();
+        let docker = write_script(directory.path(), "fake-docker", script_body);
+        Fixture {
+            site_root: PathBuf::from("/var/www/example.com"),
+            _directory: directory,
+            state,
+            docker,
+        }
+    }
+
+    fn calls_log(fixture: &Fixture) -> Vec<String> {
+        let log_path = fixture.docker.parent().unwrap().join("calls.log");
+        match fs::read_to_string(log_path) {
+            Ok(contents) => contents.lines().map(str::to_owned).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn request_for(fx: &Fixture, request_id: &str, key: Option<&str>) -> Request {
+        let json = valid_json().replace("/var/www/example.com", fx.site_root.to_str().unwrap());
+        Request::parse(&json, request_id, key).expect("request should parse")
+    }
+
+    /// `wp config get` returns the current DB_USER/DB_PASSWORD as JSON strings;
+    /// every other call (ALTER USER, config set, db check) just succeeds.
+    const ALWAYS_SUCCEED: &str = r#"#!/bin/sh
+echo "$@" >> "$(dirname "$0")/calls.log"
+case "$*" in
+  *"config get DB_USER"*) echo '"old_user"'; exit 0 ;;
+  *"config get DB_PASSWORD"*) echo '"old_password"'; exit 0 ;;
+esac
+exit 0
+"#;
+
+    #[test]
+    fn rotates_credentials_end_to_end() {
+        let fx = fixture(ALWAYS_SUCCEED);
+        let request = request_for(&fx, REQUEST_ID, None);
+        let context = Context {
+            engine_state: &fx.state,
+            docker_program: fx.docker.to_str().unwrap(),
+        };
+
+        let result = execute(&context, &request, &CancellationToken::default())
+            .expect("rotation should succeed");
+        assert_eq!(result.db_user, "old_user");
+
+        let calls = calls_log(&fx);
+        assert_eq!(calls.len(), 5, "unexpected call sequence: {calls:#?}");
+        assert!(calls[0].contains("config get DB_USER"));
+        assert!(calls[1].contains("config get DB_PASSWORD"));
+        assert!(calls[2].contains("mariadb-1")); // ALTER USER, run against the MariaDB container
+        assert!(calls[3].contains("config set DB_PASSWORD"));
+        assert!(calls[4].contains("db check"));
     }
 }
