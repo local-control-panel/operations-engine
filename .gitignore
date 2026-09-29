@@ -3,4 +3,5 @@
 /.superpowers/
 release/minisign.key
 tests/fixtures/engine/minisign.key
+/.worktrees/
 
