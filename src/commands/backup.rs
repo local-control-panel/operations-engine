@@ -270,7 +270,7 @@ fn create_database(
             Ok(value) => Response::success(backup_create::OPERATION, value),
             Err(error) => {
                 let (code, message) = error.protocol();
-                Ok(Response::failure(backup_create::OPERATION, code, message))
+                Ok(Response::failure(backup_create::OPERATION, code, &message))
             }
         }
     }
