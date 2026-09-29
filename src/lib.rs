@@ -34,6 +34,7 @@ pub mod rollback;
 pub mod runtime_config;
 pub mod site;
 pub mod system_autoupdates;
+pub mod system_autoupdates_install;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;
