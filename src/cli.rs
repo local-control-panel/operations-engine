@@ -222,6 +222,15 @@ impl AgentCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum WordpressCommand {
+    /// Import a bounded, SHA-256-verified WXR artifact as the site UID.
+    Import {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Run one developer-defined cleanup action as the site's container user.
     Cleanup {
         #[arg(long = "request-file")]
@@ -307,6 +316,7 @@ pub enum WordpressCommand {
 impl WordpressCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::Import { .. } => "wordpress.import",
             Self::Cleanup { .. } => "wordpress.cleanup",
             Self::Install { .. } => "wordpress.install",
             Self::Clone { .. } => "wordpress.clone",
