@@ -231,6 +231,19 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Rotate a WordPress site's MariaDB credentials under one lock/
+    /// idempotency/transaction/audit-backed request: generates a new
+    /// password, applies it to MariaDB and to `wp-config.php`, verifies
+    /// database connectivity, and reverts both back to the prior password
+    /// if the update or the verification fails.
+    RotateCredentials {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl WordpressCommand {
@@ -242,6 +255,7 @@ impl WordpressCommand {
             Self::UpdateCore { .. } => "wordpress.updateCore",
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
             Self::UpdateThemes { .. } => "wordpress.updateThemes",
+            Self::RotateCredentials { .. } => "wordpress.rotateCredentials",
         }
     }
 }

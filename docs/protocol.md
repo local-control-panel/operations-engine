@@ -312,6 +312,22 @@ bounded theme slugs. The full site archive and database export must complete
 before the fixed site-UID `wp theme update` argv runs; no theme name is
 interpreted by a shell.
 
+## `wordpress.rotateCredentials`
+
+`wordpress rotate-credentials` accepts a root-owned JSON request containing
+the validated runtime container, WordPress root, site UID/GID, the MariaDB
+container, the MariaDB root password and a caller-generated new password.
+Under a per-site lock, the engine reads the site's current `DB_USER` and
+`DB_PASSWORD` out of `wp-config.php`, applies the new password to the
+MariaDB account with `ALTER USER ... IDENTIFIED BY` (fed to `mariadb` over
+stdin, like `db.provisionMariaDb`) and writes it to `wp-config.php` with `wp
+config set`, then verifies database connectivity with `wp db check`. If
+writing the new password or the connectivity check fails, both MariaDB and
+`wp-config.php` are reverted to the prior password before the request
+fails. The MariaDB root password and both the old and new site passwords
+never appear in a subprocess argument list. The operation is idempotent and
+transaction/audit recorded like every other WordPress mutation here.
+
 ## `agent.activateBruteforceConfig`
 
 `agent activate-bruteforce-config` accepts a root-owned JSON request with the

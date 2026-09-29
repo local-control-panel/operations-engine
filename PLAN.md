@@ -119,7 +119,7 @@ Delivered families include:
 - permissions repair;
 - MariaDB and PostgreSQL provisioning and restore workflows;
 - protected database-tool lifecycle operations;
-- WordPress install, clone, update, and cleanup operations;
+- WordPress install, clone, update, cleanup, and credential-rotation operations;
 - target-aware cron installation;
 - backup activation and retention operations;
 - Docker Compose configuration activation.
