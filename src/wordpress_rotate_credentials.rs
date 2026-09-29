@@ -660,4 +660,35 @@ exit 0
         assert!(calls[5].contains("config set DB_PASSWORD"), "expected a revert config set: {calls:#?}");
         assert!(calls[6].contains("mariadb-1"), "expected a revert ALTER USER: {calls:#?}");
     }
+
+    #[test]
+    fn reports_recovery_required_when_the_revert_itself_fails() {
+        let script = r#"#!/bin/sh
+echo "$@" >> "$(dirname "$0")/calls.log"
+case "$*" in
+  *"config get DB_USER"*) echo '"old_user"'; exit 0 ;;
+  *"config get DB_PASSWORD"*) echo '"old_password"'; exit 0 ;;
+  *"db check"*) exit 1 ;;
+  *"config set DB_PASSWORD"*)
+    n=$(grep -c "config set DB_PASSWORD" "$(dirname "$0")/calls.log")
+    if [ "$n" -ge 2 ]; then exit 1; fi
+    ;;
+esac
+exit 0
+"#;
+        let fx = fixture(script);
+        let request = request_for(&fx, REQUEST_ID, None);
+        let context = Context {
+            engine_state: &fx.state,
+            docker_program: fx.docker.to_str().unwrap(),
+        };
+
+        let error = execute(&context, &request, &CancellationToken::default())
+            .expect_err("a failed revert must not be reported as a clean failure");
+        assert_eq!(error.protocol().0, ErrorCode::Conflict);
+        assert!(
+            matches!(error, Error::RecoveryRequired),
+            "expected RecoveryRequired, got {error:?}"
+        );
+    }
 }
