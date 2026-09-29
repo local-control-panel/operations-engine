@@ -72,6 +72,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.rotateCredentials",
                 "agent.activateBruteforceConfig",
                 "system.activateAutoupdatesConfig",
+                "system.installAutoupdates",
             ],
             output_formats: ["json"],
             features: Features {

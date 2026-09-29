@@ -149,12 +149,22 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Install the `unattended-upgrades` apt package under one lock/
+    /// idempotency/transaction/audit-backed request.
+    InstallAutoupdates {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SystemCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateAutoupdatesConfig { .. } => "system.activateAutoupdatesConfig",
+            Self::InstallAutoupdates { .. } => "system.installAutoupdates",
         }
     }
 }
