@@ -199,4 +199,35 @@ mod tests {
         let json = valid_json().replace("\"uid\": 1000,", "\"uid\": 1000, \"unexpected\": true,");
         assert!(Request::parse(&json, REQUEST_ID, None).is_err());
     }
+
+    #[test]
+    fn rejects_a_new_password_containing_a_nul_byte() {
+        let password_with_nul = "new-secret\0value";
+        let json = format!(
+            r#"{{
+            "container": "runtime-1",
+            "root": "/var/www/example.com",
+            "uid": 1000,
+            "gid": 1000,
+            "mariadbContainer": "mariadb-1",
+            "dbRootPassword": "root-secret",
+            "newPassword": "{}"
+        }}"#,
+            password_with_nul
+        );
+        assert!(Request::parse(&json, REQUEST_ID, None).is_err());
+    }
+
+    #[test]
+    fn rejects_a_new_password_containing_a_carriage_return() {
+        let json = valid_json().replace("new-secret-value", "new-secret\rvalue");
+        assert!(Request::parse(&json, REQUEST_ID, None).is_err());
+    }
+
+    #[test]
+    fn rejects_a_new_password_exceeding_the_length_bound() {
+        let long_password = "x".repeat(257);
+        let json = valid_json().replace("\"new-secret-value\"", &format!("\"{}\"", long_password));
+        assert!(Request::parse(&json, REQUEST_ID, None).is_err());
+    }
 }
