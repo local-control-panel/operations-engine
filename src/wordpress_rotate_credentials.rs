@@ -239,9 +239,7 @@ fn read_config(
     }
     let value: String =
         serde_json::from_slice(&output.stdout.bytes).map_err(|_| Error::InvalidCredentials)?;
-    if value.is_empty() || value.len() > MAX_SECRET_BYTES {
-        return Err(Error::InvalidCredentials);
-    }
+    validate_secret(&value).map_err(|_| Error::InvalidCredentials)?;
     Ok(value)
 }
 
@@ -307,7 +305,6 @@ pub fn execute(
     };
 
     let mut credential_mutated = false;
-    let mut config_mutated = false;
     let work = (|| -> Result<(), Error> {
         critical(process::run_with_stdin_bytes(
             &mariadb_command(ctx, req),
@@ -329,7 +326,6 @@ pub fn execute(
             &ProcessLimits::default(),
             cancel,
         ))?;
-        config_mutated = true;
 
         critical(process::run(
             &wp_command(ctx, req).args(["db", "check", "--quiet"]),
@@ -341,7 +337,7 @@ pub fn execute(
 
     if let Err(error) = work {
         let mut recovered = true;
-        if config_mutated {
+        if credential_mutated {
             recovered &= critical(process::run_with_stdin_bytes(
                 &wp_command(ctx, req).args([
                     "config",
@@ -355,15 +351,15 @@ pub fn execute(
                 &CancellationToken::default(),
             ))
             .is_ok();
-        }
-        if credential_mutated {
-            recovered &= critical(process::run_with_stdin_bytes(
-                &mariadb_command(ctx, req),
-                &alter_user_stdin(&req.db_root_password, &old_user, &old_password),
-                &ProcessLimits::default(),
-                &CancellationToken::default(),
-            ))
-            .is_ok();
+            if recovered {
+                recovered &= critical(process::run_with_stdin_bytes(
+                    &mariadb_command(ctx, req),
+                    &alter_user_stdin(&req.db_root_password, &old_user, &old_password),
+                    &ProcessLimits::default(),
+                    &CancellationToken::default(),
+                ))
+                .is_ok();
+            }
         }
         if recovered {
             fail_now!(error);
