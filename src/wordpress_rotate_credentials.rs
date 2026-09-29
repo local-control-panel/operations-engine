@@ -631,4 +631,33 @@ exit 0
         assert!(calls[3].contains("config set DB_PASSWORD"));
         assert!(calls[4].contains("db check"));
     }
+
+    #[test]
+    fn reverts_both_mutations_when_verification_fails() {
+        let script = r#"#!/bin/sh
+echo "$@" >> "$(dirname "$0")/calls.log"
+case "$*" in
+  *"config get DB_USER"*) echo '"old_user"'; exit 0 ;;
+  *"config get DB_PASSWORD"*) echo '"old_password"'; exit 0 ;;
+  *"db check"*) exit 1 ;;
+esac
+exit 0
+"#;
+        let fx = fixture(script);
+        let request = request_for(&fx, REQUEST_ID, None);
+        let context = Context {
+            engine_state: &fx.state,
+            docker_program: fx.docker.to_str().unwrap(),
+        };
+
+        let error = execute(&context, &request, &CancellationToken::default())
+            .expect_err("a failed verification should fail the whole request");
+        assert_eq!(error.protocol().0, ErrorCode::SubprocessFailed);
+
+        let calls = calls_log(&fx);
+        // get x2, ALTER (new), config set (new), db check (fails), config set (revert to old), ALTER (revert to old)
+        assert_eq!(calls.len(), 7, "unexpected call sequence: {calls:#?}");
+        assert!(calls[5].contains("config set DB_PASSWORD"), "expected a revert config set: {calls:#?}");
+        assert!(calls[6].contains("mariadb-1"), "expected a revert ALTER USER: {calls:#?}");
+    }
 }
