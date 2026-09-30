@@ -14,7 +14,9 @@
 //! It also carries the typed replacements for the panel's former free-form
 //! `wp:cli` mutations (cache/rewrite flush, salts, cron, a fixed set of
 //! boolean `wp-config.php` flags, maintenance mode, users, search-replace,
-//! the site URL and plugin installation). Every kind maps to fixed argv;
+//! the site URL, plugin installation, and the tools-tab cleanups:
+//! transients, database optimize/repair, core language update and media
+//! regeneration). Every kind maps to fixed argv;
 //! the only secret (a new user's password) travels on stdin to a fixed
 //! `wp eval` script and never reaches argv or the recorded output. A kind
 //! may run several steps in order; a failure after the first reports how
@@ -140,6 +142,11 @@ enum ActionPlan {
     PluginInstall {
         slug: String,
     },
+    TransientDeleteAll {},
+    DbOptimize {},
+    DbRepair {},
+    LanguageCoreUpdate {},
+    MediaRegenerate {},
 }
 
 /// The only `wp-config.php` constants the panel toggles, always as a raw
@@ -216,6 +223,11 @@ enum Action {
         replace_from: Option<String>,
     },
     PluginInstall(String),
+    TransientDeleteAll,
+    DbOptimize,
+    DbRepair,
+    LanguageCoreUpdate,
+    MediaRegenerate,
 }
 
 #[derive(Clone, Debug)]
@@ -421,6 +433,11 @@ impl ActionPlan {
             Self::PluginInstall { slug } if validate_plugin_slug(&slug) => {
                 Ok(Action::PluginInstall(slug))
             }
+            Self::TransientDeleteAll {} => Ok(Action::TransientDeleteAll),
+            Self::DbOptimize {} => Ok(Action::DbOptimize),
+            Self::DbRepair {} => Ok(Action::DbRepair),
+            Self::LanguageCoreUpdate {} => Ok(Action::LanguageCoreUpdate),
+            Self::MediaRegenerate {} => Ok(Action::MediaRegenerate),
             _ => Err(RequestError::InvalidAction),
         }
     }
@@ -578,6 +595,15 @@ impl Request {
                 }
                 steps
             }
+            Action::TransientDeleteAll => vec![step(self.wp(&["transient", "delete", "--all"]))],
+            Action::DbOptimize => vec![long(self.wp(&["db", "optimize", "--quiet"]))],
+            Action::DbRepair => vec![long(self.wp(&["db", "repair", "--quiet"]))],
+            Action::LanguageCoreUpdate => vec![Step {
+                args: self.wp(&["language", "core", "update"]),
+                stdin: None,
+                timeout: Duration::from_secs(3 * 60),
+            }],
+            Action::MediaRegenerate => vec![long(self.wp(&["media", "regenerate", "--yes"]))],
             Action::PluginInstall(slug) => vec![Step {
                 args: self.wp(&["plugin", "install", slug, "--activate"]),
                 stdin: None,
@@ -1172,6 +1198,20 @@ echo "step $n ok"
             (
                 r#"{"kind":"pluginInstall","slug":"redis-cache"}"#,
                 vec!["plugin|install|redis-cache|--activate"],
+            ),
+            (
+                r#"{"kind":"transientDeleteAll"}"#,
+                vec!["transient|delete|--all"],
+            ),
+            (r#"{"kind":"dbOptimize"}"#, vec!["db|optimize|--quiet"]),
+            (r#"{"kind":"dbRepair"}"#, vec!["db|repair|--quiet"]),
+            (
+                r#"{"kind":"languageCoreUpdate"}"#,
+                vec!["language|core|update"],
+            ),
+            (
+                r#"{"kind":"mediaRegenerate"}"#,
+                vec!["media|regenerate|--yes"],
             ),
             (
                 r#"{"kind":"setSiteUrl","url":"https://new.example.com","replaceFrom":"https://old.example.com"}"#,
