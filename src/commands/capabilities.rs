@@ -75,6 +75,11 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.rotateCredentials",
                 "wordpress.multisiteDeleteSite",
                 "wordpress.boundedAction",
+                // The typed replacements for free-form `wp:cli` mutations
+                // (cache/rewrite flush, salts, cron, config flags,
+                // maintenance, users, search-replace, site URL, plugin
+                // install), carried by `wordpress.boundedAction`.
+                "wordpress.typedActions",
                 "wordpress.setSmtpRelay",
                 "agent.activateBruteforceConfig",
                 "system.activateAutoupdatesConfig",
