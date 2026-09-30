@@ -42,6 +42,7 @@ fn capabilities_describe_only_implemented_operations() {
             "doctor",
             "operation.status",
             "backup.delete",
+            "backup.importRemote",
             "backup.createDatabase",
             "backup.activateConfig",
             "backup.triggerNow",
