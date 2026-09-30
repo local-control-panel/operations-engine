@@ -3,7 +3,7 @@ use crate::{
     commands::read_root_owned_content_file,
     error::ErrorCode,
     protocol::{Response, ResponseBuildError},
-    wordpress, wordpress_clone, wordpress_import, wordpress_install,
+    wordpress, wordpress_bounded_action, wordpress_clone, wordpress_import, wordpress_install,
     wordpress_multisite_delete_site, wordpress_rotate_credentials, wordpress_update,
 };
 
@@ -50,6 +50,11 @@ pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => multisite_delete_site(&request_file, &request_id, idempotency_key.as_deref()),
+        WordpressCommand::BoundedAction {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => bounded_action(&request_file, &request_id, idempotency_key.as_deref()),
     }
 }
 
@@ -590,6 +595,101 @@ fn multisite_delete_site(
             wordpress_multisite_delete_site::OPERATION,
             ErrorCode::UnsupportedPlatform,
             "wordpress.multisiteDeleteSite requires a Unix host",
+        ))
+    }
+}
+
+fn bounded_action(
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::filesystem::ManagedRoot;
+        let config = match crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    wordpress_bounded_action::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    wordpress_bounded_action::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request =
+            match wordpress_bounded_action::Request::parse(&json, request_id, idempotency_key) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Response::failure(
+                        wordpress_bounded_action::OPERATION,
+                        ErrorCode::InvalidInput,
+                        "request-file is not a valid bounded WordPress action plan",
+                    ));
+                }
+            };
+        if !config
+            .content_roots
+            .iter()
+            .any(|root| request.root().starts_with(root.as_path()))
+        {
+            return Ok(Response::failure(
+                wordpress_bounded_action::OPERATION,
+                ErrorCode::InvalidInput,
+                "WordPress root is outside configured content roots",
+            ));
+        }
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    wordpress_bounded_action::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = wordpress_bounded_action::Context {
+            engine_state: &state,
+            docker_program: "docker",
+        };
+        match wordpress_bounded_action::execute(
+            &context,
+            &request,
+            &crate::process::CancellationToken::default(),
+        ) {
+            Ok(v) | Err(wordpress_bounded_action::Error::PostCommit { result: v }) => {
+                Response::success(wordpress_bounded_action::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(
+                    wordpress_bounded_action::OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            wordpress_bounded_action::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "wordpress.boundedAction requires a Unix host",
         ))
     }
 }
