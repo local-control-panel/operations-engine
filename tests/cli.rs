@@ -43,6 +43,7 @@ fn capabilities_describe_only_implemented_operations() {
             "operation.status",
             "backup.delete",
             "backup.importRemote",
+            "backup.installRclone",
             "backup.createDatabase",
             "backup.activateConfig",
             "backup.triggerNow",

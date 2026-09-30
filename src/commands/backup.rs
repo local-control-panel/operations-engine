@@ -16,6 +16,10 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        BackupCommand::InstallRclone {
+            request_id,
+            idempotency_key,
+        } => install_rclone(&request_id, idempotency_key.as_deref()),
         BackupCommand::ImportRemote {
             request_file,
             request_id,
@@ -118,6 +122,101 @@ fn import_remote(
             backup_import_remote::OPERATION,
             ErrorCode::UnsupportedPlatform,
             "backup.importRemote requires a Unix host",
+        ))
+    }
+}
+
+const INSTALL_RCLONE: &str = "backup.installRclone";
+
+fn install_rclone(request_id: &str, key: Option<&str>) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{
+            backup_install_rclone as rclone, config::EngineConfig, engine::fetch,
+            filesystem::ManagedRoot, site::TrustedRoot,
+        };
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    INSTALL_RCLONE,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let request = match rclone::Request::parse(request_id, key) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    INSTALL_RCLONE,
+                    ErrorCode::InvalidInput,
+                    "request-id or idempotency-key is invalid",
+                ));
+            }
+        };
+        let Some(artifact) = rclone::pinned_artifact() else {
+            return Ok(Response::failure(
+                INSTALL_RCLONE,
+                ErrorCode::UnsupportedPlatform,
+                "no pinned rclone release for this host (Linux amd64/arm64 only)",
+            ));
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    INSTALL_RCLONE,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let bin_dir_path = std::path::Path::new(rclone::BIN_DIR);
+        let bin_dir = match TrustedRoot::parse(bin_dir_path).and_then(|root| {
+            ManagedRoot::open(&root).map_err(|_| crate::site::ValidationError::PathResolutionFailed)
+        }) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    INSTALL_RCLONE,
+                    ErrorCode::Internal,
+                    "/usr/bin is unavailable",
+                ));
+            }
+        };
+        let existing: Vec<&std::path::Path> = rclone::EXISTING_PATHS
+            .iter()
+            .map(std::path::Path::new)
+            .collect();
+        let fetch = |url: &str| {
+            fetch::fetch_bytes_bounded(url, rclone::MAX_ARCHIVE_BYTES, rclone::FETCH_TIMEOUT)
+        };
+        let context = rclone::Context {
+            engine_state: &state,
+            bin_dir: &bin_dir,
+            bin_dir_path,
+            existing_paths: &existing,
+            artifact: &artifact,
+            fetch: &fetch,
+        };
+        match rclone::execute(&context, &request, &CancellationToken::default()) {
+            Ok(value) | Err(rclone::Error::PostCommit { result: value }) => {
+                Response::success(INSTALL_RCLONE, value)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(INSTALL_RCLONE, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request_id, key);
+        Ok(Response::failure(
+            INSTALL_RCLONE,
+            ErrorCode::UnsupportedPlatform,
+            "backup.installRclone requires a Linux host",
         ))
     }
 }

@@ -711,6 +711,7 @@ dependencies = [
  "assert_cmd",
  "cap-std",
  "clap",
+ "flate2",
  "libc",
  "minisign-verify",
  "serde",
