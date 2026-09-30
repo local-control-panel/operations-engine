@@ -4,7 +4,7 @@ use crate::{
         BACKUP_ROOT, OPERATION, Request, RequestError,
         execute::{Context, Error, execute},
     },
-    backup_deploy, backup_trigger,
+    backup_deploy, backup_import_remote, backup_trigger,
     cli::BackupCommand,
     commands::read_root_owned_content_file,
     error::ErrorCode,
@@ -16,6 +16,11 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        BackupCommand::ImportRemote {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => import_remote(&request_file, &request_id, idempotency_key.as_deref()),
         BackupCommand::ActivateConfig {
             request_file,
             request_id,
@@ -35,6 +40,85 @@ pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => delete(&request_file, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn import_remote(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_import_remote::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_import_remote::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match backup_import_remote::Request::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(message) => {
+                return Ok(Response::failure(
+                    backup_import_remote::OPERATION,
+                    ErrorCode::InvalidInput,
+                    message,
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    backup_import_remote::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = backup_import_remote::Context {
+            engine_state: &state,
+            import_root: std::path::Path::new(backup_import_remote::IMPORT_ROOT),
+            rclone_config: std::path::Path::new(backup_import_remote::RCLONE_CONFIG),
+            rclone_program: "rclone",
+        };
+        match backup_import_remote::execute(&context, &request, &CancellationToken::default()) {
+            Ok(value) | Err(backup_import_remote::Error::PostCommit { result: value }) => {
+                Response::success(backup_import_remote::OPERATION, value)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(
+                    backup_import_remote::OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            backup_import_remote::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.importRemote requires a Unix host",
+        ))
     }
 }
 

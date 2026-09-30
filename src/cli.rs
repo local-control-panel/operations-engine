@@ -361,6 +361,15 @@ impl MeilisearchCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum BackupCommand {
+    /// Copy and verify one remote artifact into the fixed imports directory.
+    ImportRemote {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Atomically activate the remote-backup configuration bundle.
     ActivateConfig {
         #[arg(long = "request-file")]
@@ -400,6 +409,7 @@ pub enum BackupCommand {
 impl BackupCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::ImportRemote { .. } => "backup.importRemote",
             Self::ActivateConfig { .. } => "backup.activateConfig",
             Self::TriggerNow { .. } => "backup.triggerNow",
             Self::CreateDatabase { .. } => "backup.createDatabase",
