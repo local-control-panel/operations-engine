@@ -8,8 +8,7 @@ on the managed host; it has no daemon or inbound API.
 The project is in selective migration and release preparation. It is not yet
 production release ready: the signing key, real tagged release, pinned panel
 installation, and live Linux rollout remain open. [PLAN.md](./PLAN.md) tracks
-those gates. The shared [migration status](https://github.com/local-control-panel/docs/blob/main/operations-engine/migration-status.md)
-tracks the cross-repository cutover.
+those gates.
 
 ## How it works
 
@@ -46,8 +45,7 @@ its authoritative operation list. The current source includes:
 
 Interactive terminals, arbitrary shell execution, general file browsing, and
 live log streaming are outside this privileged API. Some panel mutations
-still use older paths; the [risk audit](https://github.com/local-control-panel/docs/blob/main/operations-engine/raw-mutation-risk-audit.md)
-records their disposition.
+still use older paths.
 
 ## CLI and protocol
 
@@ -67,7 +65,7 @@ protocol version and required operation before dispatch.
 
 `operation status` reads durable mutation state; it does not retry a mutation.
 Request IDs and optional idempotency keys let callers distinguish a replay
-from a new attempt. Review each operation's milestone for its commit point,
+from a new attempt. Review each operation's contract for its commit point,
 failure state, and recovery limits.
 
 ## Security boundary
