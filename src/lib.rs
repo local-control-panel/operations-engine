@@ -50,6 +50,7 @@ pub mod wordpress_import;
 pub mod wordpress_install;
 pub mod wordpress_multisite_delete_site;
 pub mod wordpress_rotate_credentials;
+pub mod wordpress_smtp_relay;
 pub mod wordpress_update;
 
 use cli::{Cli, Command};
