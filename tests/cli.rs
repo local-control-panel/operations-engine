@@ -89,6 +89,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.rotateCredentials",
             "wordpress.multisiteDeleteSite",
             "wordpress.boundedAction",
+            "wordpress.setSmtpRelay",
             "agent.activateBruteforceConfig",
             "system.activateAutoupdatesConfig",
             "system.installAutoupdates",

@@ -352,6 +352,16 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Install WP Mail SMTP and atomically write its relay constants to
+    /// wp-config.php; the password arrives only in the root-owned request.
+    SetSmtpRelay {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl WordpressCommand {
@@ -367,6 +377,7 @@ impl WordpressCommand {
             Self::RotateCredentials { .. } => "wordpress.rotateCredentials",
             Self::MultisiteDeleteSite { .. } => "wordpress.multisiteDeleteSite",
             Self::BoundedAction { .. } => "wordpress.boundedAction",
+            Self::SetSmtpRelay { .. } => "wordpress.setSmtpRelay",
         }
     }
 }

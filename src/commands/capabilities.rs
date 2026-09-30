@@ -75,6 +75,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.rotateCredentials",
                 "wordpress.multisiteDeleteSite",
                 "wordpress.boundedAction",
+                "wordpress.setSmtpRelay",
                 "agent.activateBruteforceConfig",
                 "system.activateAutoupdatesConfig",
                 "system.installAutoupdates",
