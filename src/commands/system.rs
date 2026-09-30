@@ -24,6 +24,159 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => start_docker(&request_id, idempotency_key.as_deref()),
+        SystemCommand::CreateSwap {
+            size_mb,
+            request_id,
+            idempotency_key,
+        } => swap(
+            SwapAction::Create { size_mb },
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SystemCommand::DeleteSwap {
+            request_id,
+            idempotency_key,
+        } => swap(SwapAction::Delete, &request_id, idempotency_key.as_deref()),
+        SystemCommand::ResizeSwap {
+            size_mb,
+            request_id,
+            idempotency_key,
+        } => swap(
+            SwapAction::Resize { size_mb },
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+    }
+}
+
+/// Mirrors `system_swap::Action` so the CLI layer compiles on every
+/// platform even though the swap module itself is Unix-only.
+#[derive(Clone, Copy)]
+enum SwapAction {
+    Create { size_mb: u32 },
+    Delete,
+    Resize { size_mb: u32 },
+}
+
+impl SwapAction {
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Create { .. } => "system.createSwap",
+            Self::Delete => "system.deleteSwap",
+            Self::Resize { .. } => "system.resizeSwap",
+        }
+    }
+}
+
+fn swap(
+    action: SwapAction,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let operation = action.operation();
+    #[cfg(unix)]
+    {
+        use crate::{
+            config::EngineConfig, filesystem::ManagedRoot, site::TrustedRoot, system_swap,
+        };
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let action = match action {
+            SwapAction::Create { size_mb } => system_swap::Action::Create { size_mb },
+            SwapAction::Delete => system_swap::Action::Delete,
+            SwapAction::Resize { size_mb } => system_swap::Action::Resize { size_mb },
+        };
+        let request = match system_swap::Request::parse(action, request_id, key) {
+            Ok(v) => v,
+            Err(system_swap::RequestError::InvalidSize) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::InvalidInput,
+                    &format!(
+                        "size-mb must be between {} and {}",
+                        system_swap::MIN_SIZE_MB,
+                        system_swap::MAX_SIZE_MB
+                    ),
+                ));
+            }
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::InvalidInput,
+                    "request-id or idempotency-key is invalid",
+                ));
+            }
+        };
+        if !cfg!(target_os = "linux") {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::UnsupportedPlatform,
+                "swap management requires a Linux host",
+            ));
+        }
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let etc_dir =
+            match TrustedRoot::parse(std::path::Path::new(system_swap::ETC_DIR)).and_then(|r| {
+                ManagedRoot::open(&r)
+                    .map_err(|_| crate::site::ValidationError::PathResolutionFailed)
+            }) {
+                Ok(v) => v,
+                Err(_) => {
+                    return Ok(Response::failure(
+                        operation,
+                        ErrorCode::Internal,
+                        "/etc is unavailable",
+                    ));
+                }
+            };
+        let ctx = system_swap::Context {
+            engine_state: &state,
+            etc_dir: &etc_dir,
+            swap_path: system_swap::SWAP_PATH,
+            proc_swaps: std::path::Path::new(system_swap::PROC_SWAPS),
+            tools: system_swap::Tools {
+                fallocate: "fallocate",
+                mkswap: "mkswap",
+                swapon: "swapon",
+                swapoff: "swapoff",
+            },
+            available_bytes: system_swap::statvfs_available_bytes,
+        };
+        match system_swap::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) | Err(system_swap::Error::PostCommit { result: v }) => {
+                Response::success(operation, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(operation, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request_id, key);
+        Ok(Response::failure(
+            operation,
+            ErrorCode::UnsupportedPlatform,
+            "swap management requires a Linux host",
+        ))
     }
 }
 

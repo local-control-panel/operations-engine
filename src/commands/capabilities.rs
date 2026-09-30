@@ -78,6 +78,9 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "system.activateAutoupdatesConfig",
                 "system.installAutoupdates",
                 "system.startDocker",
+                "system.createSwap",
+                "system.deleteSwap",
+                "system.resizeSwap",
             ],
             output_formats: ["json"],
             features: Features {

@@ -37,6 +37,8 @@ pub mod site;
 pub mod system_autoupdates;
 pub mod system_autoupdates_install;
 pub mod system_start_docker;
+#[cfg(unix)]
+pub mod system_swap;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;
