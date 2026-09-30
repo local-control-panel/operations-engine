@@ -165,6 +165,32 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Create, format, enable and persist the managed `/swapfile`.
+    CreateSwap {
+        #[arg(long = "size-mb")]
+        size_mb: u32,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Disable and remove the managed `/swapfile` and its fstab entry.
+    DeleteSwap {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Replace the managed `/swapfile` with one of a new size, restoring
+    /// the previous file when the replacement fails.
+    ResizeSwap {
+        #[arg(long = "size-mb")]
+        size_mb: u32,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SystemCommand {
@@ -173,6 +199,9 @@ impl SystemCommand {
             Self::ActivateAutoupdatesConfig { .. } => "system.activateAutoupdatesConfig",
             Self::InstallAutoupdates { .. } => "system.installAutoupdates",
             Self::StartDocker { .. } => "system.startDocker",
+            Self::CreateSwap { .. } => "system.createSwap",
+            Self::DeleteSwap { .. } => "system.deleteSwap",
+            Self::ResizeSwap { .. } => "system.resizeSwap",
         }
     }
 }

@@ -91,7 +91,10 @@ fn capabilities_describe_only_implemented_operations() {
             "agent.activateBruteforceConfig",
             "system.activateAutoupdatesConfig",
             "system.installAutoupdates",
-            "system.startDocker"
+            "system.startDocker",
+            "system.createSwap",
+            "system.deleteSwap",
+            "system.resizeSwap"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
