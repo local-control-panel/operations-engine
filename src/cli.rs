@@ -403,6 +403,13 @@ impl MeilisearchCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum BackupCommand {
+    /// Install the pinned, SHA-256-verified rclone release binary.
+    InstallRclone {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Copy and verify one remote artifact into the fixed imports directory.
     ImportRemote {
         #[arg(long = "request-file")]
@@ -451,6 +458,7 @@ pub enum BackupCommand {
 impl BackupCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::InstallRclone { .. } => "backup.installRclone",
             Self::ImportRemote { .. } => "backup.importRemote",
             Self::ActivateConfig { .. } => "backup.activateConfig",
             Self::TriggerNow { .. } => "backup.triggerNow",

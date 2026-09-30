@@ -48,6 +48,28 @@ pub fn fetch_bytes(url: &str) -> Result<Vec<u8>, Error> {
         .map_err(|error| classify(error, Error::Read))
 }
 
+/// Like `fetch_bytes`, for a pinned third-party artifact larger than
+/// `ureq`'s 10 MiB default: the body is capped at `max_bytes` and the whole
+/// request at `timeout` (still with this module's connect bound, no proxy,
+/// and HTTPS-only for every non-loopback URL). The caller must verify the
+/// bytes against a compiled-in digest before using them.
+pub fn fetch_bytes_bounded(url: &str, max_bytes: u64, timeout: Duration) -> Result<Vec<u8>, Error> {
+    let mut response = agent(url)
+        .get(url)
+        .config()
+        .timeout_global(Some(timeout))
+        .timeout_recv_body(Some(timeout))
+        .build()
+        .call()
+        .map_err(|error| classify(error, Error::Request))?;
+    response
+        .body_mut()
+        .with_config()
+        .limit(max_bytes)
+        .read_to_vec()
+        .map_err(|error| classify(error, Error::Read))
+}
+
 fn classify(error: ureq::Error, otherwise: fn(ureq::Error) -> Error) -> Error {
     if matches!(error, ureq::Error::Timeout(_)) {
         Error::Timeout
