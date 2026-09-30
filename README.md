@@ -1,215 +1,106 @@
 # Operations Engine
 
-Operations Engine is a Linux-only command-line execution layer for structured,
-reliable server operations.
+Operations Engine is a Linux command-line execution layer for typed server
+mutations. A control plane, currently `website-control-panel`, invokes
+`ops-engine` over SSH and receives a versioned JSON response. The engine runs
+on the managed host; it has no daemon or inbound API.
 
-It is designed to be installed on managed servers and invoked by a control
-plane over an existing SSH connection. Instead of assembling long shell
-scripts remotely, a client calls a versioned operation and receives a
-machine-readable result.
+The project is in selective migration and release preparation. It is not yet
+production release ready: the signing key, real tagged release, pinned panel
+installation, and live Linux rollout remain open. [PLAN.md](./PLAN.md) tracks
+those gates. The shared [migration status](https://github.com/local-control-panel/docs/blob/main/operations-engine/migration-status.md)
+tracks the cross-repository cutover.
 
-> [!IMPORTANT]
-> Phases 0-6 (foundation, transaction framework, Git deploy/rollback,
-> client integration) are complete. Phase 7 (release and production
-> hardening) is functionally done and tested, with a small remainder before
-> a real release — see [PLAN.md](./PLAN.md) for the authoritative current
-> status and test count. Dozens of typed operations beyond the original Git
-> deploy/rollback pilot now ship (WordPress lifecycle, database, permissions,
-> ingress/runtime, backups). The protocol and installation process are
-> stabilizing but not yet frozen.
-
-Development follows the shared [roadmap](./PLAN.md). It records current
-priorities, release blockers, completion criteria, and the next work items.
-Completed delivery notes and the original decision log are preserved in the
-[implementation history](./docs/implementation-history.md).
-
-## Why it exists
-
-Remote orchestration built from shell commands becomes difficult to maintain as
-workflows grow. Quoting, partial failures, multiple SSH round trips, and parsing
-human-oriented command output make operations such as deploy and rollback more
-fragile than they need to be.
-
-Operations Engine provides a narrow boundary between a control plane and the
-server. It is intended to make complex operations:
-
-- typed and machine-readable;
-- transactional where the underlying system allows it;
-- recoverable after interrupted connections or partially completed work;
-- versioned independently from the client application;
-- reusable from a desktop application, CI, or a direct SSH session;
-- testable without a graphical interface.
-
-## Architecture
+## How it works
 
 ```text
-Control plane
-  -> SSH: ops-engine <operation> --output json
-  -> Operations Engine
-  -> Docker / Git / Caddy / filesystem / databases
+website-control-panel or another client
+    -> SSH: ops-engine <command> --output json
+    -> validated operation on the managed Linux host
+    -> Docker, Git, filesystem, database, or system service
 ```
 
-The control plane remains the source of truth for user-facing state and local
-metadata. Operations Engine is the execution layer: it validates input,
-performs a local server operation, and returns a structured result.
+The panel owns its user-facing state and local metadata. The engine validates
+each request again at the server boundary and uses bounded subprocesses,
+resource locks, idempotency records, transaction state, and audit events for
+mutations. These mechanisms do not make every workflow automatically
+reversible. In particular, `db.restore` has no automatic rollback or final
+application health probe, and an SSH disconnect does not turn a synchronous
+operation into a background job.
 
-The first version will be a CLI, not a continuously running daemon or a
-general-purpose remote agent.
+## Supported surface
 
-## Command surface
+Run `ops-engine capabilities --output json` against the installed binary for
+its authoritative operation list. The current source includes:
 
-The original small surface (`version`, `capabilities`, `doctor`, `stack
-status`, `site inspect/deploy/rollback`, `reconcile`) shipped first as the
-Git deploy/rollback pilot — it was a useful test of locking, filesystem
-staging, Git state, progress reporting, recovery, and compatibility between
-client and engine versions.
+- Site Git deploy and rollback; ingress, runtime, cron, Compose, and host
+  configuration activation.
+- MariaDB, PostgreSQL, Valkey, database tool, export, restore, and backup
+  operations. `backup.importRemote` stages a remote artifact only after a
+  SHA-256 match; the panel separately performs site-bound restore with a
+  safety backup.
+- WordPress install, clone, bounded WXR import, updates, cleanup, credential
+  rotation, and multisite subsite deletion.
+- Permissions repair, Meilisearch lifecycle, system updates, Docker start,
+  agent configuration, and engine install/rollback.
 
-Selective expansion (Phase 8) has since added typed, capability-gated
-operations well beyond that pilot: WordPress lifecycle (`wordpress.install`,
-`wordpress.clone`, `wordpress.updateCore`/`updatePlugins`/`updateThemes`,
-`wordpress.cleanup`), database operations (`db.provisionMariaDb`,
-`db.restore`, `db.export`, MariaDB/PostgreSQL/Valkey lifecycle),
-`permissions.fixOwnership`, backup workflows, and ingress/runtime
-reconciliation, among others. `ops-engine capabilities --output json` lists
-what a given build actually supports; see [PLAN.md](./PLAN.md) for current
-priorities and the criteria each migration must meet.
+Interactive terminals, arbitrary shell execution, general file browsing, and
+live log streaming are outside this privileged API. Some panel mutations
+still use older paths; the [risk audit](https://github.com/local-control-panel/docs/blob/main/operations-engine/raw-mutation-risk-audit.md)
+records their disposition.
 
-## Protocol direction
+## CLI and protocol
 
-Standard output is reserved for protocol messages. Diagnostic logs belong on
-standard error.
-
-A completed operation will return a versioned JSON envelope similar to:
-
-```json
-{
-  "protocolVersion": 1,
-  "operation": "site.deploy",
-  "ok": true,
-  "result": {},
-  "warnings": [],
-  "error": null
-}
+```console
+ops-engine version --output json
+ops-engine capabilities --output json
+ops-engine doctor --output json
+ops-engine backup import-remote --request-file /path/to/root-owned-plan.json --request-id <uuid> --output json
 ```
 
-Long-running operations may use JSON Lines for progress followed by a final
-result:
+Mutation commands use typed arguments or a bounded, root-owned request file.
+The engine emits one JSON response on stdout, with `protocolVersion`,
+`operation`, `ok`, `result`, `warnings`, and `error` fields. Diagnostics go to
+stderr. `capabilities` currently reports JSON output and does not advertise
+JSON Lines progress or cancellation as protocol features. Clients check the
+protocol version and required operation before dispatch.
 
-```jsonl
-{"type":"progress","step":"validate","status":"start"}
-{"type":"progress","step":"validate","status":"ok"}
-{"type":"result","ok":true,"result":{}}
-```
+`operation status` reads durable mutation state; it does not retry a mutation.
+Request IDs and optional idempotency keys let callers distinguish a replay
+from a new attempt. Review each operation's milestone for its commit point,
+failure state, and recovery limits.
 
-The protocol version and the engine's semantic version are separate. Clients
-will negotiate support through `capabilities` and reject incompatible protocol
-versions safely.
+## Security boundary
 
-## Scope
+- Install the privileged binary as root-owned and restrict the caller's sudo
+  access to approved commands.
+- Validate domains, paths, container names, operation parameters, and the
+  configured content and state roots on the host.
+- Use explicit subprocess argument lists, bounded time and output, and
+  capability-based filesystem access for mutations.
+- Keep secrets out of protocol output and audit records. Use verified release
+  artifacts for production installation once the release gate is complete.
 
-Good candidates for structured operations include:
-
-- server preflight checks and diagnostics;
-- stack status and reconciliation;
-- Git deploy and rollback;
-- atomic site and Caddy configuration changes;
-- backup and restore workflows;
-- locks, staging, and recovery;
-- narrowly scoped scheduled operations.
-
-The following should generally remain outside the structured API:
-
-- interactive terminals;
-- arbitrary shell or container execution;
-- live log streaming;
-- SFTP and general file browsing;
-- small read-only probes where an abstraction adds no value.
-
-## Security principles
-
-Operations Engine is intentionally not an unrestricted privileged remote
-execution API.
-
-- The installed binary should be owned by `root` and not writable by the
-  managed service user.
-- Privileged operations should use a minimal allowlist rather than broad sudo
-  access.
-- Domains, paths, container names, and service names must be validated at the
-  execution boundary.
-- Mutating filesystem operations should use temporary files, validation, and
-  atomic rename where possible.
-- Per-resource locks must have bounded and explicit stale-lock recovery.
-- Mutation operations should produce audit events.
-- Protocol output must never expose secrets, private keys, or raw environment
-  dumps.
-- Releases should be distributed with checksums and signatures.
-
-## Implementation direction
-
-The engine is planned as a Rust application. Likely building blocks include:
-
-- `clap` for the command-line interface;
-- `serde` and `serde_json` for protocol messages;
-- `tracing` for diagnostic logs;
-- `semver` for compatibility checks;
-- `thiserror` for a stable error taxonomy;
-- `sha2` for release asset verification.
-
-External processes should be started with explicit argument lists through
-`std::process::Command`. Shell execution should be limited to isolated cases
-where it is genuinely required.
+The current release signing material is **test only**. Do not treat the
+existing test fixtures as a production distribution channel.
 
 ## Development
 
-The project requires Rust 1.85 or newer. The repository toolchain file selects
-the current stable toolchain for local development.
+Rust 1.85 is the minimum supported compiler. The repository toolchain file
+selects the local development toolchain. CI runs these checks on Linux:
 
 ```console
-cargo build
-cargo test --all-features
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo +1.85.0 check --all-features
 ```
 
-Run a command locally with:
-
-```console
-cargo run -- version --output json
-cargo run -- capabilities --output json
-cargo run -- doctor --output json
-```
-
-macOS is useful for development, but production builds and operational behavior
-target Linux. See [CONTRIBUTING.md](./CONTRIBUTING.md) for the contribution and
-validation workflow.
-
-External process execution follows the bounded timeout, output, and
-cancellation contract in [docs/subprocess.md](./docs/subprocess.md).
-
-## Roadmap
-
-1. ~~Define the protocol, privilege model, and threat model.~~ Done.
-2. ~~Build `version`, `capabilities`, and `doctor` with Linux releases for
-   AMD64 and ARM64.~~ Done.
-3. ~~Implement and test a Git deploy/rollback pilot.~~ Done.
-4. Signed releases, atomic upgrades, audit logging, and recovery procedures —
-   done and tested; rotating off the TEST-ONLY signing key remains before a
-   real release.
-5. Migrate additional operations only where the structured boundary provides a
-   measurable benefit — in progress (Phase 8); see [PLAN.md](./PLAN.md) for
-   what has shipped and what's next.
-
-Detailed implementation milestones live in the docs repository's
-[`operations-engine/milestones`](https://github.com/local-control-panel/docs/tree/main/operations-engine/milestones).
-The authoritative execution order and current status live in [PLAN.md](./PLAN.md).
-
-## Naming
-
-**Operations Engine** and `ops-engine` are neutral working names. They do not
-depend on the name of any client product. A stable product prefix may be added
-before the first public release without changing the component's architectural
-role.
+macOS is useful for development; operational behavior and releases target
+Linux. See [CONTRIBUTING.md](./CONTRIBUTING.md) for command design and
+validation rules, [docs/subprocess.md](./docs/subprocess.md) for subprocess
+limits, and [PLAN.md](./PLAN.md) for current priorities.
 
 ## License
 
-This project is licensed under the terms in [LICENSE](./LICENSE).
+This project is licensed under [LICENSE](./LICENSE).
