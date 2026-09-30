@@ -10,6 +10,15 @@
 //! an internal `action.kind` discriminator instead. A future bounded action
 //! with its own nontrivial validation or recovery story should get its own
 //! operation module rather than growing the match arm here.
+//!
+//! It also carries the typed replacements for the panel's former free-form
+//! `wp:cli` mutations (cache/rewrite flush, salts, cron, a fixed set of
+//! boolean `wp-config.php` flags, maintenance mode, users, search-replace,
+//! the site URL and plugin installation). Every kind maps to fixed argv;
+//! the only secret (a new user's password) travels on stdin to a fixed
+//! `wp eval` script and never reaches argv or the recorded output. A kind
+//! may run several steps in order; a failure after the first reports how
+//! many steps were already applied, since none of them is rolled back.
 
 use crate::{
     db_restore::{ContainerName, RestoreRequestError},
@@ -43,6 +52,23 @@ const MAX_EMAIL_BYTES: usize = 254;
 /// own multisite defaults tolerate comfortably.
 const MAX_SLUG_BYTES: usize = 63;
 const STEP_TIMEOUT: Duration = Duration::from_secs(120);
+const LONG_STEP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_HOOK_BYTES: usize = 200;
+const MAX_LOGIN_BYTES: usize = 60;
+const MAX_PASSWORD_BYTES: usize = 1024;
+const MAX_REPLACE_BYTES: usize = 2048;
+const MAX_PLUGIN_SLUG_BYTES: usize = 100;
+
+/// Creates one user from a stdin JSON plan with `wp_insert_user`, so the
+/// password is never an argv element (WP-CLI's `--prompt` would echo it
+/// back in the reconstructed command). Fixed text; nothing is interpolated.
+pub const USER_CREATE_PHP: &str = r#"$plan = json_decode(stream_get_contents(STDIN), true);
+if (!is_array($plan) || !isset($plan['login'], $plan['email'], $plan['role'])) { fwrite(STDERR, "invalid plan\n"); exit(2); }
+if (!get_role((string) $plan['role'])) { fwrite(STDERR, "unknown role\n"); exit(3); }
+$password = isset($plan['password']) && $plan['password'] !== '' ? (string) $plan['password'] : wp_generate_password(24, true, true);
+$id = wp_insert_user(array('user_login' => (string) $plan['login'], 'user_email' => (string) $plan['email'], 'role' => (string) $plan['role'], 'user_pass' => $password));
+if (is_wp_error($id)) { fwrite(STDERR, $id->get_error_message() . "\n"); exit(1); }
+echo "Success: Created user {$id}.\n";"#;
 const MAX_STEP_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -56,7 +82,12 @@ struct Plan {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 enum ActionPlan {
     MultisiteCreateSite {
         title: String,
@@ -68,6 +99,85 @@ enum ActionPlan {
         subdomain: bool,
     },
     WooClearTransients {},
+    CacheFlush {},
+    RewriteFlush {},
+    ShuffleSalts {},
+    CronRun {
+        hook: Option<String>,
+    },
+    CronDelete {
+        hook: String,
+    },
+    SetConfigFlag {
+        name: ConfigFlag,
+        value: bool,
+    },
+    Maintenance {
+        active: bool,
+    },
+    UserCreate {
+        login: String,
+        email: String,
+        role: String,
+        password: Option<String>,
+    },
+    UserSetRole {
+        id: u64,
+        role: String,
+    },
+    UserDelete {
+        id: u64,
+    },
+    SearchReplace {
+        from: String,
+        to: String,
+        dry_run: bool,
+    },
+    SetSiteUrl {
+        url: String,
+        replace_from: Option<String>,
+    },
+    PluginInstall {
+        slug: String,
+    },
+}
+
+/// The only `wp-config.php` constants the panel toggles, always as a raw
+/// PHP boolean.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+pub enum ConfigFlag {
+    #[serde(rename = "WP_DEBUG")]
+    WpDebug,
+    #[serde(rename = "WP_DEBUG_LOG")]
+    WpDebugLog,
+    #[serde(rename = "DISABLE_WP_CRON")]
+    DisableWpCron,
+    #[serde(rename = "AUTOMATIC_UPDATER_DISABLED")]
+    AutomaticUpdaterDisabled,
+    #[serde(rename = "WP_AUTO_UPDATE_CORE")]
+    WpAutoUpdateCore,
+}
+
+impl ConfigFlag {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::WpDebug => "WP_DEBUG",
+            Self::WpDebugLog => "WP_DEBUG_LOG",
+            Self::DisableWpCron => "DISABLE_WP_CRON",
+            Self::AutomaticUpdaterDisabled => "AUTOMATIC_UPDATER_DISABLED",
+            Self::WpAutoUpdateCore => "WP_AUTO_UPDATE_CORE",
+        }
+    }
+}
+
+/// A value that must never appear in `Debug` output.
+#[derive(Clone)]
+struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[redacted]")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +191,31 @@ enum Action {
         subdomain: bool,
     },
     WooClearTransients,
+    CacheFlush,
+    RewriteFlush,
+    ShuffleSalts,
+    CronRun(Option<String>),
+    CronDelete(String),
+    SetConfigFlag(ConfigFlag, bool),
+    Maintenance(bool),
+    UserCreate {
+        login: String,
+        email: String,
+        role: String,
+        password: Option<Secret>,
+    },
+    UserSetRole(u64, String),
+    UserDelete(u64),
+    SearchReplace {
+        from: String,
+        to: String,
+        dry_run: bool,
+    },
+    SetSiteUrl {
+        url: String,
+        replace_from: Option<String>,
+    },
+    PluginInstall(String),
 }
 
 #[derive(Clone, Debug)]
@@ -151,6 +286,57 @@ fn validate_slug(value: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
+fn no_control(value: &str) -> bool {
+    !value.chars().any(char::is_control)
+}
+
+/// Bounded free text that becomes one argv element: never empty, never a
+/// control character, and never starting with `-`, so WP-CLI cannot read
+/// it as a flag.
+fn validate_arg(value: &str, max_len: usize) -> bool {
+    !value.is_empty() && value.len() <= max_len && !value.starts_with('-') && no_control(value)
+}
+
+/// Cron hook names are PHP action names: identifier-like, with the
+/// separators plugins commonly use.
+fn validate_hook(value: &str) -> bool {
+    validate_arg(value, MAX_HOOK_BYTES)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':' | b'/'))
+}
+
+fn validate_role(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+fn validate_url(value: &str) -> bool {
+    (value.starts_with("https://") || value.starts_with("http://"))
+        && value.len() <= MAX_REPLACE_BYTES
+        && !value
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+}
+
+/// A wordpress.org plugin slug.
+fn validate_plugin_slug(value: &str) -> bool {
+    validate_slug_bytes(value, MAX_PLUGIN_SLUG_BYTES)
+}
+
+fn validate_slug_bytes(value: &str, max_len: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_len
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 impl ActionPlan {
     fn validate(self) -> Result<Action, RequestError> {
         match self {
@@ -178,6 +364,64 @@ impl ActionPlan {
             }
             Self::MultisiteSetMode { subdomain } => Ok(Action::MultisiteSetMode { subdomain }),
             Self::WooClearTransients {} => Ok(Action::WooClearTransients),
+            Self::CacheFlush {} => Ok(Action::CacheFlush),
+            Self::RewriteFlush {} => Ok(Action::RewriteFlush),
+            Self::ShuffleSalts {} => Ok(Action::ShuffleSalts),
+            Self::CronRun { hook } => match hook {
+                None => Ok(Action::CronRun(None)),
+                Some(hook) if validate_hook(&hook) => Ok(Action::CronRun(Some(hook))),
+                Some(_) => Err(RequestError::InvalidAction),
+            },
+            Self::CronDelete { hook } if validate_hook(&hook) => Ok(Action::CronDelete(hook)),
+            Self::SetConfigFlag { name, value } => Ok(Action::SetConfigFlag(name, value)),
+            Self::Maintenance { active } => Ok(Action::Maintenance(active)),
+            Self::UserCreate {
+                login,
+                email,
+                role,
+                password,
+            } if validate_arg(login.trim(), MAX_LOGIN_BYTES)
+                && validate_email(&email)
+                && validate_role(&role)
+                && password
+                    .as_deref()
+                    .is_none_or(|p| p.len() <= MAX_PASSWORD_BYTES && no_control(p)) =>
+            {
+                Ok(Action::UserCreate {
+                    login: login.trim().to_owned(),
+                    email,
+                    role,
+                    password: password.filter(|p| !p.is_empty()).map(Secret),
+                })
+            }
+            Self::UserSetRole { id, role } if id >= 1 && validate_role(&role) => {
+                Ok(Action::UserSetRole(id, role))
+            }
+            // Content is reassigned to user 1, so user 1 itself is never a
+            // valid deletion target here.
+            Self::UserDelete { id } if id >= 2 => Ok(Action::UserDelete(id)),
+            Self::SearchReplace { from, to, dry_run }
+                if validate_arg(&from, MAX_REPLACE_BYTES)
+                    && validate_arg(&to, MAX_REPLACE_BYTES)
+                    && from != to =>
+            {
+                Ok(Action::SearchReplace { from, to, dry_run })
+            }
+            Self::SetSiteUrl { url, replace_from }
+                if validate_url(&url)
+                    && replace_from
+                        .as_deref()
+                        .is_none_or(|from| validate_arg(from, MAX_REPLACE_BYTES)) =>
+            {
+                Ok(Action::SetSiteUrl {
+                    replace_from: replace_from.filter(|from| from != &url),
+                    url,
+                })
+            }
+            Self::PluginInstall { slug } if validate_plugin_slug(&slug) => {
+                Ok(Action::PluginInstall(slug))
+            }
+            _ => Err(RequestError::InvalidAction),
         }
     }
 }
@@ -214,7 +458,7 @@ impl Request {
         &self.root
     }
 
-    fn argv(&self) -> Vec<String> {
+    fn wp(&self, tail: &[&str]) -> Vec<String> {
         let mut args = vec![
             "exec".to_owned(),
             "-i".to_owned(),
@@ -225,36 +469,128 @@ impl Request {
             format!("--path={}", self.root.display()),
             "--allow-root".to_owned(),
         ];
+        args.extend(tail.iter().map(|arg| (*arg).to_owned()));
+        args
+    }
+
+    fn steps(&self) -> Vec<Step> {
+        let step = |args: Vec<String>| Step {
+            args,
+            stdin: None,
+            timeout: STEP_TIMEOUT,
+        };
+        let long = |args: Vec<String>| Step {
+            args,
+            stdin: None,
+            timeout: LONG_STEP_TIMEOUT,
+        };
         match &self.action {
             Action::MultisiteCreateSite {
                 title,
                 email,
                 target,
             } => {
-                args.push("site".to_owned());
-                args.push("create".to_owned());
-                match target {
-                    CreateSiteTarget::Slug(slug) => args.push(format!("--slug={slug}")),
-                    CreateSiteTarget::Url(url) => args.push(format!("--url={url}")),
+                let target = match target {
+                    CreateSiteTarget::Slug(slug) => format!("--slug={slug}"),
+                    CreateSiteTarget::Url(url) => format!("--url={url}"),
+                };
+                vec![step(self.wp(&[
+                    "site",
+                    "create",
+                    &target,
+                    &format!("--title={title}"),
+                    &format!("--email={email}"),
+                ]))]
+            }
+            Action::MultisiteSetMode { subdomain } => vec![step(self.wp(&[
+                "config",
+                "set",
+                "SUBDOMAIN_INSTALL",
+                if *subdomain { "1" } else { "0" },
+                "--raw",
+            ]))],
+            Action::WooClearTransients => vec![step(self.wp(&["transient", "delete", "--all"]))],
+            Action::CacheFlush => vec![step(self.wp(&["cache", "flush"]))],
+            Action::RewriteFlush => vec![step(self.wp(&["rewrite", "flush"]))],
+            Action::ShuffleSalts => vec![step(self.wp(&["config", "shuffle-salts"]))],
+            Action::CronRun(None) => vec![long(self.wp(&["cron", "event", "run", "--due-now"]))],
+            Action::CronRun(Some(hook)) => vec![long(self.wp(&["cron", "event", "run", hook]))],
+            Action::CronDelete(hook) => vec![step(self.wp(&["cron", "event", "delete", hook]))],
+            Action::SetConfigFlag(flag, value) => vec![step(self.wp(&[
+                "config",
+                "set",
+                flag.name(),
+                if *value { "true" } else { "false" },
+                "--raw",
+            ]))],
+            Action::Maintenance(active) => vec![step(self.wp(&[
+                "maintenance-mode",
+                if *active { "activate" } else { "deactivate" },
+            ]))],
+            Action::UserCreate {
+                login,
+                email,
+                role,
+                password,
+            } => {
+                let plan = serde_json::json!({
+                    "login": login, "email": email, "role": role,
+                    "password": password.as_ref().map(|secret| secret.0.as_str()),
+                });
+                vec![Step {
+                    args: self.wp(&["eval", USER_CREATE_PHP]),
+                    stdin: Some(plan.to_string().into_bytes()),
+                    timeout: STEP_TIMEOUT,
+                }]
+            }
+            Action::UserSetRole(id, role) => vec![step(self.wp(&[
+                "user",
+                "update",
+                &id.to_string(),
+                &format!("--role={role}"),
+            ]))],
+            Action::UserDelete(id) => vec![step(self.wp(&[
+                "user",
+                "delete",
+                &id.to_string(),
+                "--yes",
+                "--reassign=1",
+            ]))],
+            Action::SearchReplace { from, to, dry_run } => {
+                let mut tail = vec!["search-replace", from.as_str(), to.as_str(), "--all-tables"];
+                if *dry_run {
+                    tail.push("--dry-run");
                 }
-                args.push(format!("--title={title}"));
-                args.push(format!("--email={email}"));
+                vec![long(self.wp(&tail))]
             }
-            Action::MultisiteSetMode { subdomain } => {
-                args.push("config".to_owned());
-                args.push("set".to_owned());
-                args.push("SUBDOMAIN_INSTALL".to_owned());
-                args.push(if *subdomain { "1" } else { "0" }.to_owned());
-                args.push("--raw".to_owned());
+            Action::SetSiteUrl { url, replace_from } => {
+                let mut steps = vec![
+                    step(self.wp(&["option", "update", "siteurl", url])),
+                    step(self.wp(&["option", "update", "home", url])),
+                ];
+                if let Some(from) = replace_from {
+                    steps.push(long(self.wp(&[
+                        "search-replace",
+                        from,
+                        url,
+                        "--all-tables",
+                    ])));
+                }
+                steps
             }
-            Action::WooClearTransients => {
-                args.push("transient".to_owned());
-                args.push("delete".to_owned());
-                args.push("--all".to_owned());
-            }
+            Action::PluginInstall(slug) => vec![Step {
+                args: self.wp(&["plugin", "install", slug, "--activate"]),
+                stdin: None,
+                timeout: Duration::from_secs(3 * 60),
+            }],
         }
-        args
     }
+}
+
+struct Step {
+    args: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    timeout: Duration,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -278,10 +614,22 @@ pub enum Error {
     Cancelled,
     Run(process::ProcessRunError),
     Rejected(SubprocessDiagnostics),
+    /// Step `failed` (1-based) of `total` was rejected after the earlier
+    /// steps had already been applied; none of them is rolled back.
+    StepRejected {
+        failed: usize,
+        total: usize,
+        diagnostics: SubprocessDiagnostics,
+    },
     TooLarge,
     InvalidUtf8,
-    PostCommit { result: BoundedActionResult },
-    Replayed { code: ErrorCode, message: String },
+    PostCommit {
+        result: BoundedActionResult,
+    },
+    Replayed {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 impl Error {
@@ -316,6 +664,22 @@ impl Error {
                     ErrorCode::SubprocessFailed
                 },
                 "WordPress rejected the bounded action".into(),
+            ),
+            Self::StepRejected {
+                failed,
+                total,
+                diagnostics,
+            } => (
+                if diagnostics.timed_out {
+                    ErrorCode::Timeout
+                } else {
+                    ErrorCode::SubprocessFailed
+                },
+                format!(
+                    "WordPress rejected step {failed} of {total}; the {} earlier step(s) were \
+                     applied and were not rolled back",
+                    failed - 1
+                ),
             ),
             Self::TooLarge => (
                 ErrorCode::Internal,
@@ -382,67 +746,83 @@ pub fn execute(
         ));
     }
 
-    let output = match process::run(
-        &ProcessRequest::new(ctx.docker_program).args(req.argv()),
-        &ProcessLimits {
-            timeout: STEP_TIMEOUT,
+    let steps = req.steps();
+    let total = steps.len();
+    let mut outputs = Vec::with_capacity(total);
+    for (index, step) in steps.into_iter().enumerate() {
+        // Once a step has been applied, the remaining ones must run to
+        // completion rather than stop on a cancellation request.
+        let step_cancel = if index == 0 {
+            cancel.clone()
+        } else {
+            CancellationToken::default()
+        };
+        let request = ProcessRequest::new(ctx.docker_program).args(&step.args);
+        let limits = ProcessLimits {
+            timeout: step.timeout,
             max_stdout_bytes: MAX_STEP_OUTPUT_BYTES,
             max_stderr_bytes: MAX_STEP_OUTPUT_BYTES,
-        },
-        cancel,
-    ) {
-        Ok(value) => value,
-        Err(error) => {
+        };
+        let run = match &step.stdin {
+            Some(input) => process::run_with_stdin_bytes(&request, input, &limits, &step_cancel),
+            None => process::run(&request, &limits, &step_cancel),
+        };
+        let output = match run {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(fail(
+                    &scope,
+                    &state_path,
+                    &audit_path,
+                    state,
+                    Error::Run(error),
+                ));
+            }
+        };
+        if !matches!(
+            output.termination,
+            ProcessTermination::Exited { success: true, .. }
+        ) {
+            let diagnostics = SubprocessDiagnostics::from_output(ctx.docker_program, &output);
+            let error = if index == 0 {
+                Error::Rejected(diagnostics)
+            } else {
+                Error::StepRejected {
+                    failed: index + 1,
+                    total,
+                    diagnostics,
+                }
+            };
+            return Err(fail(&scope, &state_path, &audit_path, state, error));
+        }
+        if output.stdout.truncated || output.stderr.truncated {
             return Err(fail(
                 &scope,
                 &state_path,
                 &audit_path,
                 state,
-                Error::Run(error),
+                Error::TooLarge,
             ));
         }
-    };
-    if !matches!(
-        output.termination,
-        ProcessTermination::Exited { success: true, .. }
-    ) {
-        return Err(fail(
-            &scope,
-            &state_path,
-            &audit_path,
-            state,
-            Error::Rejected(SubprocessDiagnostics::from_output(
-                ctx.docker_program,
-                &output,
-            )),
-        ));
-    }
-    if output.stdout.truncated || output.stderr.truncated {
-        return Err(fail(
-            &scope,
-            &state_path,
-            &audit_path,
-            state,
-            Error::TooLarge,
-        ));
-    }
-    let bytes = if output.stdout.bytes.is_empty() {
-        output.stderr.bytes
-    } else {
-        output.stdout.bytes
-    };
-    let output = match String::from_utf8(bytes) {
-        Ok(value) => value,
-        Err(_) => {
-            return Err(fail(
-                &scope,
-                &state_path,
-                &audit_path,
-                state,
-                Error::InvalidUtf8,
-            ));
+        let bytes = if output.stdout.bytes.is_empty() {
+            output.stderr.bytes
+        } else {
+            output.stdout.bytes
+        };
+        match String::from_utf8(bytes) {
+            Ok(value) => outputs.push(value),
+            Err(_) => {
+                return Err(fail(
+                    &scope,
+                    &state_path,
+                    &audit_path,
+                    state,
+                    Error::InvalidUtf8,
+                ));
+            }
         }
-    };
+    }
+    let output = outputs.join("\n");
 
     let result = BoundedActionResult {
         output,
@@ -686,5 +1066,220 @@ mod tests {
 
         let result = execute(&ctx, &req, &CancellationToken::default());
         assert!(matches!(result, Err(Error::Rejected(_))));
+    }
+
+    fn plan(action: &str) -> String {
+        format!(
+            r#"{{"container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1000,"action":{action}}}"#
+        )
+    }
+
+    /// Logs each call's argv as one `|`-joined line and its stdin to
+    /// `stdin.log`; exits `exit_on_call_n` on that 1-based call, else 0.
+    fn logging_docker(directory: &std::path::Path, fail_call: usize) -> String {
+        let path = directory.join("logging-docker");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+DIR="$(dirname "$0")"
+n=$(( $(cat "$DIR/count" 2>/dev/null || echo 0) + 1 )); echo $n > "$DIR/count"
+out=""; for a in "$@"; do out="$out|$a"; done; printf '%s\n' "$out" >> "$DIR/argv.log"
+if [ "$*" != "${{*%eval*}}" ]; then cat >> "$DIR/stdin.log"; fi
+[ $n -eq {fail_call} ] && exit 1
+echo "step $n ok"
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn run_logged(
+        action: &str,
+        fail_call: usize,
+    ) -> (tempfile::TempDir, Result<BoundedActionResult, Error>) {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = logging_docker(dir.path(), fail_call);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+        };
+        let req = Request::parse(&plan(action), ID, None).unwrap();
+        let result = execute(&ctx, &req, &CancellationToken::default());
+        (dir, result)
+    }
+
+    fn argv_log(dir: &tempfile::TempDir) -> Vec<String> {
+        fs::read_to_string(dir.path().join("argv.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .map(|line| {
+                let wp = line
+                    .find("|--allow-root|")
+                    .map_or(0, |at| at + "|--allow-root|".len());
+                line[wp..].to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn each_typed_kind_maps_to_its_fixed_argv() {
+        for (action, expected) in [
+            (r#"{"kind":"cacheFlush"}"#, vec!["cache|flush"]),
+            (r#"{"kind":"rewriteFlush"}"#, vec!["rewrite|flush"]),
+            (r#"{"kind":"shuffleSalts"}"#, vec!["config|shuffle-salts"]),
+            (r#"{"kind":"cronRun"}"#, vec!["cron|event|run|--due-now"]),
+            (
+                r#"{"kind":"cronRun","hook":"wp_version_check"}"#,
+                vec!["cron|event|run|wp_version_check"],
+            ),
+            (
+                r#"{"kind":"cronDelete","hook":"my_plugin/job"}"#,
+                vec!["cron|event|delete|my_plugin/job"],
+            ),
+            (
+                r#"{"kind":"setConfigFlag","name":"WP_DEBUG","value":true}"#,
+                vec!["config|set|WP_DEBUG|true|--raw"],
+            ),
+            (
+                r#"{"kind":"setConfigFlag","name":"DISABLE_WP_CRON","value":false}"#,
+                vec!["config|set|DISABLE_WP_CRON|false|--raw"],
+            ),
+            (
+                r#"{"kind":"maintenance","active":true}"#,
+                vec!["maintenance-mode|activate"],
+            ),
+            (
+                r#"{"kind":"maintenance","active":false}"#,
+                vec!["maintenance-mode|deactivate"],
+            ),
+            (
+                r#"{"kind":"userSetRole","id":7,"role":"editor"}"#,
+                vec!["user|update|7|--role=editor"],
+            ),
+            (
+                r#"{"kind":"userDelete","id":7}"#,
+                vec!["user|delete|7|--yes|--reassign=1"],
+            ),
+            (
+                r#"{"kind":"searchReplace","from":"a b'c","to":"x$y","dryRun":true}"#,
+                vec!["search-replace|a b'c|x$y|--all-tables|--dry-run"],
+            ),
+            (
+                r#"{"kind":"pluginInstall","slug":"redis-cache"}"#,
+                vec!["plugin|install|redis-cache|--activate"],
+            ),
+            (
+                r#"{"kind":"setSiteUrl","url":"https://new.example.com","replaceFrom":"https://old.example.com"}"#,
+                vec![
+                    "option|update|siteurl|https://new.example.com",
+                    "option|update|home|https://new.example.com",
+                    "search-replace|https://old.example.com|https://new.example.com|--all-tables",
+                ],
+            ),
+            (
+                r#"{"kind":"setSiteUrl","url":"https://same.example.com","replaceFrom":"https://same.example.com"}"#,
+                vec![
+                    "option|update|siteurl|https://same.example.com",
+                    "option|update|home|https://same.example.com",
+                ],
+            ),
+        ] {
+            let (dir, result) = run_logged(action, 0);
+            result.unwrap_or_else(|error| panic!("{action}: {error:?}"));
+            assert_eq!(argv_log(&dir), expected, "{action}");
+        }
+    }
+
+    #[test]
+    fn a_new_users_password_travels_only_on_stdin() {
+        let (dir, result) = run_logged(
+            r#"{"kind":"userCreate","login":"bob","email":"bob@example.com","role":"editor","password":"p@$$ !w(0)rd"}"#,
+            0,
+        );
+        result.unwrap();
+        let argv = fs::read_to_string(dir.path().join("argv.log")).unwrap();
+        assert!(!argv.contains("p@$$"));
+        assert!(!argv.contains("bob@example.com"));
+        assert!(argv.contains("|eval|"));
+        let stdin: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(dir.path().join("stdin.log")).unwrap())
+                .unwrap();
+        assert_eq!(stdin["password"], "p@$$ !w(0)rd");
+        assert_eq!(stdin["login"], "bob");
+
+        let req = Request::parse(
+            &plan(r#"{"kind":"userCreate","login":"bob","email":"b@e.com","role":"editor","password":"hunter2"}"#),
+            ID,
+            None,
+        )
+        .unwrap();
+        assert!(!format!("{req:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn a_later_step_failure_reports_the_steps_already_applied() {
+        let (_dir, result) = run_logged(
+            r#"{"kind":"setSiteUrl","url":"https://new.example.com","replaceFrom":"https://old.example.com"}"#,
+            3,
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            Error::StepRejected {
+                failed: 3,
+                total: 3,
+                ..
+            }
+        ));
+        assert!(
+            error
+                .protocol()
+                .1
+                .contains("the 2 earlier step(s) were applied")
+        );
+
+        let (_dir, result) = run_logged(r#"{"kind":"cacheFlush"}"#, 1);
+        assert!(matches!(result, Err(Error::Rejected(_))));
+    }
+
+    #[test]
+    fn rejects_malformed_typed_actions() {
+        for action in [
+            r#"{"kind":"cronRun","hook":"--due-now"}"#,
+            r#"{"kind":"cronDelete","hook":"a b"}"#,
+            r#"{"kind":"setConfigFlag","name":"DB_PASSWORD","value":true}"#,
+            r#"{"kind":"userCreate","login":"","email":"a@b.com","role":"editor"}"#,
+            r#"{"kind":"userCreate","login":"bob","email":"nope","role":"editor"}"#,
+            r#"{"kind":"userCreate","login":"bob","email":"a@b.com","role":"Admin!"}"#,
+            r#"{"kind":"userCreate","login":"bob","email":"a@b.com","role":"editor","password":"line\nbreak"}"#,
+            r#"{"kind":"userSetRole","id":0,"role":"editor"}"#,
+            r#"{"kind":"userDelete","id":1}"#,
+            r#"{"kind":"searchReplace","from":"--all","to":"x","dryRun":false}"#,
+            r#"{"kind":"searchReplace","from":"same","to":"same","dryRun":false}"#,
+            r#"{"kind":"setSiteUrl","url":"javascript:alert(1)"}"#,
+            r#"{"kind":"setSiteUrl","url":"https://a b.com"}"#,
+            r#"{"kind":"pluginInstall","slug":"../evil"}"#,
+            r#"{"kind":"pluginInstall","slug":"https://evil.example/p.zip"}"#,
+            r#"{"kind":"cacheFlush","extra":true}"#,
+            r#"{"kind":"evalAnything","code":"phpinfo();"}"#,
+        ] {
+            assert_eq!(
+                Request::parse(&plan(action), ID, None).unwrap_err(),
+                if action.contains("evalAnything")
+                    || action.contains("extra")
+                    || action.contains("DB_PASSWORD")
+                {
+                    RequestError::InvalidJson
+                } else {
+                    RequestError::InvalidAction
+                },
+                "{action}"
+            );
+        }
     }
 }
