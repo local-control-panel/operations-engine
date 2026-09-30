@@ -29,6 +29,21 @@ struct Remote {
     head: String,
 }
 
+/// These tests spawn `git` while holding the per-site `flock`. A child
+/// forked by a *parallel* test in this same process briefly inherits every
+/// open descriptor — including another test's lock file — until it
+/// `exec`s, so a test that re-acquires its lock right after releasing it
+/// can observe `Held` from a process that is not its own. The CLI runs
+/// one operation per process, so this is a test-harness artifact;
+/// serializing the tests in this binary removes it.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn local_remote() -> Remote {
     let dir = tempfile::tempdir().expect("remote directory should exist");
     let run = |args: &[&str]| {
@@ -150,6 +165,7 @@ fn site_id() -> SiteId {
 
 #[test]
 fn a_full_deploy_activates_the_release_and_records_success() {
+    let _serial = serial();
     let remote = local_remote();
     let harness = harness();
     let manifest = SiteManifest::from_json_for_site(&manifest_json(&remote), site_id())
@@ -186,6 +202,7 @@ fn a_full_deploy_activates_the_release_and_records_success() {
 
 #[test]
 fn retrying_with_the_same_idempotency_key_replays_the_original_result_without_redeploying() {
+    let _serial = serial();
     let remote = local_remote();
     let harness = harness();
     let manifest = SiteManifest::from_json_for_site(&manifest_json(&remote), site_id())
@@ -237,6 +254,7 @@ fn retrying_with_the_same_idempotency_key_replays_the_original_result_without_re
 
 #[test]
 fn a_revision_not_on_an_allowed_branch_fails_without_activating_anything_and_frees_the_lock() {
+    let _serial = serial();
     let remote = local_remote();
     let harness = harness();
     let manifest = SiteManifest::from_json_for_site(&manifest_json(&remote), site_id())
