@@ -311,6 +311,18 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Run one of a small fixed set of bounded WordPress mutations
+    /// (multisite create-site, multisite set-mode, WooCommerce clear
+    /// transients) under one lock/idempotency/transaction/audit-backed
+    /// request.
+    BoundedAction {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl WordpressCommand {
@@ -325,6 +337,7 @@ impl WordpressCommand {
             Self::UpdateThemes { .. } => "wordpress.updateThemes",
             Self::RotateCredentials { .. } => "wordpress.rotateCredentials",
             Self::MultisiteDeleteSite { .. } => "wordpress.multisiteDeleteSite",
+            Self::BoundedAction { .. } => "wordpress.boundedAction",
         }
     }
 }
