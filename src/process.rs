@@ -226,6 +226,29 @@ fn build_command(request: &ProcessRequest) -> Command {
     command
 }
 
+/// `Command::spawn`, retried a few times while `exec` fails with `ETXTBSY`.
+///
+/// A file that was just written and closed can still be open for writing in
+/// a child that another thread forked before the close and has not yet
+/// exec'd (`O_CLOEXEC` only closes it at exec), so executing it fails with
+/// "Text file busy" for that short window. Nothing has run when `exec`
+/// fails, so retrying is safe. Seen with test fixtures and with binaries
+/// this engine writes and then runs (rclone, the engine itself).
+fn spawn_retrying_busy(command: &mut Command) -> io::Result<std::process::Child> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 1;
+    loop {
+        match command.spawn() {
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempt < ATTEMPTS => {
+                std::thread::sleep(Duration::from_millis(20 * u64::from(attempt)));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Spawns `command` (stdin already configured by the caller) and supervises
 /// it exactly as `run` always has: poll for cancellation/timeout/exit,
 /// capture stdout/stderr on background threads bounded by `limits`.
@@ -235,7 +258,7 @@ fn spawn_and_supervise(
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, ProcessRunError> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(ProcessRunError::Spawn)?;
+    let mut child = spawn_retrying_busy(&mut command).map_err(ProcessRunError::Spawn)?;
 
     let stdout = child
         .stdout
@@ -326,7 +349,7 @@ pub fn run_with_stdout_file(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(ProcessRunError::Spawn)?;
+    let mut child = spawn_retrying_busy(&mut command).map_err(ProcessRunError::Spawn)?;
     let stderr = child
         .stderr
         .take()
@@ -376,7 +399,7 @@ pub fn run_with_stdin_bytes(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(ProcessRunError::Spawn)?;
+    let mut child = spawn_retrying_busy(&mut command).map_err(ProcessRunError::Spawn)?;
     let mut stdin = child
         .stdin
         .take()
@@ -453,7 +476,8 @@ pub fn run_piped(
 ) -> Result<(ProcessTermination, ProcessOutput), ProcessRunError> {
     let mut upstream_command = build_command(upstream);
     upstream_command.stdin(Stdio::null()).stdout(Stdio::piped());
-    let mut upstream_child = upstream_command.spawn().map_err(ProcessRunError::Spawn)?;
+    let mut upstream_child =
+        spawn_retrying_busy(&mut upstream_command).map_err(ProcessRunError::Spawn)?;
     let upstream_stdout = upstream_child
         .stdout
         .take()

@@ -94,6 +94,7 @@ fn capabilities_describe_only_implemented_operations() {
             "agent.activateBruteforceConfig",
             "system.activateAutoupdatesConfig",
             "system.installAutoupdates",
+            "system.installDocker",
             "system.startDocker",
             "system.createSwap",
             "system.deleteSwap",

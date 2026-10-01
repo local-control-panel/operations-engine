@@ -158,6 +158,15 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Install Docker Engine and Compose v2 from the official Docker apt
+    /// repository on an allowlisted Debian/Ubuntu host, refusing any
+    /// Docker from another source.
+    InstallDocker {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Start the host Docker service through a fixed platform action.
     StartDocker {
         #[arg(long = "request-id")]
@@ -198,6 +207,7 @@ impl SystemCommand {
         match self {
             Self::ActivateAutoupdatesConfig { .. } => "system.activateAutoupdatesConfig",
             Self::InstallAutoupdates { .. } => "system.installAutoupdates",
+            Self::InstallDocker { .. } => "system.installDocker",
             Self::StartDocker { .. } => "system.startDocker",
             Self::CreateSwap { .. } => "system.createSwap",
             Self::DeleteSwap { .. } => "system.deleteSwap",
