@@ -63,6 +63,20 @@ pub fn load_backup(
     load_scoped(engine_state, &scope_path, request_id)
 }
 
+/// The managed WCP stack is the only stack; any other name is an invalid
+/// scope rather than a missing record.
+pub fn load_stack(
+    engine_state: &ManagedRoot,
+    stack: &str,
+    request_id: &str,
+) -> Result<OperationStatus, StatusError> {
+    if stack != "wcp" {
+        return Err(StatusError::InvalidScope);
+    }
+    let scope_path = SiteRelativePath::parse("stacks/wcp").expect("literal path is valid");
+    load_scoped(engine_state, &scope_path, request_id)
+}
+
 fn load_scoped(
     engine_state: &ManagedRoot,
     scope_path: &SiteRelativePath,

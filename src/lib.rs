@@ -36,6 +36,8 @@ pub mod protocol;
 pub mod rollback;
 pub mod runtime_config;
 pub mod site;
+#[cfg(unix)]
+pub mod stack_deploy;
 pub mod system_autoupdates;
 pub mod system_autoupdates_install;
 #[cfg(unix)]
@@ -79,6 +81,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Wordpress { command } => commands::wordpress::run(command),
         Command::Agent { command } => commands::agent::run(command),
         Command::System { command } => commands::system::run(command),
+        Command::Stack { command } => commands::stack::run(command),
     };
 
     response.unwrap_or_else(|error| internal_error(operation, error))

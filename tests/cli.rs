@@ -98,7 +98,8 @@ fn capabilities_describe_only_implemented_operations() {
             "system.startDocker",
             "system.createSwap",
             "system.deleteSwap",
-            "system.resizeSwap"
+            "system.resizeSwap",
+            "stack.deploy"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

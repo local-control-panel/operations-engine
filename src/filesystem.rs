@@ -185,6 +185,27 @@ impl ManagedRoot {
             .rename(temp_path.as_path(), &self.directory, path.as_path())
     }
 
+    /// Like `write_atomic`, but the temp file is made owner-only (`0o600`)
+    /// before any content is written, so secret-bearing content is never
+    /// readable by another user, not even for the moment between write and
+    /// rename.
+    #[cfg(unix)]
+    pub fn write_atomic_private(&self, path: &SiteRelativePath, contents: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_path = temp_sibling_path(path)?;
+        {
+            let mut file = self.directory.create(temp_path.as_path())?;
+            file.set_permissions(cap_std::fs::Permissions::from_std(
+                std::fs::Permissions::from_mode(0o600),
+            ))?;
+            file.write_all(contents)?;
+            file.sync_all()?;
+        }
+        self.directory
+            .rename(temp_path.as_path(), &self.directory, path.as_path())
+    }
+
     /// Reads `path` in full as raw bytes — the binary counterpart of
     /// `read_to_string`, for content (a fetched engine executable) that
     /// is not valid UTF-8.
