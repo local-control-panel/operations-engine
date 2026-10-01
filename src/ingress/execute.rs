@@ -52,6 +52,9 @@ pub struct ActivateContext<'a> {
 
 #[derive(Debug)]
 pub enum ActivateConfigError {
+    /// Another operation is already working on the managed WCP stack
+    /// (milestone 048). Nothing was written.
+    StackBusy,
     Io(io::Error),
     Preflight(preflight::Error),
     /// The idempotency key was already claimed, but the original attempt
@@ -81,6 +84,10 @@ impl ActivateConfigError {
     /// `docs/protocol.md`'s `details` allowlist).
     pub fn protocol(&self) -> (ErrorCode, String) {
         match self {
+            Self::StackBusy => (
+                ErrorCode::Conflict,
+                "another operation on the wcp stack is in progress".into(),
+            ),
             Self::Io(_) | Self::State(_) | Self::PostCommitRecordFailed { .. } => (
                 ErrorCode::Internal,
                 "internal ingress activation error".to_owned(),
@@ -235,6 +242,14 @@ pub fn execute(
 ) -> Result<ActivateConfigResult, ActivateConfigError> {
     let ingress_state =
         open_ingress_state(context.engine_state).map_err(ActivateConfigError::Io)?;
+
+    // Milestone 048: this operation reloads containers `stack.deploy` can be
+    // recreating, so it takes the shared stack lock first and holds it for
+    // the whole body.
+    let stack_scope =
+        crate::stack_deploy::open_scope(context.engine_state).map_err(ActivateConfigError::Io)?;
+    let _stack_lock = crate::stack_deploy::acquire_stack_lock(&stack_scope, request.request_id)
+        .map_err(|_| ActivateConfigError::StackBusy)?;
 
     let admitted = match preflight::run(
         &ingress_state,
@@ -536,6 +551,37 @@ mod tests {
             compose: &access,
         };
         execute(&context, request, &CancellationToken::default())
+    }
+
+    /// Milestone 048: a reload must not land in containers `stack.deploy`
+    /// is in the middle of recreating.
+    #[test]
+    fn a_held_stack_lock_blocks_an_activation_without_touching_the_route() {
+        let host = host(Some(PREVIOUS));
+        let docker = FakeDocker::new();
+        let scope = crate::stack_deploy::open_scope(&host.engine_state)
+            .expect("the stack scope should open");
+        let _deploying = crate::stack_deploy::acquire_stack_lock(
+            &scope,
+            crate::transaction::RequestId::parse(RETRY_REQUEST_ID).expect("a valid request id"),
+        )
+        .expect("the stack lock should be free");
+
+        let error = run(
+            &host,
+            &docker,
+            &request(
+                HashGuard::Sha256(ConfigHash::of(PREVIOUS.as_bytes())),
+                RouteTarget::Live,
+                REQUEST_ID,
+                None,
+            ),
+        )
+        .expect_err("the stack is busy");
+
+        assert!(matches!(error, ActivateConfigError::StackBusy));
+        assert_eq!(error.protocol().0, ErrorCode::Conflict);
+        assert_eq!(host.live().as_deref(), Some(PREVIOUS));
     }
 
     #[test]

@@ -128,7 +128,10 @@ pub fn open_site_state(engine_state: &ManagedRoot, site_id: SiteId) -> io::Resul
     Ok(site_state)
 }
 
-fn lock_path() -> SiteRelativePath {
+/// `pub(crate)` so an operation that must exclude a *different*
+/// operation's scope can acquire that scope's lock directly rather than
+/// duplicating the literal (see `stack_deploy::acquire_stack_lock`).
+pub(crate) fn lock_path() -> SiteRelativePath {
     SiteRelativePath::parse("locks/mutation.lock").expect("literal path is valid")
 }
 
