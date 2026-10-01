@@ -20,6 +20,10 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => install_autoupdates(&request_id, idempotency_key.as_deref()),
+        SystemCommand::InstallDocker {
+            request_id,
+            idempotency_key,
+        } => install_docker(&request_id, idempotency_key.as_deref()),
         SystemCommand::StartDocker {
             request_id,
             idempotency_key,
@@ -176,6 +180,99 @@ fn swap(
             operation,
             ErrorCode::UnsupportedPlatform,
             "swap management requires a Linux host",
+        ))
+    }
+}
+
+fn install_docker(request_id: &str, key: Option<&str>) -> Result<Response, ResponseBuildError> {
+    const OPERATION: &str = "system.installDocker";
+    #[cfg(unix)]
+    {
+        use crate::{
+            config::EngineConfig, filesystem::ManagedRoot, site::TrustedRoot,
+            system_install_docker as op,
+        };
+        use std::path::Path;
+        let config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let request = match op::Request::parse(request_id, key) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-id or idempotency-key is invalid",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let open_apt_dir = |path: &str| {
+            std::fs::create_dir_all(path).ok()?;
+            ManagedRoot::open(&TrustedRoot::parse(Path::new(path)).ok()?).ok()
+        };
+        let (Some(keyrings_dir), Some(sources_dir)) = (
+            open_apt_dir(op::KEYRINGS_DIR),
+            open_apt_dir(op::SOURCES_DIR),
+        ) else {
+            return Ok(Response::failure(
+                OPERATION,
+                ErrorCode::Internal,
+                "apt configuration directories are unavailable",
+            ));
+        };
+        let unowned: Vec<&Path> = op::UNOWNED_BINARIES.iter().map(Path::new).collect();
+        let cli: Vec<&Path> = op::CLI_BINARIES.iter().map(Path::new).collect();
+        let ctx = op::Context {
+            engine_state: &state,
+            os_release: Path::new(op::OS_RELEASE),
+            keyrings_dir: &keyrings_dir,
+            sources_dir: &sources_dir,
+            sources_list: Path::new(op::SOURCES_LIST),
+            unowned_binaries: &unowned,
+            cli_binaries: &cli,
+            keyring: op::DOCKER_KEYRING,
+            keyring_sha256: op::DOCKER_KEYRING_SHA256,
+            tools: op::Tools {
+                apt_get: "apt-get",
+                dpkg: "dpkg",
+                dpkg_query: "dpkg-query",
+                systemctl: "systemctl",
+                docker: "docker",
+            },
+        };
+        match op::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) => Response::success(OPERATION, v),
+            Err(op::Error::PostCommit { result }) => Response::success(OPERATION, *result),
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request_id, key);
+        Ok(Response::failure(
+            OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "system.installDocker requires a Debian or Ubuntu host",
         ))
     }
 }

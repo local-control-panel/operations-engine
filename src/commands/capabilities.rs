@@ -84,6 +84,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "agent.activateBruteforceConfig",
                 "system.activateAutoupdatesConfig",
                 "system.installAutoupdates",
+                "system.installDocker",
                 "system.startDocker",
                 "system.createSwap",
                 "system.deleteSwap",

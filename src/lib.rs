@@ -38,6 +38,8 @@ pub mod runtime_config;
 pub mod site;
 pub mod system_autoupdates;
 pub mod system_autoupdates_install;
+#[cfg(unix)]
+pub mod system_install_docker;
 pub mod system_start_docker;
 #[cfg(unix)]
 pub mod system_swap;
