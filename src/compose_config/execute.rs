@@ -45,6 +45,9 @@ pub struct ComposeActivateContext<'a> {
 
 #[derive(Debug)]
 pub enum ComposeActivateConfigError {
+    /// Another operation is already working on the managed WCP stack
+    /// (milestone 048). Nothing was written.
+    StackBusy,
     Io(io::Error),
     Preflight(preflight::Error),
     ReplayInProgress,
@@ -67,6 +70,10 @@ impl ComposeActivateConfigError {
     /// swapped for "compose"/"stack".
     pub fn protocol(&self) -> (ErrorCode, String) {
         match self {
+            Self::StackBusy => (
+                ErrorCode::Conflict,
+                "another operation on the wcp stack is in progress".into(),
+            ),
             Self::Io(_) | Self::State(_) | Self::PostCommitRecordFailed { .. } => (
                 ErrorCode::Internal,
                 "internal compose activation error".to_owned(),
@@ -170,6 +177,18 @@ pub fn execute(
 ) -> Result<ComposeActivateConfigResult, ComposeActivateConfigError> {
     let compose_state = open_compose_state(context.engine_state, &request.stack_name)
         .map_err(ComposeActivateConfigError::Io)?;
+
+    // Milestone 048: only the managed WCP stack shares its containers with
+    // `stack.deploy`; another stack name under `~/compose` is independent.
+    let stack_scope = (request.stack_name.as_str() == crate::stack_deploy::STACK_NAME)
+        .then(|| crate::stack_deploy::open_scope(context.engine_state))
+        .transpose()
+        .map_err(ComposeActivateConfigError::Io)?;
+    let _stack_lock = stack_scope
+        .as_ref()
+        .map(|scope| crate::stack_deploy::acquire_stack_lock(scope, request.request_id))
+        .transpose()
+        .map_err(|_| ComposeActivateConfigError::StackBusy)?;
 
     let admitted = match preflight::run(
         &compose_state,

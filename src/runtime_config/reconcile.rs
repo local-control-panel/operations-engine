@@ -87,6 +87,9 @@ pub struct RuntimeReconcileResult {
 
 #[derive(Debug)]
 pub enum RuntimeReconcileError {
+    /// Another operation is already working on the managed WCP stack
+    /// (milestone 048). Nothing was written.
+    StackBusy,
     Io(io::Error),
     Preflight(preflight::Error),
     /// The idempotency key was already claimed, but the original attempt
@@ -110,6 +113,10 @@ pub enum RuntimeReconcileError {
 impl RuntimeReconcileError {
     pub fn protocol(&self) -> (ErrorCode, String) {
         match self {
+            Self::StackBusy => (
+                ErrorCode::Conflict,
+                "another operation on the wcp stack is in progress".into(),
+            ),
             Self::Io(_) | Self::State(_) | Self::PostCommitRecordFailed { .. } => (
                 ErrorCode::Internal,
                 "internal runtime reconciliation error".to_owned(),
@@ -150,6 +157,14 @@ pub fn execute(
 ) -> Result<RuntimeReconcileResult, RuntimeReconcileError> {
     let runtime_state = open_runtime_config_state(context.engine_state, &request.runtime_id)
         .map_err(RuntimeReconcileError::Io)?;
+
+    // Milestone 048: this operation reloads containers `stack.deploy` can be
+    // recreating, so it takes the shared stack lock first and holds it for
+    // the whole body.
+    let stack_scope =
+        crate::stack_deploy::open_scope(context.engine_state).map_err(RuntimeReconcileError::Io)?;
+    let _stack_lock = crate::stack_deploy::acquire_stack_lock(&stack_scope, request.request_id)
+        .map_err(|_| RuntimeReconcileError::StackBusy)?;
 
     let admitted = match preflight::run(
         &runtime_state,

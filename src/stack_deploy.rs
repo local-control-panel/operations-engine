@@ -57,6 +57,10 @@ pub const OPERATION: &str = "stack.deploy";
 /// Engine-state scope shared by every operation on the WCP stack.
 pub const SCOPE: &str = "stacks/wcp";
 
+/// The managed stack's directory name under `~/compose`; the one
+/// `compose.*` stack name that must take the shared stack lock.
+pub const STACK_NAME: &str = "wp-stack";
+
 /// Compose project name; mirrors `crate::compose::COMPOSE_PROJECT`.
 pub const PROJECT: &str = crate::compose::COMPOSE_PROJECT;
 
@@ -88,6 +92,9 @@ pub const INGRESS_SERVICE: &str = "ingress";
 const IMAGE_PREFIX: &str = "ghcr.io/local-control-panel/";
 pub const MAX_FILE_BYTES: usize = 128 * 1024;
 const JOURNAL: &str = "journal.json";
+
+/// `.env`'s position in `FILES`.
+const ENV_INDEX: usize = FILES.len() - 1;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_INSPECT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -97,6 +104,15 @@ const MAX_INSPECT_BYTES: usize = 4 * 1024 * 1024;
 pub struct Request {
     /// Contents in `FILES` order.
     pub files: Vec<String>,
+    /// `.env` keys the engine fills with a fresh random secret when the
+    /// merged file does not already carry them. The value never leaves the
+    /// server, so the caller cannot keep a stale copy of it.
+    pub generate_env_keys: Vec<String>,
+    /// `.env` keys that must hold a non-empty value once the incoming file
+    /// has been merged over the existing one and the generated keys filled
+    /// in. This is what makes a first deploy without passwords fail instead
+    /// of silently installing a placeholder.
+    pub require_env_keys: Vec<String>,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -109,6 +125,7 @@ pub enum RequestError {
     FileTooLarge,
     InvalidContent,
     InvalidEnvFile,
+    InvalidEnvKey,
     InvalidRequestId,
     InvalidIdempotencyKey,
 }
@@ -122,6 +139,7 @@ impl RequestError {
             Self::FileTooLarge => "a stack file exceeds the maximum allowed size",
             Self::InvalidContent => "a stack file contains a NUL byte",
             Self::InvalidEnvFile => "the .env file must hold only comments and KEY=value lines",
+            Self::InvalidEnvKey => "generate-env-keys and require-env-keys must name env variables",
             Self::InvalidRequestId => "request-id is not a canonical UUID",
             Self::InvalidIdempotencyKey => "idempotency-key is invalid",
         }
@@ -129,9 +147,13 @@ impl RequestError {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct WireRequest {
     files: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    generate_env_keys: Vec<String>,
+    #[serde(default)]
+    require_env_keys: Vec<String>,
 }
 
 impl Request {
@@ -169,8 +191,18 @@ impl Request {
             }
             files.push(content);
         }
+        if !wire
+            .generate_env_keys
+            .iter()
+            .chain(&wire.require_env_keys)
+            .all(|key| env_key_is_valid(key))
+        {
+            return Err(RequestError::InvalidEnvKey);
+        }
         Ok(Self {
             files,
+            generate_env_keys: wire.generate_env_keys,
+            require_env_keys: wire.require_env_keys,
             request_id,
             idempotency_key,
         })
@@ -192,10 +224,123 @@ fn env_file_is_valid(content: &str) -> bool {
         let Some((key, _)) = line.split_once('=') else {
             return false;
         };
-        let mut bytes = key.bytes();
-        matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
-            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        env_key_is_valid(key)
     })
+}
+
+fn env_key_is_valid(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// The `KEY` a `.env` line assigns, or `None` for a comment or blank line.
+fn env_line_key(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    trimmed.split_once('=').map(|(key, _)| key)
+}
+
+/// The last line of `content` assigning `key`, verbatim.
+fn env_line<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+    content
+        .lines()
+        .filter(|line| env_line_key(line) == Some(key))
+        .next_back()
+}
+
+/// A value Compose would read for `key`, with the surrounding quotes the
+/// panel writes stripped. Later assignments win, matching Compose.
+fn env_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
+    env_line(content, key)
+        .and_then(|line| line.trim_start().split_once('='))
+        .map(|(_, value)| unquote_env_value(value))
+}
+
+/// Strips one matching pair of single or double quotes. Enough to tell an
+/// empty value from a set one; this is not a full dotenv parser.
+fn unquote_env_value(value: &str) -> &str {
+    for quote in ['\'', '"'] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
+}
+
+/// Merges `incoming` over `existing`, keeping `existing`'s line order,
+/// comments and every key `incoming` does not mention.
+///
+/// This is what makes a redeploy non-destructive (milestone 047): the panel
+/// leaves out the keys whose form fields were left blank, so their current
+/// server-side values survive, and operator-added keys it knows nothing
+/// about (`WCP_TLS_MODE`, `CADDY_TRUSTED_PROXIES`) are never dropped.
+/// `incoming`'s own comments are discarded, because `existing` already
+/// carries the generated header and duplicating it on every deploy would
+/// make an unchanged redeploy look changed.
+fn merge_env_file(existing: &str, incoming: &str) -> String {
+    let mut merged = String::with_capacity(existing.len() + incoming.len());
+    for line in existing.lines() {
+        // `incoming` is already quoted by the caller, so its line is taken
+        // verbatim rather than re-quoting a parsed-out value.
+        merged.push_str(
+            env_line_key(line)
+                .and_then(|key| env_line(incoming, key))
+                .unwrap_or(line),
+        );
+        merged.push('\n');
+    }
+    for line in incoming.lines() {
+        let Some(key) = env_line_key(line) else {
+            continue;
+        };
+        if env_value(existing, key).is_none() {
+            merged.push_str(line);
+            merged.push('\n');
+        }
+    }
+    merged
+}
+
+/// Appends `KEY='<secret>'` for every requested key the file does not
+/// already set, and reports which keys were filled in. Names only: the
+/// secret itself stays on the server.
+fn generate_missing_env_keys(env: &mut String, keys: &[String]) -> Vec<String> {
+    let mut generated = Vec::new();
+    for key in keys {
+        if env_value(env, key).is_some_and(|value| !value.is_empty()) {
+            continue;
+        }
+        if !env.is_empty() && !env.ends_with('\n') {
+            env.push('\n');
+        }
+        // Two v4 UUIDs: 244 random bits as 64 hex characters, which needs no
+        // quoting beyond the single quotes every generated value carries.
+        env.push_str(&format!(
+            "{key}='{}{}'\n",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        generated.push(key.clone());
+    }
+    generated
+}
+
+/// The requested keys the merged file leaves unset or empty.
+fn missing_env_values(env: &str, keys: &[String]) -> Vec<String> {
+    let mut missing: Vec<String> = keys
+        .iter()
+        .filter(|key| env_value(env, key).is_none_or(str::is_empty))
+        .cloned()
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 /// `ghcr.io/local-control-panel/<name>[:<tag>]@sha256:<64 lowercase hex>`.
@@ -259,6 +404,10 @@ pub struct DeployResult {
     pub services: Vec<String>,
     /// Every container of the project after the deploy, sorted by service.
     pub images: Vec<ImageEvidence>,
+    /// `.env` keys this deploy filled with a freshly generated secret.
+    /// Names only, so the record stays safe to log and replay.
+    #[serde(default)]
+    pub generated_env_keys: Vec<String>,
     pub completed_at_unix_secs: u64,
 }
 
@@ -332,6 +481,9 @@ pub enum RestoreFailure {
 pub enum Error {
     Io(io::Error),
     Preflight(preflight::Error),
+    /// Required `.env` keys that neither the request nor the existing file
+    /// supplied - a first deploy with the password fields left blank.
+    MissingEnvValues(Vec<String>),
     ReplayInProgress,
     Replayed {
         code: ErrorCode,
@@ -473,6 +625,14 @@ impl Error {
                     "the new stack did not come up ({}) and {}; check the server",
                     cause.describe(),
                     restore.describe()
+                ),
+            ),
+            Self::MissingEnvValues(keys) => (
+                ErrorCode::InvalidInput,
+                format!(
+                    "the stack needs a value for {} - a first deploy must supply every \
+                     password, and a redeploy only keeps what the server already has",
+                    keys.join(", ")
                 ),
             ),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit { .. } => {
@@ -793,6 +953,27 @@ pub fn execute(
     Ok(result)
 }
 
+/// Acquires the one lock that serializes every operation able to recreate
+/// or reload a container of the managed WCP stack (milestone 048).
+///
+/// `stack.deploy` already takes this as its own preflight lock, so the
+/// operations that only *reload* the running stack - `ingress.*`,
+/// `runtime.*` and the compose operations on `wp-stack` - take it here,
+/// before their own scope lock, and hold it for their whole body. Without
+/// it an `ingress.reconcile` can reload Caddy while a deploy's `up -d` is
+/// recreating the ingress container, and the reload lands in a container
+/// that is about to be replaced.
+///
+/// The ordering is fixed: this lock is always the outermost one, so a
+/// deploy and a reload can never each hold half of the pair. Every lock
+/// here is non-blocking, so the loser gets `Held` immediately.
+pub fn acquire_stack_lock(
+    scope: &ManagedRoot,
+    holder: RequestId,
+) -> Result<crate::transaction::lock::SiteLockGuard<'_>, crate::transaction::lock::LockError> {
+    crate::transaction::lock::acquire(scope, &preflight::lock_path(), holder)
+}
+
 pub fn open_scope(engine_state: &ManagedRoot) -> io::Result<ManagedRoot> {
     let scope_path = rel(SCOPE);
     engine_state.create_dir_all(&scope_path)?;
@@ -830,10 +1011,29 @@ fn deploy(
     for name in FILES {
         previous.push(read_optional(&root, &rel(name)).map_err(Error::Io)?);
     }
+
+    // Milestone 047: `.env` is merged over what the server already holds
+    // rather than replaced, so blank form fields and operator-added keys
+    // survive a redeploy, and the keys the caller asked the engine to own
+    // are generated here once and never handed back.
+    let mut files = req.files.clone();
+    let env = &mut files[ENV_INDEX];
+    if let Some(existing) = previous[ENV_INDEX]
+        .as_deref()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+    {
+        *env = merge_env_file(&existing, env);
+    }
+    let generated_env_keys = generate_missing_env_keys(env, &req.generate_env_keys);
+    let missing = missing_env_values(env, &req.require_env_keys);
+    if !missing.is_empty() {
+        return Err(Error::MissingEnvValues(missing));
+    }
+
     let changed = FILES
         .iter()
         .enumerate()
-        .any(|(i, _)| previous[i].as_deref() != Some(req.files[i].as_bytes()));
+        .any(|(i, _)| previous[i].as_deref() != Some(files[i].as_bytes()));
 
     // Stage, validate, enforce the image policy and pull — all before any
     // live file changes.
@@ -849,7 +1049,7 @@ fn deploy(
             ctx.owner,
             name,
             &rel(staged_name(name)),
-            req.files[i].as_bytes(),
+            files[i].as_bytes(),
         ) {
             discard_staged();
             return Err(Error::Io(error));
@@ -923,6 +1123,7 @@ fn deploy(
         recovered_interrupted,
         services,
         images,
+        generated_env_keys,
         completed_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1259,6 +1460,10 @@ exit 2
         }
 
         fn run(&self, id: &str, key: Option<&str>, compose: &str) -> Result<DeployResult, Error> {
+            self.run_json(id, key, &request_json(compose))
+        }
+
+        fn run_json(&self, id: &str, key: Option<&str>, json: &str) -> Result<DeployResult, Error> {
             let state =
                 ManagedRoot::open(&TrustedRoot::parse(self.path("state")).unwrap()).unwrap();
             let stack = TrustedRoot::parse(self.path("stack")).unwrap();
@@ -1276,8 +1481,34 @@ exit 2
                 },
                 owner: Some(current_owner()),
             };
-            let request = Request::parse(&request_json(compose), id, key).unwrap();
+            let request = Request::parse(json, id, key).unwrap();
             execute(&ctx, &request, &CancellationToken::default())
+        }
+
+        fn run_env(
+            &self,
+            id: &str,
+            key: Option<&str>,
+            compose: &str,
+            env: &str,
+        ) -> Result<DeployResult, Error> {
+            self.run_full(id, key, compose, env, &[], &[])
+        }
+
+        fn run_full(
+            &self,
+            id: &str,
+            key: Option<&str>,
+            compose: &str,
+            env: &str,
+            generate: &[&str],
+            require: &[&str],
+        ) -> Result<DeployResult, Error> {
+            let mut value: serde_json::Value =
+                serde_json::from_str(&request_json_with_env(compose, env)).unwrap();
+            value["generateEnvKeys"] = generate.into();
+            value["requireEnvKeys"] = require.into();
+            self.run_json(id, key, &value.to_string())
         }
     }
 
@@ -1287,11 +1518,15 @@ exit 2
     }
 
     fn request_json(compose: &str) -> String {
+        request_json_with_env(compose, "# generated\nMARIADB_ROOT_PASSWORD='s3cret'\n")
+    }
+
+    fn request_json_with_env(compose: &str, env: &str) -> String {
         let mut files = serde_json::Map::new();
         for name in FILES {
             let content = match name {
                 COMPOSE_FILE => compose.to_owned(),
-                ENV_FILE => "# generated\nMARIADB_ROOT_PASSWORD='s3cret'\n".to_owned(),
+                ENV_FILE => env.to_owned(),
                 other => format!("# {other}\n"),
             };
             files.insert(name.to_owned(), content.into());
@@ -1612,6 +1847,165 @@ exit 2
             "ghcr.io/local-control-panel/x@sha256:{}",
             DIGEST.to_uppercase()
         )));
+    }
+
+    // ── .env merge and secret ownership (milestone 047) ──────────────────
+
+    #[test]
+    fn merge_keeps_unmentioned_keys_comments_and_order() {
+        let existing = "# Generated by Website Control Panel\n\
+                        MARIADB_ROOT_PASSWORD='kept'\n\
+                        SERVER_NAME=':80'\n\
+                        WCP_TLS_MODE='internal'\n";
+        let incoming = "# header the panel just wrote\nSERVER_NAME=':443'\nWORKER_PROCESSES='8'\n";
+        assert_eq!(
+            merge_env_file(existing, incoming),
+            "# Generated by Website Control Panel\n\
+             MARIADB_ROOT_PASSWORD='kept'\n\
+             SERVER_NAME=':443'\n\
+             WCP_TLS_MODE='internal'\n\
+             WORKER_PROCESSES='8'\n"
+        );
+    }
+
+    #[test]
+    fn merging_the_same_file_twice_is_a_fixed_point() {
+        let existing = "# head\nA='1'\nB='2'\n";
+        let once = merge_env_file(existing, "A='1'\nC='3'\n");
+        assert_eq!(once, merge_env_file(&once, "A='1'\nC='3'\n"));
+    }
+
+    #[test]
+    fn generate_fills_only_absent_or_empty_keys() {
+        let mut env = "A='set'\nB=''\n".to_owned();
+        let generated =
+            generate_missing_env_keys(&mut env, &["A".to_owned(), "B".to_owned(), "C".to_owned()]);
+        assert_eq!(generated, ["B", "C"]);
+        assert_eq!(env_value(&env, "A"), Some("set"));
+        for key in ["B", "C"] {
+            let value = env_value(&env, key).unwrap();
+            assert_eq!(value.len(), 64, "{key}");
+            assert!(value.bytes().all(|b| b.is_ascii_hexdigit()), "{key}");
+        }
+        assert_ne!(env_value(&env, "B"), env_value(&env, "C"));
+    }
+
+    #[test]
+    fn required_keys_missing_from_both_sides_are_reported() {
+        assert_eq!(
+            missing_env_values(
+                "A='set'\nB=''\n",
+                &["A".to_owned(), "B".to_owned(), "C".to_owned()]
+            ),
+            ["B", "C"]
+        );
+    }
+
+    #[test]
+    fn a_blank_field_on_redeploy_keeps_the_servers_secret() {
+        let fx = Fixture::new();
+        fx.run_env(
+            ID,
+            None,
+            "services: old\n",
+            "MARIADB_ROOT_PASSWORD='original'\n",
+        )
+        .unwrap();
+        // The panel leaves the key out entirely when its field is blank.
+        let second = fx
+            .run_env(ID_2, None, "services: old\n", "SERVER_NAME=':443'\n")
+            .unwrap();
+        assert!(second.changed);
+        let env = fx.live(ENV_FILE).unwrap();
+        assert_eq!(env_value(&env, "MARIADB_ROOT_PASSWORD"), Some("original"));
+        assert_eq!(env_value(&env, "SERVER_NAME"), Some(":443"));
+    }
+
+    #[test]
+    fn a_generated_key_survives_the_next_deploy_unchanged() {
+        let fx = Fixture::new();
+        let first = fx
+            .run_full(ID, None, "services: old\n", "A='1'\n", &["MEILI_KEY"], &[])
+            .unwrap();
+        assert_eq!(first.generated_env_keys, ["MEILI_KEY"]);
+        let key = env_value(&fx.live(ENV_FILE).unwrap(), "MEILI_KEY")
+            .unwrap()
+            .to_owned();
+
+        let second = fx
+            .run_full(
+                ID_2,
+                None,
+                "services: old\n",
+                "A='1'\n",
+                &["MEILI_KEY"],
+                &[],
+            )
+            .unwrap();
+        assert!(second.generated_env_keys.is_empty());
+        assert!(
+            !second.changed,
+            "a regenerated key would recreate containers"
+        );
+        assert_eq!(
+            env_value(&fx.live(ENV_FILE).unwrap(), "MEILI_KEY"),
+            Some(key.as_str())
+        );
+    }
+
+    #[test]
+    fn a_first_deploy_without_a_required_password_is_rejected_before_anything_runs() {
+        let fx = Fixture::new();
+        let error = fx
+            .run_full(
+                ID,
+                None,
+                "services: old\n",
+                "SERVER_NAME=':80'\n",
+                &[],
+                &["MARIADB_ROOT_PASSWORD", "POSTGRES_PASSWORD"],
+            )
+            .unwrap_err();
+        let (code, message) = error.protocol();
+        assert_eq!(code, ErrorCode::InvalidInput);
+        assert!(message.contains("MARIADB_ROOT_PASSWORD"), "{message}");
+        assert!(message.contains("POSTGRES_PASSWORD"), "{message}");
+        assert_eq!(fx.stack_entries(), Vec::<String>::new());
+        assert_eq!(fx.calls(), "", "nothing may run before the check");
+    }
+
+    #[test]
+    fn a_redeploy_satisfies_required_keys_from_the_existing_file() {
+        let fx = Fixture::new();
+        fx.run_full(
+            ID,
+            None,
+            "services: old\n",
+            "MARIADB_ROOT_PASSWORD='original'\n",
+            &[],
+            &["MARIADB_ROOT_PASSWORD"],
+        )
+        .unwrap();
+        fx.run_full(
+            ID_2,
+            None,
+            "services: old\n",
+            "SERVER_NAME=':443'\n",
+            &[],
+            &["MARIADB_ROOT_PASSWORD"],
+        )
+        .expect("the server's own value satisfies the requirement");
+    }
+
+    #[test]
+    fn env_key_lists_must_name_env_variables() {
+        let mut value: serde_json::Value =
+            serde_json::from_str(&request_json("services: a\n")).unwrap();
+        value["requireEnvKeys"] = serde_json::json!(["not a key"]);
+        assert_eq!(
+            Request::parse(&value.to_string(), ID, None).unwrap_err(),
+            RequestError::InvalidEnvKey
+        );
     }
 
     #[test]

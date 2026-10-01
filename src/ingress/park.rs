@@ -44,6 +44,9 @@ use crate::{
 
 #[derive(Debug)]
 pub enum ParkError {
+    /// Another operation is already working on the managed WCP stack
+    /// (milestone 048). Nothing was written.
+    StackBusy,
     Io(io::Error),
     Preflight(preflight::Error),
     /// The idempotency key was already claimed, but the original attempt
@@ -81,6 +84,10 @@ impl ParkError {
     /// message for `NothingLive`.
     pub fn protocol(&self) -> (ErrorCode, String) {
         match self {
+            Self::StackBusy => (
+                ErrorCode::Conflict,
+                "another operation on the wcp stack is in progress".into(),
+            ),
             Self::Io(_) | Self::State(_) | Self::PostCommitRecordFailed { .. } => (
                 ErrorCode::Internal,
                 "internal ingress activation error".to_owned(),
@@ -188,6 +195,14 @@ pub fn execute(
     cancellation: &CancellationToken,
 ) -> Result<ParkResult, ParkError> {
     let ingress_state = open_ingress_state(context.engine_state).map_err(ParkError::Io)?;
+
+    // Milestone 048: this operation reloads containers `stack.deploy` can be
+    // recreating, so it takes the shared stack lock first and holds it for
+    // the whole body.
+    let stack_scope =
+        crate::stack_deploy::open_scope(context.engine_state).map_err(ParkError::Io)?;
+    let _stack_lock = crate::stack_deploy::acquire_stack_lock(&stack_scope, request.request_id)
+        .map_err(|_| ParkError::StackBusy)?;
 
     let admitted = match preflight::run(
         &ingress_state,
