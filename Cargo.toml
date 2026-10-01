@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Structured execution layer for reliable server operations"
-license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/skanevi/operations-engine"
 publish = false
 
