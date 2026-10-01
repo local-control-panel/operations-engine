@@ -289,6 +289,10 @@ pub struct Context<'a> {
     pub stack_root: &'a TrustedRoot,
     pub docker: &'a str,
     pub timing: Timing,
+    /// Who owns the stack files and directories: the account whose home
+    /// holds the stack, as when the control panel wrote them itself. `None`
+    /// leaves them root-owned.
+    pub owner: Option<(u32, u32)>,
 }
 
 // ── Errors ─────────────────────────────────────────────────────────────────
@@ -496,11 +500,21 @@ fn is_private(name: &str) -> bool {
     name == ENV_FILE
 }
 
-fn write(root: &ManagedRoot, name: &str, path: &SiteRelativePath, bytes: &[u8]) -> io::Result<()> {
+fn write(
+    root: &ManagedRoot,
+    owner: Option<(u32, u32)>,
+    name: &str,
+    path: &SiteRelativePath,
+    bytes: &[u8],
+) -> io::Result<()> {
     if is_private(name) {
-        root.write_atomic_private(path, bytes)
+        root.write_atomic_private(path, bytes)?;
     } else {
-        root.write_atomic(path, bytes)
+        root.write_atomic(path, bytes)?;
+    }
+    match owner {
+        Some((uid, gid)) => root.chown(path, uid, gid),
+        None => Ok(()),
     }
 }
 
@@ -798,6 +812,11 @@ fn deploy(
     let root = ManagedRoot::open(ctx.stack_root).map_err(Error::Io)?;
     for directory in DIRECTORIES {
         root.create_dir_all(&rel(directory)).map_err(Error::Io)?;
+        if let Some((uid, gid)) = ctx.owner {
+            for path in [directory.split('/').next().unwrap_or(directory), directory] {
+                root.chown(&rel(path), uid, gid).map_err(Error::Io)?;
+            }
+        }
     }
     let docker = Docker {
         program: ctx.docker,
@@ -827,6 +846,7 @@ fn deploy(
     for (i, name) in FILES.iter().enumerate() {
         if let Err(error) = write(
             &root,
+            ctx.owner,
             name,
             &rel(staged_name(name)),
             req.files[i].as_bytes(),
@@ -865,7 +885,7 @@ fn deploy(
             discard_staged();
             return Err(Error::Io(error));
         }
-        let outcome = activate(&root, req.request_id, &previous)
+        let outcome = activate(&root, ctx.owner, req.request_id, &previous)
             .map_err(NotUp::Activation)
             .and_then(|()| converge(&docker, &services, &ctx.timing));
         if let Err(cause) = outcome {
@@ -946,12 +966,13 @@ fn prepare(docker: &Docker<'_>, timing: &Timing) -> Result<Vec<String>, Error> {
 /// Backs every previous file up, then renames each staged file into place.
 fn activate(
     root: &ManagedRoot,
+    owner: Option<(u32, u32)>,
     request_id: RequestId,
     previous: &[Option<Vec<u8>>],
 ) -> io::Result<()> {
     for (i, name) in FILES.iter().enumerate() {
         if let Some(bytes) = &previous[i] {
-            write(root, name, &backup_path(name, request_id), bytes)?;
+            write(root, owner, name, &backup_path(name, request_id), bytes)?;
         }
         root.rename(&rel(staged_name(name)), &rel(name))?;
     }
@@ -1253,10 +1274,16 @@ exit 2
                     health: Duration::from_millis(300),
                     poll_interval: Duration::from_millis(20),
                 },
+                owner: Some(current_owner()),
             };
             let request = Request::parse(&request_json(compose), id, key).unwrap();
             execute(&ctx, &request, &CancellationToken::default())
         }
+    }
+
+    fn current_owner() -> (u32, u32) {
+        // SAFETY: neither call takes arguments or can fail.
+        unsafe { (libc::getuid(), libc::getgid()) }
     }
 
     fn request_json(compose: &str) -> String {
@@ -1297,6 +1324,19 @@ exit 2
             .permissions()
             .mode();
         assert_eq!(env_mode & 0o777, 0o600);
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owner = current_owner();
+            for path in [
+                "stack/.env",
+                "stack/stack/docker-compose.yml",
+                "stack/mariadb",
+                "stack/mariadb/conf.d",
+            ] {
+                let metadata = fs::metadata(fx.path(path)).unwrap();
+                assert_eq!((metadata.uid(), metadata.gid()), owner, "{path}");
+            }
+        }
         assert_eq!(fx.stack_entries(), managed_files());
         assert!(!fx.path("state/stacks/wcp/journal.json").exists());
         let calls = fx.calls();

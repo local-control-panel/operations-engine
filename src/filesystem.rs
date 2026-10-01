@@ -37,6 +37,41 @@ impl ManagedRoot {
         })
     }
 
+    /// Changes the owner of the file or directory at `path`. The target is
+    /// opened through this root's capability first and changed through
+    /// that descriptor, so a symlink cannot redirect the change outside the
+    /// root.
+    #[cfg(unix)]
+    pub fn chown(&self, path: &SiteRelativePath, uid: u32, gid: u32) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let target = match self.directory.open_dir(path.as_path()) {
+            Ok(dir) => dir.into_std_file(),
+            Err(_) => self.directory.open(path.as_path())?.into_std(),
+        };
+        // Directories may be opened `O_PATH` on Linux, which `fchown`
+        // rejects; `fchownat` with an empty path accepts any descriptor.
+        #[cfg(target_os = "linux")]
+        // SAFETY: `target` is open for the call and the path is a valid,
+        // NUL-terminated empty string.
+        let result = unsafe {
+            libc::fchownat(
+                target.as_raw_fd(),
+                c"".as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: `target` is an open descriptor for the duration of the call.
+        let result = unsafe { libc::fchown(target.as_raw_fd(), uid, gid) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Creates `path` as a new directory, failing if it already exists (its
     /// parent must already exist — use `create_dir_all` for that first).
     /// Use this, not `create_dir_all`, wherever the caller needs a
