@@ -89,6 +89,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "system.createSwap",
                 "system.deleteSwap",
                 "system.resizeSwap",
+                "stack.deploy",
             ],
             output_formats: ["json"],
             features: Features {

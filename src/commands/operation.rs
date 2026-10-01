@@ -18,11 +18,13 @@ pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
             site_id,
             database,
             backup_database,
+            stack,
             request_id,
         } => status(
             site_id.as_deref(),
             database.as_deref(),
             backup_database.as_deref(),
+            stack.as_deref(),
             &request_id,
         ),
     }
@@ -32,6 +34,7 @@ fn status(
     site_id: Option<&str>,
     database: Option<&str>,
     backup_database: Option<&str>,
+    stack: Option<&str>,
     request_id: &str,
 ) -> Result<Response, ResponseBuildError> {
     #[cfg(unix)]
@@ -56,13 +59,18 @@ fn status(
                 ));
             }
         };
-        let state = match (site_id, database, backup_database) {
-            (Some(site_id), None, None) => operation_status::load_site(&root, site_id, request_id),
-            (None, Some(database), None) => {
+        let state = match (site_id, database, backup_database, stack) {
+            (Some(site_id), None, None, None) => {
+                operation_status::load_site(&root, site_id, request_id)
+            }
+            (None, Some(database), None, None) => {
                 operation_status::load_database(&root, database, request_id)
             }
-            (None, None, Some(database)) => {
+            (None, None, Some(database), None) => {
                 operation_status::load_backup(&root, database, request_id)
+            }
+            (None, None, None, Some(stack)) => {
+                operation_status::load_stack(&root, stack, request_id)
             }
             _ => Err(StatusError::InvalidScope),
         };
@@ -92,7 +100,7 @@ fn status(
     }
     #[cfg(not(unix))]
     {
-        let _ = (site_id, database, backup_database, request_id);
+        let _ = (site_id, database, backup_database, stack, request_id);
         Ok(Response::failure(
             OPERATION,
             ErrorCode::UnsupportedPlatform,

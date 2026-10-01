@@ -28,6 +28,20 @@ pub struct SiteLockGuard<'a> {
     _file: std::fs::File,
 }
 
+/// Unlocks explicitly before the descriptor closes. A `flock` belongs to the
+/// open file description, and a child forked by another thread holds a
+/// duplicate of it until it execs; closing only our copy would leave the
+/// lock held for that window. `LOCK_UN` on any duplicate releases it for
+/// all of them.
+impl Drop for SiteLockGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `_file` is still open here; it closes after this returns.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 impl std::fmt::Debug for SiteLockGuard<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.debug_struct("SiteLockGuard").finish()

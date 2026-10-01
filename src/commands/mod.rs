@@ -12,6 +12,7 @@ pub mod operation;
 pub mod permissions;
 pub mod runtime_config;
 pub mod site;
+pub mod stack;
 pub mod system;
 pub mod version;
 pub mod wordpress;

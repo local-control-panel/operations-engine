@@ -110,6 +110,12 @@ pub enum Command {
         #[command(subcommand)]
         command: SystemCommand,
     },
+
+    /// Managed WCP Compose stack operations.
+    Stack {
+        #[command(subcommand)]
+        command: StackCommand,
+    },
 }
 
 impl Command {
@@ -132,6 +138,7 @@ impl Command {
             Self::Wordpress { command } => command.operation(),
             Self::Agent { command } => command.operation(),
             Self::System { command } => command.operation(),
+            Self::Stack { command } => command.operation(),
         }
     }
 }
@@ -228,6 +235,10 @@ pub enum OperationCommand {
 
         #[arg(long = "backup-database")]
         backup_database: Option<String>,
+
+        /// A managed Compose stack; only `wcp` exists.
+        #[arg(long)]
+        stack: Option<String>,
 
         #[arg(long = "request-id")]
         request_id: String,
@@ -803,6 +814,30 @@ pub enum RuntimeCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StackCommand {
+    /// Replace the managed WCP stack's files and converge its containers:
+    /// staged validation, image policy and pull before any live change,
+    /// then activation, a health gate and automatic rollback.
+    Deploy {
+        /// Root-owned JSON file holding every managed stack file's contents.
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl StackCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Deploy { .. } => "stack.deploy",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
