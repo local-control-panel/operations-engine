@@ -671,27 +671,45 @@ fn remove_written(ctx: &Context<'_>, written: &Written) -> Result<(), Error> {
 
 /// Enables and starts the service unless it already is both; `true` when
 /// it had to.
+///
+/// The socket unit is restarted too: when a removed `docker.io` left its
+/// `docker.socket` running, `docker-ce` replaces the unit underneath it and
+/// the old socket keeps no listening descriptor, so `docker.service` fails
+/// with "no sockets found via socket activation" until both are restarted
+/// (seen on Ubuntu 24.04 after following this operation's own refusal
+/// advice to remove `docker.io`).
 fn ensure_running(ctx: &Context<'_>, cancel: &CancellationToken) -> Result<bool, Error> {
-    let probe = |args: &[&str]| -> Result<bool, Error> {
+    let systemctl = |args: &[&str]| {
         spawn(
             ctx.tools.systemctl,
             args,
-            Duration::from_secs(30),
+            Duration::from_secs(2 * 60),
             Stage::Enable,
             cancel,
         )
-        .map(|output| succeeded(&output))
     };
-    if probe(&["is-enabled", "--quiet", "docker"])? && probe(&["is-active", "--quiet", "docker"])? {
+    let probe = |args: &[&str]| systemctl(args).map(|output| succeeded(&output));
+    if probe(&["is-enabled", "--quiet", "docker.service"])?
+        && probe(&["is-active", "--quiet", "docker.service"])?
+    {
         return Ok(false);
     }
-    run_checked(
-        ctx.tools.systemctl,
-        &["enable", "--now", "docker"],
-        Duration::from_secs(2 * 60),
-        Stage::Enable,
-        cancel,
-    )?;
+    // Clears a start-limit hit left by earlier failed starts; nothing to
+    // clear is not an error.
+    systemctl(&["reset-failed", "docker.socket", "docker.service"])?;
+    for args in [
+        &["enable", "docker.socket", "docker.service"][..],
+        &["restart", "docker.socket"],
+        &["start", "docker.service"],
+    ] {
+        let output = systemctl(args)?;
+        if !succeeded(&output) {
+            return Err(Error::Rejected(
+                Stage::Enable,
+                SubprocessDiagnostics::from_output(ctx.tools.systemctl, &output),
+            ));
+        }
+    }
     Ok(true)
 }
 
@@ -1039,7 +1057,8 @@ exit $missing
                     r#"echo "systemctl $*" >> '{p}/calls.log'
 case "$1" in
   is-enabled|is-active) [ -e '{p}/active' ] ;;
-  enable) [ -e '{p}/fail-enable' ] && exit 1; touch '{p}/active' ;;
+  enable) if [ -e '{p}/fail-enable' ]; then exit 1; fi ;;
+  start) touch '{p}/active' ;;
 esac
 "#
                 ),
@@ -1207,7 +1226,12 @@ case "$1" in info) echo 28.5.0 ;; compose) echo 2.39.4 ;; esac
         let calls = fx.calls();
         assert!(calls.contains("install -y ca-certificates\n"));
         assert!(calls.contains(&format!("install -y {}\n", PACKAGES.join(" "))));
-        assert!(calls.contains("systemctl enable --now docker\n"));
+        assert!(calls.contains(
+            "systemctl reset-failed docker.socket docker.service\n\
+             systemctl enable docker.socket docker.service\n\
+             systemctl restart docker.socket\n\
+             systemctl start docker.service\n"
+        ));
     }
 
     #[test]
@@ -1219,7 +1243,7 @@ case "$1" in info) echo 28.5.0 ;; compose) echo 2.39.4 ;; esac
         assert!(!result.changed && !result.installed && !result.started);
         let after = fx.calls();
         assert!(!after[before.len()..].contains("apt-get"));
-        assert!(!after[before.len()..].contains("enable --now"));
+        assert!(!after[before.len()..].contains("systemctl enable"));
     }
 
     #[test]
