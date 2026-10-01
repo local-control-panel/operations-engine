@@ -990,6 +990,12 @@ mod tests {
     const NOBLE: &str = "PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\nID=ubuntu\nID_LIKE=debian\n\
                          VERSION_CODENAME=noble\nUBUNTU_CODENAME=noble\n";
 
+    /// These tests fork dozens of fake tools each. Run in parallel they
+    /// widen the fork-before-exec window in which a child holds other
+    /// tests' descriptors (a just-written executable, a held `flock`), which
+    /// made unrelated lib tests flake; one at a time they do not.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn managed(directory: &Path) -> ManagedRoot {
         ManagedRoot::open(&crate::site::TrustedRoot::parse(directory).unwrap()).unwrap()
     }
@@ -999,10 +1005,14 @@ mod tests {
     /// files make the matching fake tool fail.
     struct Fixture {
         dir: tempfile::TempDir,
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Fixture {
         fn new() -> Self {
+            let serial = SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path();
             for child in ["state", "keyrings", "sources", "pkgs", "bin"] {
@@ -1072,7 +1082,10 @@ case "$1" in info) echo 28.5.0 ;; compose) echo 2.39.4 ;; esac
 "#
                 ),
             );
-            Self { dir }
+            Self {
+                dir,
+                _serial: serial,
+            }
         }
 
         fn tool(root: &Path, name: &str, body: &str) {
@@ -1310,6 +1323,8 @@ case "$1" in info) echo 28.5.0 ;; compose) echo 2.39.4 ;; esac
         let fx = Fixture::new();
         fx.touch("snap-docker");
         assert!(matches!(fx.run(ID), Err(Error::ForeignDocker(_))));
+        // Each fixture holds the serial lock until it is dropped.
+        drop(fx);
 
         // A /usr/bin/docker without docker-ce-cli is foreign; with it, it
         // is the package's own.
