@@ -26,13 +26,11 @@ fn deploy(
 ) -> Result<Response, ResponseBuildError> {
     use crate::{
         commands::{ContentFileError, read_root_owned_content_file},
-        compose,
         config::EngineConfig,
         error::WarningCode,
         filesystem::ManagedRoot,
         process::CancellationToken,
         protocol::Warning,
-        site::TrustedRoot,
         stack_deploy::{self, Context, Error, Request, Timing},
     };
 
@@ -90,25 +88,19 @@ fn deploy(
             ));
         }
     };
-    let stack_root = match compose::compose_base_dir()
-        .ok()
-        .filter(|path| std::fs::create_dir_all(path).is_ok())
-        .and_then(|path| TrustedRoot::parse(path).ok())
-    {
-        Some(root) => root,
-        None => {
-            return Ok(Response::failure(
-                OPERATION,
-                ErrorCode::Internal,
-                "stack directory is unavailable",
-            ));
-        }
+    let Some((stack_root, owner)) = prepare_stack_root() else {
+        return Ok(Response::failure(
+            OPERATION,
+            ErrorCode::Internal,
+            "stack directory is unavailable",
+        ));
     };
     let context = Context {
         engine_state: &engine_state,
         stack_root: &stack_root,
         docker: "docker",
         timing: Timing::PRODUCTION,
+        owner,
     };
     match stack_deploy::execute(&context, &request, &CancellationToken::default()) {
         Ok(result) => Response::success(OPERATION, result),
@@ -125,6 +117,38 @@ fn deploy(
             Ok(Response::failure(OPERATION, code, &message))
         }
     }
+}
+
+/// Creates `~/compose/wp-stack` inside the invoking account's home and
+/// returns it with that home's owner, which the stack files keep - the same
+/// ownership they had when the control panel wrote them over SSH. A
+/// root-owned home means root-owned files, as before. Both directories are
+/// created and re-owned through a capability on the home directory, so a
+/// symlink cannot point the change elsewhere.
+#[cfg(unix)]
+fn prepare_stack_root() -> Option<(crate::site::TrustedRoot, Option<(u32, u32)>)> {
+    use std::os::unix::fs::MetadataExt;
+
+    use crate::{
+        compose,
+        filesystem::ManagedRoot,
+        site::{SiteRelativePath, TrustedRoot},
+    };
+
+    let stack_dir = compose::compose_base_dir().ok()?;
+    let home = stack_dir.parent()?.parent()?;
+    let home_root = TrustedRoot::parse(home).ok()?;
+    let home_dir = ManagedRoot::open(&home_root).ok()?;
+    let metadata = std::fs::metadata(home).ok()?;
+    let owner = (metadata.uid() != 0).then(|| (metadata.uid(), metadata.gid()));
+    for relative in ["compose", "compose/wp-stack"] {
+        let relative = SiteRelativePath::parse(relative).ok()?;
+        home_dir.create_dir_all(&relative).ok()?;
+        if let Some((uid, gid)) = owner {
+            home_dir.chown(&relative, uid, gid).ok()?;
+        }
+    }
+    Some((TrustedRoot::parse(stack_dir).ok()?, owner))
 }
 
 #[cfg(not(unix))]
