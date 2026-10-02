@@ -852,6 +852,40 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Start one runtime pool's service (`up -d`) and wait until its
+    /// healthcheck reports `healthy`, under the shared stack lock.
+    EnsureRuntime {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        /// `php-<major>.<minor>` for a non-default pool gated behind a
+        /// Compose profile; omitted for the default runtime.
+        #[arg(long = "profile")]
+        profile: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Send FrankenPHP's worker-reload signal (USR2 to pid 1) to one
+    /// runtime pool, under the shared stack lock.
+    ReloadWorkers {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Purge the Souin full-page cache inside one runtime pool, under the
+    /// shared stack lock.
+    FlushFpc {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl StackCommand {
@@ -860,6 +894,9 @@ impl StackCommand {
             Self::Deploy { .. } => "stack.deploy",
             Self::ReloadCaddy { .. } => "stack.reloadCaddy",
             Self::StopIdleRuntime { .. } => "stack.stopIdleRuntime",
+            Self::EnsureRuntime { .. } => "stack.ensureRuntime",
+            Self::ReloadWorkers { .. } => "stack.reloadWorkers",
+            Self::FlushFpc { .. } => "stack.flushFpc",
         }
     }
 }

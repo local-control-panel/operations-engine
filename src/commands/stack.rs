@@ -25,7 +25,94 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => stop_idle_runtime(&runtime_id, &request_id, idempotency_key.as_deref()),
+        StackCommand::EnsureRuntime {
+            runtime_id,
+            profile,
+            request_id,
+            idempotency_key,
+        } => ensure_runtime(
+            &runtime_id,
+            profile.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        StackCommand::ReloadWorkers {
+            runtime_id,
+            request_id,
+            idempotency_key,
+        } => runtime_action(
+            crate::stack_service::RELOAD_WORKERS_OPERATION,
+            crate::stack_service::reload_workers,
+            &runtime_id,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        StackCommand::FlushFpc {
+            runtime_id,
+            request_id,
+            idempotency_key,
+        } => runtime_action(
+            crate::stack_service::FLUSH_FPC_OPERATION,
+            crate::stack_service::flush_fpc,
+            &runtime_id,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
     }
+}
+
+fn ensure_runtime(
+    runtime_id: &str,
+    profile: Option<&str>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::stack_service::{ENSURE_OPERATION, EnsureRequest, ensure_runtime};
+
+    let request = match EnsureRequest::parse(runtime_id, profile, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                ENSURE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    run_service_operation(ENSURE_OPERATION, |ctx, cancel| {
+        ensure_runtime(ctx, &request, cancel)
+    })
+}
+
+/// `stack.reloadWorkers` / `stack.flushFpc`: one runtime pool, no other
+/// input.
+fn runtime_action(
+    operation: &'static str,
+    action: fn(
+        &crate::stack_service::Context<'_>,
+        &crate::stack_service::RuntimeRequest,
+        &crate::process::CancellationToken,
+    )
+        -> Result<crate::stack_service::RuntimeActionResult, crate::stack_service::Error>,
+    runtime_id: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let request = match crate::stack_service::RuntimeRequest::parse(
+        runtime_id,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    run_service_operation(operation, |ctx, cancel| action(ctx, &request, cancel))
 }
 
 fn reload_caddy(
@@ -123,6 +210,7 @@ where
         runtime_root: &config.runtime_root,
         stack_dir: &stack_dir,
         docker: "docker",
+        health: stack_service::HealthWait::PRODUCTION,
     };
     match run(&context, &CancellationToken::default()) {
         Ok(result) => Response::success(operation, result),

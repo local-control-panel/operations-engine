@@ -101,7 +101,10 @@ fn capabilities_describe_only_implemented_operations() {
             "system.resizeSwap",
             "stack.deploy",
             "stack.reloadCaddy",
-            "stack.stopIdleRuntime"
+            "stack.stopIdleRuntime",
+            "stack.ensureRuntime",
+            "stack.reloadWorkers",
+            "stack.flushFpc"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
