@@ -58,7 +58,151 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        StackCommand::WriteSiteService {
+            runtime_id,
+            domain,
+            uid,
+            gid,
+            port,
+            root,
+            worker_mode,
+            worker_count,
+            request_id,
+            idempotency_key,
+        } => write_site_service(
+            &runtime_id,
+            &domain,
+            uid,
+            gid,
+            port,
+            root,
+            worker_mode,
+            worker_count,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        StackCommand::ActivateSiteConfig {
+            runtime_id,
+            domain,
+            port,
+            root,
+            content_file,
+            expected_prior_hash,
+            request_id,
+            idempotency_key,
+        } => activate_site_config(
+            &runtime_id,
+            &domain,
+            port,
+            root,
+            &content_file,
+            expected_prior_hash.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_site_service(
+    runtime_id: &str,
+    domain: &str,
+    uid: u32,
+    gid: u32,
+    port: u16,
+    root: String,
+    worker_mode: bool,
+    worker_count: i64,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::stack_service::{
+        WRITE_SITE_SERVICE_OPERATION, WriteSiteServiceRequest, write_site_service,
+    };
+
+    let request = match WriteSiteServiceRequest::parse(
+        runtime_id,
+        domain,
+        uid,
+        gid,
+        port,
+        root,
+        worker_mode,
+        worker_count,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                WRITE_SITE_SERVICE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    run_service_operation(WRITE_SITE_SERVICE_OPERATION, |ctx, cancel| {
+        write_site_service(ctx, &request, cancel)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_site_config(
+    runtime_id: &str,
+    domain: &str,
+    port: u16,
+    root: String,
+    content_file: &std::path::Path,
+    expected_prior_hash: Option<&str>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::{
+        commands::{ContentFileError, read_root_owned_content_file},
+        stack_service::{
+            ACTIVATE_SITE_CONFIG_OPERATION, ActivateSiteConfigRequest, activate_site_config,
+        },
+    };
+
+    let caddyfile = match read_root_owned_content_file(content_file) {
+        Ok(content) => content,
+        Err(ContentFileError::TooLarge) => {
+            return Ok(Response::failure(
+                ACTIVATE_SITE_CONFIG_OPERATION,
+                ErrorCode::InvalidInput,
+                "content-file exceeds the maximum allowed size",
+            ));
+        }
+        Err(ContentFileError::Unreadable) => {
+            return Ok(Response::failure(
+                ACTIVATE_SITE_CONFIG_OPERATION,
+                ErrorCode::InvalidInput,
+                "content-file must be a root-owned file that is not group/world-writable",
+            ));
+        }
+    };
+    let request = match ActivateSiteConfigRequest::parse(
+        runtime_id,
+        domain,
+        port,
+        root,
+        caddyfile,
+        expected_prior_hash,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                ACTIVATE_SITE_CONFIG_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    run_service_operation(ACTIVATE_SITE_CONFIG_OPERATION, |ctx, cancel| {
+        activate_site_config(ctx, &request, cancel)
+    })
 }
 
 fn ensure_runtime(
@@ -208,6 +352,7 @@ where
     let context = stack_service::Context {
         engine_state: &engine_state,
         runtime_root: &config.runtime_root,
+        site_services_root: &config.site_services_root,
         stack_dir: &stack_dir,
         docker: "docker",
         health: stack_service::HealthWait::PRODUCTION,
