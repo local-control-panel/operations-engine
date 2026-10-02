@@ -2,7 +2,7 @@
 //! `stack.reloadWorkers` and `stack.flushFpc`: the container mutations the
 //! control panel used to run over raw SSH against the managed WCP Compose
 //! project (`caddy reload`, `stop runtime-<id>`, `up -d runtime-<id>` plus a
-//! health poll, `kill -USR2 1` and the Souin cache purge).
+//! health poll, the worker reload and the Souin cache purge).
 //!
 //! Both take the shared `stacks/wcp` lock (milestone 048) as their outermost
 //! lock, so neither can land in a container that `stack.deploy`'s `up -d`
@@ -72,6 +72,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `kill -USR2 1` and the cache purge are both instant inside the container.
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// PHP workers run in each site's own FrankenPHP child process (`admin off`,
+/// supervised by s6 under `/etc/wcp/site-services/<domain>`), not in the
+/// pool's main Caddy, and pid 1 is `s6-svscan`. Reloading them means
+/// restarting every site service that has a `run` script; a leftover
+/// directory without one is skipped.
+const RELOAD_WORKERS_SCRIPT: &str = "for d in /etc/wcp/site-services/*/; do \
+     [ -f \"${d}run\" ] || continue; s6-svc -r \"$d\" || exit 1; done";
 
 /// Fixed in-container FPC purge: a `PURGE` to Souin plus a wipe of its
 /// BadgerDB store, both best-effort, exactly what the panel ran before.
@@ -480,7 +488,7 @@ pub fn reload_workers(
         RELOAD_WORKERS_OPERATION,
         Stage::ReloadWorkers,
         req,
-        &["kill", "-USR2", "1"],
+        &["sh", "-c", RELOAD_WORKERS_SCRIPT],
         cancel,
     )
 }
@@ -1096,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn reload_workers_signals_pid_one_in_the_pool() {
+    fn reload_workers_restarts_the_pool_site_services() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let fixture = Fixture::new(0);
         let req = RuntimeRequest::parse("fp1-php84", ID, None).unwrap();
@@ -1106,7 +1114,7 @@ mod tests {
         assert_eq!(
             fixture.calls(),
             vec![format!(
-                "{} exec -T runtime-fp1-php84 kill -USR2 1",
+                "{} exec -T runtime-fp1-php84 sh -c {RELOAD_WORKERS_SCRIPT}",
                 compose_prefix(&fixture)
             )]
         );

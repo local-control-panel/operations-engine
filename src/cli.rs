@@ -866,8 +866,8 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
-    /// Send FrankenPHP's worker-reload signal (USR2 to pid 1) to one
-    /// runtime pool, under the shared stack lock.
+    /// Restart every site process (and so its PHP workers) in one runtime
+    /// pool through s6, under the shared stack lock.
     ReloadWorkers {
         #[arg(long = "runtime-id")]
         runtime_id: String,
