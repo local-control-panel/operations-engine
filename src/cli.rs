@@ -830,12 +830,36 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Reload Caddy inside one service of the managed WCP stack (the
+    /// ingress or one runtime pool) through a fixed argv, under the shared
+    /// stack lock.
+    ReloadCaddy {
+        /// `ingress` or `runtime-<runtime id>`.
+        #[arg(long = "service")]
+        service: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Stop one runtime pool's service, but only if no site exec config is
+    /// left under its runtime directory; otherwise leave it running.
+    StopIdleRuntime {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl StackCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Deploy { .. } => "stack.deploy",
+            Self::ReloadCaddy { .. } => "stack.reloadCaddy",
+            Self::StopIdleRuntime { .. } => "stack.stopIdleRuntime",
         }
     }
 }

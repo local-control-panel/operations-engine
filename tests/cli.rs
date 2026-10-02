@@ -99,7 +99,9 @@ fn capabilities_describe_only_implemented_operations() {
             "system.createSwap",
             "system.deleteSwap",
             "system.resizeSwap",
-            "stack.deploy"
+            "stack.deploy",
+            "stack.reloadCaddy",
+            "stack.stopIdleRuntime"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
