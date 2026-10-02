@@ -38,6 +38,7 @@ pub mod runtime_config;
 pub mod site;
 #[cfg(unix)]
 pub mod stack_deploy;
+pub mod stack_service;
 pub mod system_autoupdates;
 pub mod system_autoupdates_install;
 #[cfg(unix)]

@@ -15,7 +15,150 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => deploy(&request_file, &request_id, idempotency_key.as_deref()),
+        StackCommand::ReloadCaddy {
+            service,
+            request_id,
+            idempotency_key,
+        } => reload_caddy(&service, &request_id, idempotency_key.as_deref()),
+        StackCommand::StopIdleRuntime {
+            runtime_id,
+            request_id,
+            idempotency_key,
+        } => stop_idle_runtime(&runtime_id, &request_id, idempotency_key.as_deref()),
     }
+}
+
+fn reload_caddy(
+    service: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::stack_service::{RELOAD_OPERATION, ReloadRequest, reload};
+
+    let request = match ReloadRequest::parse(service, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                RELOAD_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    run_service_operation(RELOAD_OPERATION, |ctx, cancel| {
+        reload(ctx, &request, cancel)
+    })
+}
+
+fn stop_idle_runtime(
+    runtime_id: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::stack_service::{STOP_OPERATION, StopRequest, stop_idle_runtime};
+
+    let request = match StopRequest::parse(runtime_id, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                STOP_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    run_service_operation(STOP_OPERATION, |ctx, cancel| {
+        stop_idle_runtime(ctx, &request, cancel)
+    })
+}
+
+/// Loads the config, opens the state root, resolves the stack directory and
+/// runs one `stack_service` operation, mapping its outcome to a response.
+#[cfg(unix)]
+fn run_service_operation<T, F>(
+    operation: &'static str,
+    run: F,
+) -> Result<Response, ResponseBuildError>
+where
+    T: serde::Serialize,
+    F: FnOnce(
+        &crate::stack_service::Context<'_>,
+        &crate::process::CancellationToken,
+    ) -> Result<T, crate::stack_service::Error>,
+{
+    use crate::{
+        compose, config::EngineConfig, error::WarningCode, filesystem::ManagedRoot,
+        process::CancellationToken, protocol::Warning, stack_service,
+    };
+
+    let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let Ok(stack_dir) = compose::compose_base_dir() else {
+        return Ok(Response::failure(
+            operation,
+            ErrorCode::Internal,
+            "stack directory is unavailable",
+        ));
+    };
+    let context = stack_service::Context {
+        engine_state: &engine_state,
+        runtime_root: &config.runtime_root,
+        stack_dir: &stack_dir,
+        docker: "docker",
+    };
+    match run(&context, &CancellationToken::default()) {
+        Ok(result) => Response::success(operation, result),
+        Err(stack_service::Error::PostCommit(result)) => {
+            Response::success(operation, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the operation completed but its transaction record could not be \
+                              saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(operation, code, &message))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_service_operation<T, F>(
+    operation: &'static str,
+    _run: F,
+) -> Result<Response, ResponseBuildError>
+where
+    F: FnOnce(
+        &crate::stack_service::Context<'_>,
+        &crate::process::CancellationToken,
+    ) -> Result<T, crate::stack_service::Error>,
+{
+    Ok(Response::failure(
+        operation,
+        ErrorCode::UnsupportedPlatform,
+        "stack service operations require a Unix host",
+    ))
 }
 
 #[cfg(unix)]
