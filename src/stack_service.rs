@@ -1,12 +1,15 @@
-//! `stack.reloadCaddy` and `stack.stopIdleRuntime`: the two container
-//! mutations the control panel used to run over raw SSH against the managed
-//! WCP Compose project (`docker compose exec -T <service> caddy reload` and
-//! `docker compose stop runtime-<id>`).
+//! `stack.reloadCaddy`, `stack.stopIdleRuntime`, `stack.ensureRuntime`,
+//! `stack.reloadWorkers` and `stack.flushFpc`: the container mutations the
+//! control panel used to run over raw SSH against the managed WCP Compose
+//! project (`caddy reload`, `stop runtime-<id>`, `up -d runtime-<id>` plus a
+//! health poll, `kill -USR2 1` and the Souin cache purge).
 //!
 //! Both take the shared `stacks/wcp` lock (milestone 048) as their outermost
 //! lock, so neither can land in a container that `stack.deploy`'s `up -d`
 //! is recreating, and both record a transaction and an audit entry in their
 //! own `stack-service` scope like every other engine mutation.
+//! `stack.ensureRuntime` holds the stack lock through its health wait, so a
+//! deploy cannot recreate the pool between `up -d` and `healthy`.
 //!
 //! The commands are fixed argv. The caller picks only which service: the
 //! ingress or one runtime pool. `stack.stopIdleRuntime` refuses to stop a
@@ -42,6 +45,9 @@ use crate::{
 
 pub const RELOAD_OPERATION: &str = "stack.reloadCaddy";
 pub const STOP_OPERATION: &str = "stack.stopIdleRuntime";
+pub const ENSURE_OPERATION: &str = "stack.ensureRuntime";
+pub const RELOAD_WORKERS_OPERATION: &str = "stack.reloadWorkers";
+pub const FLUSH_FPC_OPERATION: &str = "stack.flushFpc";
 
 /// Engine-state scope for both operations. Separate from `stacks/wcp`,
 /// whose own preflight lock *is* the shared stack lock.
@@ -56,6 +62,21 @@ const RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
 /// `docker compose stop` waits up to 10 s per container before it kills;
 /// the rest is Compose's own start-up and the API round trips.
 const STOP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `docker compose up -d` for one service may pull nothing but still has to
+/// create the container and its network attachments.
+const UP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One `ps -q` or `docker inspect` round trip during the health wait.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `kill -USR2 1` and the cache purge are both instant inside the container.
+const SIGNAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fixed in-container FPC purge: a `PURGE` to Souin plus a wipe of its
+/// BadgerDB store, both best-effort, exactly what the panel ran before.
+const FLUSH_FPC_SCRIPT: &str =
+    "curl -sf -X PURGE http://localhost/ 2>/dev/null; rm -rf /tmp/souin 2>/dev/null; echo ok";
 
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -92,6 +113,7 @@ fn runtime_service(runtime_id: &RuntimeId) -> String {
 pub enum RequestError {
     InvalidService,
     InvalidRuntimeId,
+    InvalidProfile,
     InvalidRequestId,
     InvalidIdempotencyKey,
 }
@@ -101,6 +123,7 @@ impl RequestError {
         match self {
             Self::InvalidService => "service must be ingress or runtime-<runtime id>",
             Self::InvalidRuntimeId => "runtime-id is not a valid runtime pool identifier",
+            Self::InvalidProfile => "profile must be php-<major>.<minor>",
             Self::InvalidRequestId => "request-id is not a canonical UUID",
             Self::InvalidIdempotencyKey => "idempotency-key is invalid",
         }
@@ -160,6 +183,56 @@ impl StopRequest {
     }
 }
 
+/// `php-<major>.<minor>`: the Compose profile that gates a non-default
+/// runtime pool (`images/stack/docker-compose.v2.yml`).
+fn valid_profile(profile: &str) -> bool {
+    let Some(version) = profile.strip_prefix("php-") else {
+        return false;
+    };
+    let Some((major, minor)) = version.split_once('.') else {
+        return false;
+    };
+    [major, minor]
+        .iter()
+        .all(|part| (1..=2).contains(&part.len()) && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+pub struct EnsureRequest {
+    pub runtime_id: RuntimeId,
+    /// `None` for the default runtime, which is in the base `up -d`.
+    pub profile: Option<String>,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl EnsureRequest {
+    pub fn parse(
+        runtime_id: &str,
+        profile: Option<&str>,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        let StopRequest {
+            runtime_id,
+            request_id,
+            idempotency_key,
+        } = StopRequest::parse(runtime_id, request_id, key)?;
+        if profile.is_some_and(|p| !valid_profile(p)) {
+            return Err(RequestError::InvalidProfile);
+        }
+        Ok(Self {
+            runtime_id,
+            profile: profile.map(str::to_owned),
+            request_id,
+            idempotency_key,
+        })
+    }
+}
+
+/// The runtime pool a `stack.reloadWorkers` / `stack.flushFpc` targets.
+/// Same fields as a stop request.
+pub type RuntimeRequest = StopRequest;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReloadResult {
@@ -179,6 +252,39 @@ pub struct StopResult {
     pub completed_at_unix_secs: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureResult {
+    pub runtime_id: String,
+    pub service: String,
+    pub healthy_at_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeActionResult {
+    pub runtime_id: String,
+    pub service: String,
+    pub completed_at_unix_secs: u64,
+}
+
+/// How long `stack.ensureRuntime` waits for `healthy`, and how often it
+/// looks.
+#[derive(Clone, Copy, Debug)]
+pub struct HealthWait {
+    pub timeout: Duration,
+    pub interval: Duration,
+}
+
+impl HealthWait {
+    /// Covers the pool healthcheck's `start_period: 15s` plus a couple of
+    /// `interval: 30s` cycles on a slow host (the panel's own 90 s poll).
+    pub const PRODUCTION: Self = Self {
+        timeout: Duration::from_secs(90),
+        interval: Duration::from_secs(1),
+    };
+}
+
 pub struct Context<'a> {
     pub engine_state: &'a ManagedRoot,
     /// `EngineConfig::runtime_root`; one subdirectory per runtime pool.
@@ -187,12 +293,17 @@ pub struct Context<'a> {
     pub stack_dir: &'a Path,
     /// `docker` in production; a fixture path in tests.
     pub docker: &'a str,
+    pub health: HealthWait,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stage {
     Reload,
     Stop,
+    Up,
+    Probe,
+    ReloadWorkers,
+    FlushFpc,
 }
 
 impl Stage {
@@ -200,6 +311,10 @@ impl Stage {
         match self {
             Self::Reload => "the Caddy reload failed",
             Self::Stop => "the runtime pool could not be stopped",
+            Self::Up => "the runtime pool could not be started",
+            Self::Probe => "the runtime pool's health could not be read",
+            Self::ReloadWorkers => "the PHP workers could not be reloaded",
+            Self::FlushFpc => "the full-page cache could not be flushed",
         }
     }
 }
@@ -213,6 +328,9 @@ pub enum Error {
     ReplayInProgress,
     Run(Stage, process::ProcessRunError),
     Rejected(Stage, SubprocessDiagnostics),
+    /// The pool started but was not `healthy` within the health wait. The
+    /// last health status seen, if any.
+    Unhealthy(Option<String>),
     PostCommit(serde_json::Value),
     Replayed {
         code: ErrorCode,
@@ -247,6 +365,10 @@ impl Error {
                     ErrorCode::SubprocessFailed
                 },
                 stage.message().into(),
+            ),
+            Self::Unhealthy(_) => (
+                ErrorCode::Timeout,
+                "the runtime pool did not become healthy in time".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit(_) => {
@@ -320,6 +442,135 @@ pub fn stop_idle_runtime(
     )
 }
 
+pub fn ensure_runtime(
+    ctx: &Context<'_>,
+    req: &EnsureRequest,
+    cancel: &CancellationToken,
+) -> Result<EnsureResult, Error> {
+    run_admitted(
+        ctx,
+        ENSURE_OPERATION,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        || {
+            let service = runtime_service(&req.runtime_id);
+            let mut tail = Vec::new();
+            if let Some(profile) = &req.profile {
+                tail.extend(["--profile", profile.as_str()]);
+            }
+            tail.extend(["up", "-d", service.as_str()]);
+            compose(ctx, Stage::Up, &tail, UP_TIMEOUT, cancel)?;
+            wait_healthy(ctx, &service, cancel)?;
+            Ok(EnsureResult {
+                runtime_id: req.runtime_id.as_str().to_owned(),
+                service,
+                healthy_at_unix_secs: unix_now_secs(),
+            })
+        },
+    )
+}
+
+pub fn reload_workers(
+    ctx: &Context<'_>,
+    req: &RuntimeRequest,
+    cancel: &CancellationToken,
+) -> Result<RuntimeActionResult, Error> {
+    runtime_action(
+        ctx,
+        RELOAD_WORKERS_OPERATION,
+        Stage::ReloadWorkers,
+        req,
+        &["kill", "-USR2", "1"],
+        cancel,
+    )
+}
+
+pub fn flush_fpc(
+    ctx: &Context<'_>,
+    req: &RuntimeRequest,
+    cancel: &CancellationToken,
+) -> Result<RuntimeActionResult, Error> {
+    runtime_action(
+        ctx,
+        FLUSH_FPC_OPERATION,
+        Stage::FlushFpc,
+        req,
+        &["sh", "-c", FLUSH_FPC_SCRIPT],
+        cancel,
+    )
+}
+
+/// `exec -T runtime-<id> <command>` under the stack lock.
+fn runtime_action(
+    ctx: &Context<'_>,
+    operation: &'static str,
+    stage: Stage,
+    req: &RuntimeRequest,
+    command: &[&str],
+    cancel: &CancellationToken,
+) -> Result<RuntimeActionResult, Error> {
+    run_admitted(
+        ctx,
+        operation,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        || {
+            let service = runtime_service(&req.runtime_id);
+            let mut tail = vec!["exec", "-T", service.as_str()];
+            tail.extend_from_slice(command);
+            compose(ctx, stage, &tail, SIGNAL_TIMEOUT, cancel)?;
+            Ok(RuntimeActionResult {
+                runtime_id: req.runtime_id.as_str().to_owned(),
+                service,
+                completed_at_unix_secs: unix_now_secs(),
+            })
+        },
+    )
+}
+
+/// Polls `ps -q <service>` and the container's `.State.Health.Status` until
+/// it reads `healthy`. A container that is not created yet, or has no health
+/// status yet, is polled again rather than failed.
+fn wait_healthy(ctx: &Context<'_>, service: &str, cancel: &CancellationToken) -> Result<(), Error> {
+    let deadline = std::time::Instant::now() + ctx.health.timeout;
+    let mut last = None;
+    loop {
+        let id = compose(
+            ctx,
+            Stage::Probe,
+            &["ps", "-q", service],
+            PROBE_TIMEOUT,
+            cancel,
+        )?;
+        let id = id.trim();
+        if !id.is_empty() {
+            let status = docker(
+                ctx,
+                Stage::Probe,
+                &[
+                    "inspect",
+                    "-f",
+                    "{{if .State.Health}}{{.State.Health.Status}}{{end}}",
+                    id,
+                ],
+                PROBE_TIMEOUT,
+                cancel,
+            )?;
+            let status = status.trim();
+            if status == "healthy" {
+                return Ok(());
+            }
+            if !status.is_empty() {
+                last = Some(status.to_owned());
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::Unhealthy(last));
+        }
+        std::thread::sleep(ctx.health.interval);
+    }
+}
+
 /// Live exec configs in `runtime_root/<runtime id>/`. Staging and rollback
 /// files (`.tmp`, `.rollback-*`) are not imported by the pool's Caddy and do
 /// not count. A missing directory means no configs.
@@ -347,7 +598,7 @@ fn compose(
     tail: &[&str],
     timeout: Duration,
     cancel: &CancellationToken,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let mut argv = vec![
         "compose",
         "-p",
@@ -358,9 +609,20 @@ fn compose(
         "stack/docker-compose.yml",
     ];
     argv.extend_from_slice(tail);
+    docker(ctx, stage, &argv, timeout, cancel)
+}
+
+/// Runs `docker <argv>` in the stack directory and returns its stdout.
+fn docker(
+    ctx: &Context<'_>,
+    stage: Stage,
+    argv: &[&str],
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<String, Error> {
     let output = process::run(
         &ProcessRequest::new(ctx.docker)
-            .args(argv)
+            .args(argv.iter().copied())
             .current_dir(ctx.stack_dir),
         &ProcessLimits {
             timeout,
@@ -379,7 +641,7 @@ fn compose(
             SubprocessDiagnostics::from_output(ctx.docker, &output),
         ));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout.bytes).into_owned())
 }
 
 /// Stack lock, then this scope's preflight (lock + idempotency), then
@@ -525,6 +787,7 @@ mod tests {
         stack_dir: PathBuf,
         docker: String,
         calls: PathBuf,
+        health: PathBuf,
     }
 
     impl Fixture {
@@ -539,8 +802,13 @@ mod tests {
             fs::write(
                 &docker,
                 format!(
-                    "#!/bin/sh\necho \"$(pwd) $*\" >> '{}'\nexit {exit}\n",
-                    calls.display()
+                    "#!/bin/sh\necho \"$(pwd) $*\" >> '{calls}'\n\
+                     case \"$*\" in\n\
+                     *' ps -q '*) echo c0ffee ;;\n\
+                     inspect*) cat '{health}' 2>/dev/null || echo healthy ;;\n\
+                     esac\nexit {exit}\n",
+                    calls = calls.display(),
+                    health = base.join("health").display(),
                 ),
             )
             .unwrap();
@@ -550,6 +818,7 @@ mod tests {
                 runtime_root: TrustedRoot::parse(base.join("runtimes")).unwrap(),
                 stack_dir: base.join("stack"),
                 docker: docker.to_string_lossy().into_owned(),
+                health: base.join("health"),
                 calls,
                 _dir: dir,
             }
@@ -561,7 +830,15 @@ mod tests {
                 runtime_root: &self.runtime_root,
                 stack_dir: &self.stack_dir,
                 docker: &self.docker,
+                health: HealthWait {
+                    timeout: Duration::from_millis(200),
+                    interval: Duration::from_millis(20),
+                },
             }
+        }
+
+        fn health(&self, status: &str) {
+            fs::write(&self.health, format!("{status}\n")).unwrap();
         }
 
         fn calls(&self) -> Vec<String> {
@@ -742,6 +1019,167 @@ mod tests {
             Err(Error::StackBusy)
         ));
         assert!(fixture.calls().is_empty());
+    }
+
+    #[test]
+    fn ensure_starts_the_pool_under_its_profile_and_waits_for_healthy() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        let req = EnsureRequest::parse("fp1-php84", Some("php-8.4"), ID, Some("up-1")).unwrap();
+
+        let result = ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()).unwrap();
+        assert_eq!(result.service, "runtime-fp1-php84");
+        ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()).unwrap();
+
+        let prefix = compose_prefix(&fixture);
+        assert_eq!(
+            fixture.calls(),
+            vec![
+                format!("{prefix} --profile php-8.4 up -d runtime-fp1-php84"),
+                format!("{prefix} ps -q runtime-fp1-php84"),
+                format!(
+                    "{} inspect -f {{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{end}}}} \
+                     c0ffee",
+                    fixture.stack_dir.display()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ensure_without_a_profile_is_a_plain_up() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        let req = EnsureRequest::parse("fp1-php83", None, ID, None).unwrap();
+
+        ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            fixture.calls()[0],
+            format!("{} up -d runtime-fp1-php83", compose_prefix(&fixture))
+        );
+    }
+
+    #[test]
+    fn a_pool_that_never_turns_healthy_times_out_and_replays_as_one() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.health("starting");
+        let req = EnsureRequest::parse("fp1-php83", None, ID, Some("up-2")).unwrap();
+
+        let error =
+            ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()).unwrap_err();
+        assert!(matches!(&error, Error::Unhealthy(Some(status)) if status == "starting"));
+        assert_eq!(error.protocol().0, ErrorCode::Timeout);
+        let calls = fixture.calls().len();
+        assert!(calls > 3, "polled more than once: {calls}");
+        assert!(matches!(
+            ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()),
+            Err(Error::Replayed {
+                code: ErrorCode::Timeout,
+                ..
+            })
+        ));
+        assert_eq!(fixture.calls().len(), calls);
+    }
+
+    #[test]
+    fn a_failed_up_skips_the_health_wait() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(1);
+        let req = EnsureRequest::parse("fp1-php83", None, ID, None).unwrap();
+
+        let error =
+            ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()).unwrap_err();
+        assert!(matches!(error, Error::Rejected(Stage::Up, _)));
+        assert_eq!(error.protocol().0, ErrorCode::SubprocessFailed);
+        assert_eq!(fixture.calls().len(), 1);
+    }
+
+    #[test]
+    fn reload_workers_signals_pid_one_in_the_pool() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        let req = RuntimeRequest::parse("fp1-php84", ID, None).unwrap();
+
+        let result = reload_workers(&fixture.ctx(), &req, &CancellationToken::default()).unwrap();
+        assert_eq!(result.service, "runtime-fp1-php84");
+        assert_eq!(
+            fixture.calls(),
+            vec![format!(
+                "{} exec -T runtime-fp1-php84 kill -USR2 1",
+                compose_prefix(&fixture)
+            )]
+        );
+    }
+
+    #[test]
+    fn flush_fpc_runs_the_fixed_purge_in_the_pool() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        let req = RuntimeRequest::parse("fp1-php84", ID, None).unwrap();
+
+        flush_fpc(&fixture.ctx(), &req, &CancellationToken::default()).unwrap();
+        assert_eq!(
+            fixture.calls(),
+            vec![format!(
+                "{} exec -T runtime-fp1-php84 sh -c {FLUSH_FPC_SCRIPT}",
+                compose_prefix(&fixture)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_held_stack_lock_blocks_ensure_and_both_pool_actions() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        let stack_scope = crate::stack_deploy::open_scope(&fixture.state).unwrap();
+        let _held = crate::stack_deploy::acquire_stack_lock(
+            &stack_scope,
+            RequestId::parse(OTHER_ID).unwrap(),
+        )
+        .unwrap();
+        let cancel = CancellationToken::default();
+        let ensure = EnsureRequest::parse("fp1-php83", None, ID, None).unwrap();
+        let pool = RuntimeRequest::parse("fp1-php83", ID, None).unwrap();
+
+        assert!(matches!(
+            ensure_runtime(&fixture.ctx(), &ensure, &cancel),
+            Err(Error::StackBusy)
+        ));
+        assert!(matches!(
+            reload_workers(&fixture.ctx(), &pool, &cancel),
+            Err(Error::StackBusy)
+        ));
+        assert!(matches!(
+            flush_fpc(&fixture.ctx(), &pool, &cancel),
+            Err(Error::StackBusy)
+        ));
+        assert!(fixture.calls().is_empty());
+    }
+
+    #[test]
+    fn ensure_accepts_only_a_php_version_profile() {
+        for good in ["php-8.4", "php-10.12"] {
+            assert!(
+                EnsureRequest::parse("fp1-php84", Some(good), ID, None).is_ok(),
+                "{good}"
+            );
+        }
+        for bad in [
+            "",
+            "php-8",
+            "php-8.4.1",
+            "php-8.x",
+            "PHP-8.4",
+            "php-8.4 ",
+            "db",
+        ] {
+            assert_eq!(
+                EnsureRequest::parse("fp1-php84", Some(bad), ID, None).err(),
+                Some(RequestError::InvalidProfile),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
