@@ -29,13 +29,13 @@ use crate::{
     compose::COMPOSE_PROJECT,
     error::ErrorCode,
     filesystem::ManagedRoot,
-    ingress::{LIVE_CONFIG_PATH, ROUTE_EXTENSION},
+    ingress::{ConfigHash, HashGuard, LIVE_CONFIG_PATH, ROUTE_EXTENSION},
     mutation::preflight,
     process::{
         self, CancellationToken, ProcessLimits, ProcessRequest, ProcessTermination,
         SubprocessDiagnostics,
     },
-    site::{RuntimeId, SiteRelativePath, TrustedRoot},
+    site::{Domain, RuntimeId, SiteRelativePath, TrustedRoot},
     transaction::{
         IdempotencyKey, RequestId,
         audit::{self, AuditRecord},
@@ -48,6 +48,15 @@ pub const STOP_OPERATION: &str = "stack.stopIdleRuntime";
 pub const ENSURE_OPERATION: &str = "stack.ensureRuntime";
 pub const RELOAD_WORKERS_OPERATION: &str = "stack.reloadWorkers";
 pub const FLUSH_FPC_OPERATION: &str = "stack.flushFpc";
+pub const WRITE_SITE_SERVICE_OPERATION: &str = "stack.writeSiteService";
+pub const ACTIVATE_SITE_CONFIG_OPERATION: &str = "stack.activateSiteConfig";
+
+/// Where each pool sees its own `site_services_root/<runtime id>/` subtree,
+/// bind-mounted bare so the path is the same inside every pool. A site's
+/// own directory is `SITE_SERVICES_CONTAINER_ROOT/<domain>`; that is the
+/// `--config` base its `run` script and every `s6-svc` target use, and the
+/// directory `s6-svscanctl -a` rescans.
+pub const SITE_SERVICES_CONTAINER_ROOT: &str = "/etc/wcp/site-services";
 
 /// Engine-state scope for both operations. Separate from `stacks/wcp`,
 /// whose own preflight lock *is* the shared stack lock.
@@ -124,6 +133,9 @@ pub enum RequestError {
     InvalidProfile,
     InvalidRequestId,
     InvalidIdempotencyKey,
+    InvalidDomain,
+    InvalidPort,
+    InvalidPriorHash,
 }
 
 impl RequestError {
@@ -134,6 +146,9 @@ impl RequestError {
             Self::InvalidProfile => "profile must be php-<major>.<minor>",
             Self::InvalidRequestId => "request-id is not a canonical UUID",
             Self::InvalidIdempotencyKey => "idempotency-key is invalid",
+            Self::InvalidDomain => "domain is not a valid site domain",
+            Self::InvalidPort => "port must be a nonzero TCP port",
+            Self::InvalidPriorHash => "expected-prior-hash must be 64 hex digits",
         }
     }
 }
@@ -297,6 +312,10 @@ pub struct Context<'a> {
     pub engine_state: &'a ManagedRoot,
     /// `EngineConfig::runtime_root`; one subdirectory per runtime pool.
     pub runtime_root: &'a TrustedRoot,
+    /// `EngineConfig::site_services_root` (`/etc/wcp/site-services`): one
+    /// `<runtime id>/<domain>/` directory per site. The host side of the
+    /// bind mount each pool sees at `SITE_SERVICES_CONTAINER_ROOT`.
+    pub site_services_root: &'a TrustedRoot,
     /// The managed stack directory (`~/compose/wp-stack`).
     pub stack_dir: &'a Path,
     /// `docker` in production; a fixture path in tests.
@@ -312,6 +331,10 @@ pub enum Stage {
     Probe,
     ReloadWorkers,
     FlushFpc,
+    ScanService,
+    ValidateConfig,
+    RestartService,
+    SiteProbe,
 }
 
 impl Stage {
@@ -323,6 +346,10 @@ impl Stage {
             Self::Probe => "the runtime pool's health could not be read",
             Self::ReloadWorkers => "the PHP workers could not be reloaded",
             Self::FlushFpc => "the full-page cache could not be flushed",
+            Self::ScanService => "the site service could not be registered with s6",
+            Self::ValidateConfig => "the site's Caddy config is invalid",
+            Self::RestartService => "the site process could not be restarted",
+            Self::SiteProbe => "the site process did not become ready",
         }
     }
 }
@@ -339,6 +366,17 @@ pub enum Error {
     /// The pool started but was not `healthy` within the health wait. The
     /// last health status seen, if any.
     Unhealthy(Option<String>),
+    /// `activateSiteConfig`'s `expected-prior-hash` did not match the file
+    /// currently on disk; nothing was changed.
+    HashMismatch,
+    /// The new site config was staged and swapped in, but the restarted
+    /// process never answered its readiness probe. The previous config was
+    /// restored and the process brought back up on it.
+    SiteRolledBack,
+    /// The site probe (or the new-config restart) failed *and* restoring the
+    /// previous config also failed. The site is left down and needs manual
+    /// recovery.
+    SiteRecoveryFailed,
     PostCommit(serde_json::Value),
     Replayed {
         code: ErrorCode,
@@ -367,8 +405,10 @@ impl Error {
                     ErrorCode::Timeout
                 } else if diagnostics.cancelled {
                     ErrorCode::Cancelled
-                } else if *stage == Stage::Reload {
+                } else if matches!(stage, Stage::Reload | Stage::RestartService) {
                     ErrorCode::ConfigReloadFailed
+                } else if *stage == Stage::ValidateConfig {
+                    ErrorCode::ConfigValidationFailed
                 } else {
                     ErrorCode::SubprocessFailed
                 },
@@ -377,6 +417,18 @@ impl Error {
             Self::Unhealthy(_) => (
                 ErrorCode::Timeout,
                 "the runtime pool did not become healthy in time".into(),
+            ),
+            Self::HashMismatch => (
+                ErrorCode::ConfigHashMismatch,
+                "the site config changed since it was read".into(),
+            ),
+            Self::SiteRolledBack => (
+                ErrorCode::ConfigReloadFailed,
+                "the site process did not become ready; the previous config was restored".into(),
+            ),
+            Self::SiteRecoveryFailed => (
+                ErrorCode::ConfigRecoveryFailed,
+                "the site process failed and restoring the previous config also failed".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit(_) => {
@@ -534,6 +586,524 @@ fn runtime_action(
             })
         },
     )
+}
+
+// ===================== site-service lifecycle (051) =====================
+//
+// `stack.writeSiteService` and `stack.activateSiteConfig`: the per-site s6
+// service directory and its dedicated FrankenPHP child's config, which the
+// control panel used to write and reload over raw SSH against the pool's
+// Compose project (`runtime_pool::site_identity`/`activation`). Both reuse
+// this module's shared `stacks/wcp` lock, `stack-service` scope, `compose`
+// exec and the `Context` the pool operations already run under. File writes
+// go through `site_services_root` (a `ManagedRoot`), the container-side
+// `s6-svc`/`s6-svscanctl`/`caddy validate`/`curl` go through `compose`.
+
+/// A site's own directory inside its pool (`SITE_SERVICES_CONTAINER_ROOT/
+/// <domain>`): the `--config` base its `run` script and `s6-svc` targets
+/// use, and what `s6-svscanctl -a` rescans.
+fn container_dir(domain: &Domain) -> String {
+    format!("{SITE_SERVICES_CONTAINER_ROOT}/{domain}")
+}
+
+/// `site_services_root`-relative path of one of a site's service files, or
+/// the directory itself when `file` is empty.
+fn service_rel(runtime_id: &RuntimeId, domain: &Domain, file: &str) -> SiteRelativePath {
+    let path = if file.is_empty() {
+        format!("{runtime_id}/{domain}")
+    } else {
+        format!("{runtime_id}/{domain}/{file}")
+    };
+    SiteRelativePath::parse(path).expect("validated runtime id and domain form a valid path")
+}
+
+/// Ported verbatim from the control panel's
+/// `sites::build_site_process_caddyfile` so the engine, not the panel, is
+/// the single generator of this file's bytes (brief decision 3).
+fn site_process_caddyfile(
+    domain: &Domain,
+    runtime_id: &RuntimeId,
+    port: u16,
+    root: &str,
+    worker_mode: bool,
+    worker_count: i64,
+) -> String {
+    let mut lines: Vec<String> = vec![
+        "{".into(),
+        "    admin off".into(),
+        "}".into(),
+        String::new(),
+    ];
+    lines.push(format!("http://127.0.0.1:{port} {{"));
+    lines.push(format!("    root * {root}"));
+    lines.push("    encode zstd gzip".into());
+    if worker_mode {
+        lines.push("    frankenphp {".into());
+        lines.push(format!("        worker {root}/index.php {worker_count}"));
+        lines.push("    }".into());
+    }
+    lines.push(String::new());
+    lines.push("    @static {".into());
+    lines.push("        file".into());
+    lines.push(
+        "        path *.css *.js *.png *.jpg *.jpeg *.gif *.webp *.avif *.svg *.woff *.woff2 *.ico"
+            .into(),
+    );
+    lines.push("    }".into());
+    lines.push("    header @static Cache-Control \"public, max-age=31536000, immutable\"".into());
+    lines.push("    header @static Vary Accept-Encoding".into());
+    lines.push(String::new());
+    lines.push("    php_server".into());
+    lines.push(String::new());
+    lines.push("    log {".into());
+    lines.push(format!(
+        "        output file /var/log/caddy/runtime-{runtime_id}-{domain}.log {{"
+    ));
+    lines.push("            mode 0600".into());
+    lines.push("        }".into());
+    lines.push("        format json".into());
+    lines.push("    }".into());
+    lines.push("    log_append request_id {http.request.header.X-Request-ID}".into());
+    lines.push(format!("    log_append domain {domain}"));
+    lines.push(format!("    log_append runtime_id {runtime_id}"));
+    lines.push("}".into());
+    lines.join("\n")
+}
+
+/// Ported from the panel's `build_site_run_script`: drops privileges to the
+/// site's UID/GID and execs its own FrankenPHP child.
+fn site_run_script(uid: u32, gid: u32, container_dir: &str) -> String {
+    format!(
+        "#!/bin/sh\nexport PHP_INI_SCAN_DIR=\"/usr/local/etc/php/conf.d:{container_dir}\"\nexec setpriv --reuid={uid} --regid={gid} --clear-groups \\\n    frankenphp run --config {container_dir}/Caddyfile --adapter caddyfile\n"
+    )
+}
+
+/// Ported from the panel's `build_site_open_basedir_ini`.
+fn site_open_basedir_ini(root: &str) -> String {
+    format!(
+        "; Managed by Website Control Panel - do not edit manually\nopen_basedir = {root}:/tmp:/var/tmp:/run/valkey/valkey.sock\n"
+    )
+}
+
+/// The identity a site's config carries: its loopback port, document root
+/// and FrankenPHP worker settings. Shared by both site operations.
+pub struct SiteConfig {
+    pub port: u16,
+    pub root: String,
+    pub worker_mode: bool,
+    pub worker_count: i64,
+}
+
+fn parse_site_config(
+    port: u16,
+    root: String,
+    worker_mode: bool,
+    worker_count: i64,
+) -> Result<SiteConfig, RequestError> {
+    if port == 0 {
+        return Err(RequestError::InvalidPort);
+    }
+    Ok(SiteConfig {
+        port,
+        root,
+        worker_mode,
+        worker_count,
+    })
+}
+
+pub struct WriteSiteServiceRequest {
+    pub runtime_id: RuntimeId,
+    pub domain: Domain,
+    pub uid: u32,
+    pub gid: u32,
+    pub config: SiteConfig,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl WriteSiteServiceRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse(
+        runtime_id: &str,
+        domain: &str,
+        uid: u32,
+        gid: u32,
+        port: u16,
+        root: String,
+        worker_mode: bool,
+        worker_count: i64,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        let runtime_id =
+            RuntimeId::parse(runtime_id).map_err(|_| RequestError::InvalidRuntimeId)?;
+        let domain = Domain::parse(domain).map_err(|_| RequestError::InvalidDomain)?;
+        let (request_id, idempotency_key) = parse_ids(request_id, key)?;
+        Ok(Self {
+            runtime_id,
+            domain,
+            uid,
+            gid,
+            config: parse_site_config(port, root, worker_mode, worker_count)?,
+            request_id,
+            idempotency_key,
+        })
+    }
+}
+
+pub struct ActivateSiteConfigRequest {
+    pub runtime_id: RuntimeId,
+    pub domain: Domain,
+    /// The site process's loopback port, for the readiness probe.
+    pub port: u16,
+    /// The document root, for regenerating `open-basedir.ini` (which is
+    /// never edited textually, only derived from the root).
+    pub root: String,
+    /// The complete new `Caddyfile`, opaque to the engine: the panel edits
+    /// this file textually (error pages, PHP settings), so it cannot be
+    /// regenerated from typed parameters. Validated inside the pool before
+    /// it can take effect.
+    pub caddyfile: String,
+    /// The precondition the swap runs under: `Absent` for a first write,
+    /// `Sha256` of what the caller last read otherwise.
+    pub guard: HashGuard,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl ActivateSiteConfigRequest {
+    #[allow(clippy::too_many_arguments)]
+    pub fn parse(
+        runtime_id: &str,
+        domain: &str,
+        port: u16,
+        root: String,
+        caddyfile: String,
+        expected_prior_hash: Option<&str>,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        let runtime_id =
+            RuntimeId::parse(runtime_id).map_err(|_| RequestError::InvalidRuntimeId)?;
+        let domain = Domain::parse(domain).map_err(|_| RequestError::InvalidDomain)?;
+        if port == 0 {
+            return Err(RequestError::InvalidPort);
+        }
+        let guard = match expected_prior_hash {
+            None => HashGuard::Absent,
+            Some(value) => HashGuard::Sha256(
+                ConfigHash::parse(value).map_err(|_| RequestError::InvalidPriorHash)?,
+            ),
+        };
+        let (request_id, idempotency_key) = parse_ids(request_id, key)?;
+        Ok(Self {
+            runtime_id,
+            domain,
+            port,
+            root,
+            caddyfile,
+            guard,
+            request_id,
+            idempotency_key,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SiteServiceResult {
+    pub runtime_id: String,
+    pub domain: String,
+    pub completed_at_unix_secs: u64,
+}
+
+fn site_result(runtime_id: &RuntimeId, domain: &Domain) -> SiteServiceResult {
+    SiteServiceResult {
+        runtime_id: runtime_id.as_str().to_owned(),
+        domain: domain.as_str().to_owned(),
+        completed_at_unix_secs: unix_now_secs(),
+    }
+}
+
+/// Writes (or overwrites) one site's s6 service directory — `run` script,
+/// dedicated `Caddyfile` and `open-basedir.ini` — then makes the running
+/// `s6-svscan` pick the directory up. No restart or readiness probe: this
+/// is site creation/migration, where the process has not served yet.
+pub fn write_site_service(
+    ctx: &Context<'_>,
+    req: &WriteSiteServiceRequest,
+    cancel: &CancellationToken,
+) -> Result<SiteServiceResult, Error> {
+    run_admitted(
+        ctx,
+        WRITE_SITE_SERVICE_OPERATION,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        || {
+            let root = ManagedRoot::open(ctx.site_services_root).map_err(Error::Io)?;
+            root.create_dir_all(&service_rel(&req.runtime_id, &req.domain, ""))
+                .map_err(Error::Io)?;
+            let cdir = container_dir(&req.domain);
+            root.write_new_executable(
+                &service_rel(&req.runtime_id, &req.domain, "run"),
+                site_run_script(req.uid, req.gid, &cdir).as_bytes(),
+            )
+            .or_else(|error| {
+                // `write_new_executable` fails if `run` already exists
+                // (create-new); a rewrite overwrites it atomically instead.
+                if error.kind() == io::ErrorKind::AlreadyExists {
+                    overwrite_executable(
+                        &root,
+                        &service_rel(&req.runtime_id, &req.domain, "run"),
+                        site_run_script(req.uid, req.gid, &cdir).as_bytes(),
+                    )
+                } else {
+                    Err(error)
+                }
+            })
+            .map_err(Error::Io)?;
+            root.write_atomic(
+                &service_rel(&req.runtime_id, &req.domain, "open-basedir.ini"),
+                site_open_basedir_ini(&req.config.root).as_bytes(),
+            )
+            .map_err(Error::Io)?;
+            root.write_atomic(
+                &service_rel(&req.runtime_id, &req.domain, "Caddyfile"),
+                site_process_caddyfile(
+                    &req.domain,
+                    &req.runtime_id,
+                    req.config.port,
+                    &req.config.root,
+                    req.config.worker_mode,
+                    req.config.worker_count,
+                )
+                .as_bytes(),
+            )
+            .map_err(Error::Io)?;
+            scan_services(ctx, &req.runtime_id, cancel)?;
+            Ok(site_result(&req.runtime_id, &req.domain))
+        },
+    )
+}
+
+/// Regenerates a site's `Caddyfile` (and `open-basedir.ini`) from typed
+/// parameters, validates the new `Caddyfile` inside the pool, swaps it in
+/// atomically, restarts the site process and waits for it to answer. If the
+/// restarted process never becomes ready the previous files are restored and
+/// the process is brought back up on them (brief decision 2).
+pub fn activate_site_config(
+    ctx: &Context<'_>,
+    req: &ActivateSiteConfigRequest,
+    cancel: &CancellationToken,
+) -> Result<SiteServiceResult, Error> {
+    run_admitted(
+        ctx,
+        ACTIVATE_SITE_CONFIG_OPERATION,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        || {
+            let root = ManagedRoot::open(ctx.site_services_root).map_err(Error::Io)?;
+            let caddy_rel = service_rel(&req.runtime_id, &req.domain, "Caddyfile");
+            let basedir_rel = service_rel(&req.runtime_id, &req.domain, "open-basedir.ini");
+            let tmp_rel = service_rel(&req.runtime_id, &req.domain, "Caddyfile.tmp");
+
+            // Hash-guard the file currently on disk before touching anything.
+            let prior_caddy = read_optional(&root, &caddy_rel)?;
+            if !req.guard.is_satisfied_by(prior_caddy.as_deref()) {
+                return Err(Error::HashMismatch);
+            }
+            let prior_basedir = read_optional(&root, &basedir_rel)?;
+
+            // The Caddyfile is the caller's opaque, validated-in-container
+            // content; open-basedir is derived from the root.
+            let new_caddy = req.caddyfile.clone();
+            let new_basedir = site_open_basedir_ini(&req.root);
+
+            // Stage the new Caddyfile next to the live one and validate it
+            // inside the pool before it can take effect. A `.tmp` sibling is
+            // not loaded by the running process.
+            root.write_atomic(&tmp_rel, new_caddy.as_bytes())
+                .map_err(Error::Io)?;
+            let cdir = container_dir(&req.domain);
+            if let Err(error) = validate_site_config(ctx, &req.runtime_id, &cdir, cancel) {
+                let _ = root.remove_file(&tmp_rel);
+                return Err(error);
+            }
+
+            // Commit: swap the validated Caddyfile in and refresh the ini.
+            root.rename(&tmp_rel, &caddy_rel).map_err(Error::Io)?;
+            root.write_atomic(&basedir_rel, new_basedir.as_bytes())
+                .map_err(Error::Io)?;
+
+            // Restart the child and probe it. Any failure rolls both files
+            // back to what was on disk and restarts on the old config.
+            let outcome = restart_service(ctx, &req.runtime_id, &cdir, cancel)
+                .and_then(|()| site_probe(ctx, &req.runtime_id, req.port, cancel));
+            match outcome {
+                Ok(()) => Ok(site_result(&req.runtime_id, &req.domain)),
+                Err(_down) => Err(restore_site(
+                    &root,
+                    ctx,
+                    req,
+                    &caddy_rel,
+                    &basedir_rel,
+                    &cdir,
+                    prior_caddy.as_deref(),
+                    prior_basedir.as_deref(),
+                    cancel,
+                )),
+            }
+        },
+    )
+}
+
+/// Overwrites an existing file atomically and marks it executable, matching
+/// `write_new_executable`'s result for a path that already exists.
+fn overwrite_executable(
+    root: &ManagedRoot,
+    path: &SiteRelativePath,
+    contents: &[u8],
+) -> io::Result<()> {
+    root.write_atomic(path, contents)?;
+    root.set_mode(path, 0o755)
+}
+
+fn read_optional(root: &ManagedRoot, path: &SiteRelativePath) -> Result<Option<Vec<u8>>, Error> {
+    match root.read_bytes(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(Error::Io(error)),
+    }
+}
+
+/// `s6-svscanctl -a` with the same bounded retry the panel used: a freshly
+/// started pool's nested `s6-svscan` may not have its control FIFO yet.
+fn scan_services(
+    ctx: &Context<'_>,
+    runtime_id: &RuntimeId,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let service = runtime_service(runtime_id);
+    let script = format!(
+        "i=0; while [ \"$i\" -lt 10 ]; do s6-svscanctl -a {SITE_SERVICES_CONTAINER_ROOT} && exit 0; i=$((i+1)); sleep 0.3; done; exit 1"
+    );
+    compose(
+        ctx,
+        Stage::ScanService,
+        &["exec", "-T", &service, "sh", "-c", &script],
+        SIGNAL_TIMEOUT,
+        cancel,
+    )?;
+    Ok(())
+}
+
+fn validate_site_config(
+    ctx: &Context<'_>,
+    runtime_id: &RuntimeId,
+    container_dir: &str,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let service = runtime_service(runtime_id);
+    let config = format!("{container_dir}/Caddyfile.tmp");
+    compose(
+        ctx,
+        Stage::ValidateConfig,
+        &[
+            "exec",
+            "-T",
+            &service,
+            "caddy",
+            "validate",
+            "--config",
+            &config,
+            "--adapter",
+            "caddyfile",
+        ],
+        RELOAD_TIMEOUT,
+        cancel,
+    )?;
+    Ok(())
+}
+
+/// `s6-svc -r <dir>`: restart the site's supervised FrankenPHP child so a
+/// config change takes effect.
+fn restart_service(
+    ctx: &Context<'_>,
+    runtime_id: &RuntimeId,
+    container_dir: &str,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let service = runtime_service(runtime_id);
+    compose(
+        ctx,
+        Stage::RestartService,
+        &["exec", "-T", &service, "s6-svc", "-r", container_dir],
+        SIGNAL_TIMEOUT,
+        cancel,
+    )?;
+    Ok(())
+}
+
+/// The readiness probe the panel ran: up to 20 one-second tries for any
+/// HTTP status on the site's loopback port.
+fn site_probe(
+    ctx: &Context<'_>,
+    runtime_id: &RuntimeId,
+    port: u16,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let service = runtime_service(runtime_id);
+    let probe = format!(
+        "i=0; while [ \"$i\" -lt 20 ]; do code=$(curl -s -o /dev/null -w '%{{http_code}}' -H 'Host: 127.0.0.1' http://127.0.0.1:{port}/ || true); [ \"$code\" != 000 ] && exit 0; i=$((i+1)); sleep 1; done; exit 1"
+    );
+    compose(
+        ctx,
+        Stage::SiteProbe,
+        &["exec", "-T", &service, "sh", "-c", &probe],
+        UP_TIMEOUT,
+        cancel,
+    )?;
+    Ok(())
+}
+
+/// Restores the previous `Caddyfile`/`open-basedir.ini` (or removes a file
+/// that had none) and restarts the child on the old config. Maps to
+/// `SiteRolledBack` on success, `SiteRecoveryFailed` if the restore itself
+/// fails.
+#[allow(clippy::too_many_arguments)]
+fn restore_site(
+    root: &ManagedRoot,
+    ctx: &Context<'_>,
+    req: &ActivateSiteConfigRequest,
+    caddy_rel: &SiteRelativePath,
+    basedir_rel: &SiteRelativePath,
+    container_dir: &str,
+    prior_caddy: Option<&[u8]>,
+    prior_basedir: Option<&[u8]>,
+    cancel: &CancellationToken,
+) -> Error {
+    let restore = |path: &SiteRelativePath, prior: Option<&[u8]>| -> io::Result<()> {
+        match prior {
+            Some(bytes) => root.write_atomic(path, bytes),
+            None => match root.remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        }
+    };
+    if restore(caddy_rel, prior_caddy).is_err() || restore(basedir_rel, prior_basedir).is_err() {
+        return Error::SiteRecoveryFailed;
+    }
+    // Only a prior config can be restarted into; a rolled-back first write
+    // leaves nothing to run, so skip the restart there. No re-probe: the
+    // restored config is the one that was serving before this request.
+    if prior_caddy.is_some()
+        && restart_service(ctx, &req.runtime_id, container_dir, cancel).is_err()
+    {
+        return Error::SiteRecoveryFailed;
+    }
+    Error::SiteRolledBack
 }
 
 /// Polls `ps -q <service>` and the container's `.State.Health.Status` until
@@ -792,6 +1362,7 @@ mod tests {
         _dir: tempfile::TempDir,
         state: ManagedRoot,
         runtime_root: TrustedRoot,
+        site_services_root: TrustedRoot,
         stack_dir: PathBuf,
         docker: String,
         calls: PathBuf,
@@ -802,7 +1373,7 @@ mod tests {
         fn new(exit: i32) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let base = dir.path().canonicalize().unwrap();
-            for sub in ["state", "runtimes", "stack"] {
+            for sub in ["state", "runtimes", "site-services", "stack"] {
                 fs::create_dir(base.join(sub)).unwrap();
             }
             let calls = base.join("calls.log");
@@ -824,6 +1395,7 @@ mod tests {
             Self {
                 state: ManagedRoot::open(&TrustedRoot::parse(base.join("state")).unwrap()).unwrap(),
                 runtime_root: TrustedRoot::parse(base.join("runtimes")).unwrap(),
+                site_services_root: TrustedRoot::parse(base.join("site-services")).unwrap(),
                 stack_dir: base.join("stack"),
                 docker: docker.to_string_lossy().into_owned(),
                 health: base.join("health"),
@@ -836,6 +1408,7 @@ mod tests {
             Context {
                 engine_state: &self.state,
                 runtime_root: &self.runtime_root,
+                site_services_root: &self.site_services_root,
                 stack_dir: &self.stack_dir,
                 docker: &self.docker,
                 health: HealthWait {
@@ -862,6 +1435,376 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             fs::write(dir.join(name), "example.com {\n}\n").unwrap();
         }
+
+        /// Rewrites the fake `docker` so it exits 1 only when its arguments
+        /// contain `marker`, and 0 otherwise — the one knob the shared
+        /// single-exit fixture lacks, used to fail just the readiness probe.
+        fn fail_on(&self, marker: &str) {
+            fs::write(
+                &self.docker,
+                format!(
+                    "#!/bin/sh\necho \"$(pwd) $*\" >> '{calls}'\n\
+                     case \"$*\" in *'{marker}'*) exit 1 ;; esac\nexit 0\n",
+                    calls = self.calls.display(),
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&self.docker, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        fn seed_dir(&self, runtime_id: &str, domain: &str) {
+            fs::create_dir_all(
+                self.site_services_root
+                    .as_path()
+                    .join(runtime_id)
+                    .join(domain),
+            )
+            .unwrap();
+        }
+
+        fn service_file(&self, runtime_id: &str, domain: &str, name: &str) -> String {
+            fs::read_to_string(
+                self.site_services_root
+                    .as_path()
+                    .join(runtime_id)
+                    .join(domain)
+                    .join(name),
+            )
+            .unwrap()
+        }
+    }
+
+    fn write_req(id: &str, key: Option<&str>) -> WriteSiteServiceRequest {
+        WriteSiteServiceRequest::parse(
+            "fp1-php83",
+            "example.test",
+            10123,
+            10123,
+            9000,
+            "/var/www/example".into(),
+            true,
+            2,
+            id,
+            key,
+        )
+        .unwrap()
+    }
+
+    fn sample_caddyfile(port: u16) -> String {
+        site_process_caddyfile(
+            &Domain::parse("example.test").unwrap(),
+            &RuntimeId::parse("fp1-php83").unwrap(),
+            port,
+            "/var/www/example",
+            true,
+            2,
+        )
+    }
+
+    fn activate_req(hash: Option<&str>, id: &str, key: Option<&str>) -> ActivateSiteConfigRequest {
+        ActivateSiteConfigRequest::parse(
+            "fp1-php83",
+            "example.test",
+            9000,
+            "/var/www/example".into(),
+            sample_caddyfile(9000),
+            hash,
+            id,
+            key,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn write_site_service_writes_the_three_files_and_scans_once() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+
+        let result = write_site_service(
+            &fixture.ctx(),
+            &write_req(ID, Some("ws-1")),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(result.domain, "example.test");
+        // A retried request replays without writing or scanning twice.
+        write_site_service(
+            &fixture.ctx(),
+            &write_req(ID, Some("ws-1")),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        let run = fixture.service_file("fp1-php83", "example.test", "run");
+        assert!(run.starts_with("#!/bin/sh\n"));
+        assert!(run.contains("setpriv --reuid=10123 --regid=10123"));
+        assert!(run.contains("--config /etc/wcp/site-services/example.test/Caddyfile"));
+        let caddy = fixture.service_file("fp1-php83", "example.test", "Caddyfile");
+        assert!(caddy.contains("http://127.0.0.1:9000 {"));
+        assert!(caddy.contains("root * /var/www/example"));
+        assert!(caddy.contains("worker /var/www/example/index.php 2"));
+        let ini = fixture.service_file("fp1-php83", "example.test", "open-basedir.ini");
+        assert!(ini.contains("open_basedir = /var/www/example:/tmp"));
+        assert_eq!(
+            fixture.calls(),
+            vec![format!(
+                "{} exec -T runtime-fp1-php83 sh -c i=0; while [ \"$i\" -lt 10 ]; do \
+                 s6-svscanctl -a /etc/wcp/site-services && exit 0; i=$((i+1)); sleep 0.3; done; \
+                 exit 1",
+                compose_prefix(&fixture)
+            )]
+        );
+    }
+
+    #[test]
+    fn write_site_service_overwrites_an_existing_run_script() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        write_site_service(
+            &fixture.ctx(),
+            &write_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        // A second, distinct request over the same directory must not fail
+        // on the already-present `run` file.
+        write_site_service(
+            &fixture.ctx(),
+            &write_req(OTHER_ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(
+            fixture
+                .service_file("fp1-php83", "example.test", "run")
+                .contains("setpriv")
+        );
+    }
+
+    #[test]
+    fn activate_validates_swaps_restarts_and_probes_in_order() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.seed_dir("fp1-php83", "example.test");
+
+        activate_site_config(
+            &fixture.ctx(),
+            &activate_req(None, ID, Some("act-1")),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+
+        let prefix = compose_prefix(&fixture);
+        let calls = fixture.calls();
+        assert_eq!(
+            calls[0],
+            format!(
+                "{prefix} exec -T runtime-fp1-php83 caddy validate --config \
+                 /etc/wcp/site-services/example.test/Caddyfile.tmp --adapter caddyfile"
+            )
+        );
+        assert_eq!(
+            calls[1],
+            format!(
+                "{prefix} exec -T runtime-fp1-php83 s6-svc -r \
+                 /etc/wcp/site-services/example.test"
+            )
+        );
+        assert!(calls[2].contains("curl -s -o /dev/null"), "{}", calls[2]);
+        // The validated Caddyfile is live and no staging file is left behind.
+        assert!(
+            fixture
+                .service_file("fp1-php83", "example.test", "Caddyfile")
+                .contains("http://127.0.0.1:9000 {")
+        );
+        assert!(
+            !fixture
+                .site_services_root
+                .as_path()
+                .join("fp1-php83/example.test/Caddyfile.tmp")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn activate_rejects_a_stale_prior_hash_before_touching_docker() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.site_config("ignored", "x"); // unrelated
+        // Seed a live Caddyfile, then present a wrong expected hash.
+        write_site_service(
+            &fixture.ctx(),
+            &write_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        fs::read_to_string(&fixture.calls).ok();
+        fs::write(&fixture.calls, "").unwrap();
+
+        let bad = ConfigHash::of(b"something else");
+        let error = activate_site_config(
+            &fixture.ctx(),
+            &activate_req(Some(bad.as_str()), OTHER_ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::HashMismatch));
+        assert_eq!(error.protocol().0, ErrorCode::ConfigHashMismatch);
+        assert!(fixture.calls().is_empty());
+    }
+
+    #[test]
+    fn activate_absent_guard_refuses_an_existing_file() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        write_site_service(
+            &fixture.ctx(),
+            &write_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        fs::write(&fixture.calls, "").unwrap();
+
+        let error = activate_site_config(
+            &fixture.ctx(),
+            &activate_req(None, OTHER_ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::HashMismatch));
+    }
+
+    #[test]
+    fn an_invalid_new_config_removes_the_staging_file_and_fails() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.seed_dir("fp1-php83", "example.test");
+        fixture.fail_on("caddy validate");
+
+        let error = activate_site_config(
+            &fixture.ctx(),
+            &activate_req(None, ID, Some("act-bad")),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Rejected(Stage::ValidateConfig, _)));
+        assert_eq!(error.protocol().0, ErrorCode::ConfigValidationFailed);
+        assert!(
+            !fixture
+                .site_services_root
+                .as_path()
+                .join("fp1-php83/example.test/Caddyfile.tmp")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn a_probe_failure_restores_the_previous_config_and_restarts_it() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        // Seed a known-good live config to roll back to.
+        let prior = write_req(ID, None);
+        write_site_service(&fixture.ctx(), &prior, &CancellationToken::default()).unwrap();
+        let live = fixture.service_file("fp1-php83", "example.test", "Caddyfile");
+        let live_hash = ConfigHash::of(live.as_bytes());
+        // A newer activation whose restarted process never answers.
+        fixture.fail_on("http_code");
+        fs::write(&fixture.calls, "").unwrap();
+
+        let req = ActivateSiteConfigRequest::parse(
+            "fp1-php83",
+            "example.test",
+            9100, // a changed port, so the file content differs
+            "/var/www/example".into(),
+            sample_caddyfile(9100),
+            Some(live_hash.as_str()),
+            OTHER_ID,
+            None,
+        )
+        .unwrap();
+        let error =
+            activate_site_config(&fixture.ctx(), &req, &CancellationToken::default()).unwrap_err();
+        assert!(matches!(error, Error::SiteRolledBack));
+        assert_eq!(error.protocol().0, ErrorCode::ConfigReloadFailed);
+        // The live Caddyfile is byte-for-byte the previous one again.
+        assert_eq!(
+            fixture.service_file("fp1-php83", "example.test", "Caddyfile"),
+            live
+        );
+        // validate, restart(new), probe(fail), restart(restored).
+        let restarts = fixture
+            .calls()
+            .iter()
+            .filter(|c| c.contains("s6-svc -r"))
+            .count();
+        assert_eq!(restarts, 2);
+    }
+
+    #[test]
+    fn a_held_stack_lock_blocks_a_site_write_before_docker_runs() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        let stack_scope = crate::stack_deploy::open_scope(&fixture.state).unwrap();
+        let _held = crate::stack_deploy::acquire_stack_lock(
+            &stack_scope,
+            RequestId::parse(OTHER_ID).unwrap(),
+        )
+        .unwrap();
+
+        let error = write_site_service(
+            &fixture.ctx(),
+            &write_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::StackBusy));
+        assert!(fixture.calls().is_empty());
+    }
+
+    #[test]
+    fn site_requests_reject_malformed_fields() {
+        assert_eq!(
+            ActivateSiteConfigRequest::parse(
+                "fp1-php83",
+                "example.test",
+                0,
+                "/r".into(),
+                "x {}".into(),
+                None,
+                ID,
+                None
+            )
+            .err(),
+            Some(RequestError::InvalidPort)
+        );
+        assert_eq!(
+            ActivateSiteConfigRequest::parse(
+                "fp1-php83",
+                "-bad.test",
+                80,
+                "/r".into(),
+                "x {}".into(),
+                None,
+                ID,
+                None
+            )
+            .err(),
+            Some(RequestError::InvalidDomain)
+        );
+        assert_eq!(
+            ActivateSiteConfigRequest::parse(
+                "fp1-php83",
+                "example.test",
+                80,
+                "/r".into(),
+                "x {}".into(),
+                Some("zz"),
+                ID,
+                None
+            )
+            .err(),
+            Some(RequestError::InvalidPriorHash)
+        );
     }
 
     fn compose_prefix(fixture: &Fixture) -> String {

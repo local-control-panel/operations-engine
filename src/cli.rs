@@ -886,6 +886,63 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Write one site's s6 service directory (run script, dedicated
+    /// Caddyfile and open-basedir.ini) under `siteServicesRoot` and
+    /// register it with the pool's s6-svscan, under the shared stack lock.
+    WriteSiteService {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "domain")]
+        domain: String,
+        /// The site's dedicated UID the run script drops privileges to.
+        #[arg(long = "uid")]
+        uid: u32,
+        #[arg(long = "gid")]
+        gid: u32,
+        /// The site process's loopback port.
+        #[arg(long = "port")]
+        port: u16,
+        /// The site's document root inside the container.
+        #[arg(long = "root")]
+        root: String,
+        /// Enable FrankenPHP worker mode for this site (`true`/`false`).
+        #[arg(long = "worker-mode", action = clap::ArgAction::Set)]
+        worker_mode: bool,
+        #[arg(long = "worker-count", default_value_t = 0)]
+        worker_count: i64,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Regenerate one site's Caddyfile (and open-basedir.ini) from typed
+    /// parameters, validate it inside the pool, swap it in, restart the
+    /// site process and probe it — restoring the previous config if the
+    /// restarted process never becomes ready. Under the shared stack lock.
+    ActivateSiteConfig {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "domain")]
+        domain: String,
+        #[arg(long = "port")]
+        port: u16,
+        /// The document root, used to regenerate `open-basedir.ini`.
+        #[arg(long = "root")]
+        root: String,
+        /// Root-owned file holding the complete new Caddyfile contents
+        /// (the panel edits this file textually, so it is opaque here and
+        /// validated inside the pool before it can take effect).
+        #[arg(long = "content-file")]
+        content_file: PathBuf,
+        /// 64 hex digits the live Caddyfile must currently hash to; omit
+        /// for a first write that must not overwrite an existing file.
+        #[arg(long = "expected-prior-hash")]
+        expected_prior_hash: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl StackCommand {
@@ -897,6 +954,8 @@ impl StackCommand {
             Self::EnsureRuntime { .. } => "stack.ensureRuntime",
             Self::ReloadWorkers { .. } => "stack.reloadWorkers",
             Self::FlushFpc { .. } => "stack.flushFpc",
+            Self::WriteSiteService { .. } => "stack.writeSiteService",
+            Self::ActivateSiteConfig { .. } => "stack.activateSiteConfig",
         }
     }
 }

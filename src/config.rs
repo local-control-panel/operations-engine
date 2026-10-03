@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::site::{Domain, SiteId, SiteRelativePath, TrustedRoot, ValidationError};
 
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 4;
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug)]
@@ -14,6 +14,10 @@ pub struct EngineConfig {
     pub credential_root: TrustedRoot,
     pub ingress_root: TrustedRoot,
     pub runtime_root: TrustedRoot,
+    /// `/etc/wcp/site-services`: one `<runtime id>/<domain>/` directory per
+    /// site, holding its s6 `run` script, dedicated FrankenPHP `Caddyfile`
+    /// and `open-basedir.ini`. A sibling of `runtime_root`, not a subtree.
+    pub site_services_root: TrustedRoot,
 }
 
 impl EngineConfig {
@@ -45,16 +49,22 @@ impl EngineConfig {
         let credential_root = TrustedRoot::parse(raw.credential_root)?;
         let ingress_root = TrustedRoot::parse(raw.ingress_root)?;
         let runtime_root = TrustedRoot::parse(raw.runtime_root)?;
-        if content_roots.iter().any(|content| {
-            roots_overlap(content, &state_root)
-                || roots_overlap(content, &credential_root)
-                || roots_overlap(content, &ingress_root)
-                || roots_overlap(content, &runtime_root)
-        }) || roots_overlap(&ingress_root, &state_root)
-            || roots_overlap(&ingress_root, &credential_root)
-            || roots_overlap(&runtime_root, &state_root)
-            || roots_overlap(&runtime_root, &credential_root)
-            || roots_overlap(&runtime_root, &ingress_root)
+        let site_services_root = TrustedRoot::parse(raw.site_services_root)?;
+        let privileged = [
+            &state_root,
+            &credential_root,
+            &ingress_root,
+            &runtime_root,
+            &site_services_root,
+        ];
+        if content_roots
+            .iter()
+            .any(|content| privileged.iter().any(|root| roots_overlap(content, root)))
+            || privileged.iter().enumerate().any(|(index, root)| {
+                privileged[..index]
+                    .iter()
+                    .any(|previous| roots_overlap(previous, root))
+            })
         {
             return Err(ConfigError::PrivilegedRootOverlapsContent);
         }
@@ -65,6 +75,7 @@ impl EngineConfig {
             credential_root,
             ingress_root,
             runtime_root,
+            site_services_root,
         })
     }
 
@@ -161,6 +172,7 @@ struct RawEngineConfig {
     credential_root: String,
     ingress_root: String,
     runtime_root: String,
+    site_services_root: String,
 }
 
 #[derive(Deserialize)]
@@ -270,12 +282,13 @@ mod tests {
 
     fn config_json() -> &'static str {
         r#"{
-          "schemaVersion": 3,
+          "schemaVersion": 4,
           "contentRoots": ["/var/www"],
           "stateRoot": "/var/lib/operations-engine",
           "credentialRoot": "/var/lib/operations-engine-credentials",
           "ingressRoot": "/var/lib/operations-engine-ingress",
-          "runtimeRoot": "/var/lib/operations-engine-runtimes"
+          "runtimeRoot": "/var/lib/operations-engine-runtimes",
+          "siteServicesRoot": "/var/lib/operations-engine-site-services"
         }"#
     }
 
