@@ -104,7 +104,10 @@ fn capabilities_describe_only_implemented_operations() {
             "stack.stopIdleRuntime",
             "stack.ensureRuntime",
             "stack.reloadWorkers",
-            "stack.flushFpc"
+            "stack.flushFpc",
+            "stack.writeSiteService",
+            "stack.activateSiteConfig",
+            "stack.removeSiteService"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
