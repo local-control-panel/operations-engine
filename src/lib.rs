@@ -47,6 +47,7 @@ pub mod system_install_docker;
 pub mod system_start_docker;
 #[cfg(unix)]
 pub mod system_swap;
+pub mod tar_extract;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;
@@ -55,6 +56,7 @@ pub mod wordpress_clone;
 pub mod wordpress_import;
 pub mod wordpress_install;
 pub mod wordpress_migrate_export;
+pub mod wordpress_migrate_import;
 pub mod wordpress_multisite_delete_site;
 pub mod wordpress_rotate_credentials;
 pub mod wordpress_smtp_relay;

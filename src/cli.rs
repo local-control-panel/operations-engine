@@ -321,6 +321,16 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Import a migration export (verified against its manifest) into a
+    /// destination site, snapshotting and restoring it on failure.
+    MigrateImport {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Remove one migration export directory (it holds a full DB dump).
     MigrateDiscard {
         #[arg(long = "export-id")]
@@ -411,6 +421,7 @@ impl WordpressCommand {
             Self::Clone { .. } => "wordpress.clone",
             Self::MigrateExport { .. } => "wordpress.migrateExport",
             Self::MigrateDiscard { .. } => "wordpress.migrateDiscard",
+            Self::MigrateImport { .. } => "wordpress.migrateImport",
             Self::UpdateCore { .. } => "wordpress.updateCore",
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
             Self::UpdateThemes { .. } => "wordpress.updateThemes",
