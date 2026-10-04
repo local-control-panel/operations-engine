@@ -70,6 +70,8 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.install",
                 "wordpress.import",
                 "wordpress.clone",
+                "wordpress.migrateExport",
+                "wordpress.migrateDiscard",
                 "wordpress.updateCore",
                 "wordpress.updatePlugins",
                 "wordpress.updateThemes",

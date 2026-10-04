@@ -311,6 +311,23 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Export one WordPress site (database dump + files archive + SHA-256
+    /// manifest) for a cross-server migration. Never changes the site.
+    MigrateExport {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove one migration export directory (it holds a full DB dump).
+    MigrateDiscard {
+        #[arg(long = "export-id")]
+        export_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
     /// Snapshot and update WordPress core through fixed WP-CLI argv.
     UpdateCore {
         #[arg(long = "request-file")]
@@ -392,6 +409,8 @@ impl WordpressCommand {
             Self::Cleanup { .. } => "wordpress.cleanup",
             Self::Install { .. } => "wordpress.install",
             Self::Clone { .. } => "wordpress.clone",
+            Self::MigrateExport { .. } => "wordpress.migrateExport",
+            Self::MigrateDiscard { .. } => "wordpress.migrateDiscard",
             Self::UpdateCore { .. } => "wordpress.updateCore",
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
             Self::UpdateThemes { .. } => "wordpress.updateThemes",

@@ -84,6 +84,8 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.install",
             "wordpress.import",
             "wordpress.clone",
+            "wordpress.migrateExport",
+            "wordpress.migrateDiscard",
             "wordpress.updateCore",
             "wordpress.updatePlugins",
             "wordpress.updateThemes",
