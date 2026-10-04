@@ -534,7 +534,7 @@ fn import_with_recovery(
         ] {
             // WP-CLI reads the value from stdin, keeping credentials out of argv.
             critical(process::run_with_stdin_bytes(
-                &wp(ctx, req).args(["config", "set", key, "--type=constant", "--prompt=value"]),
+                &wp(ctx, req).args(["config", "set", key, "--type=constant", "--prompt"]),
                 format!("{value}\n").as_bytes(),
                 &step_limits(),
                 cancel,
