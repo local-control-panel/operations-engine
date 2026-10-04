@@ -593,7 +593,7 @@ fn clone_with_recovery(
                     "set",
                     key,
                     "--type=constant",
-                    "--prompt=value",
+                    "--prompt",
                 ]),
                 format!("{value}\n").as_bytes(),
                 &step_limits(),
@@ -1143,7 +1143,7 @@ esac
         .unwrap();
         let log = fs::read_to_string(fx.docker.parent().unwrap().join("docker-calls.log")).unwrap();
         assert!(log.contains("runtime-staging wp"));
-        assert!(log.contains("config set DB_HOST --type=constant --prompt=value"));
+        assert!(log.contains("config set DB_HOST --type=constant --prompt\n"));
         assert!(log.contains("search-replace source.example.com staging.example.com --all-tables"));
         assert!(log.find("config set DB_PASSWORD").unwrap() < log.find("search-replace").unwrap());
         assert!(log.find("search-replace").unwrap() < log.find("core is-installed").unwrap());
