@@ -57,13 +57,21 @@ impl EngineConfig {
             &runtime_root,
             &site_services_root,
         ];
+        // State and credentials are one engine-owned tree: the panel's
+        // layout nests `credentialRoot` under `stateRoot`
+        // (`/var/lib/operations-engine/credentials`). Only that pair may
+        // overlap; every other privileged root stays disjoint.
+        let may_overlap = |left: usize, right: usize| matches!((left, right), (0, 1) | (1, 0));
         if content_roots
             .iter()
             .any(|content| privileged.iter().any(|root| roots_overlap(content, root)))
             || privileged.iter().enumerate().any(|(index, root)| {
                 privileged[..index]
                     .iter()
-                    .any(|previous| roots_overlap(previous, root))
+                    .enumerate()
+                    .any(|(previous_index, previous)| {
+                        !may_overlap(previous_index, index) && roots_overlap(previous, root)
+                    })
             })
         {
             return Err(ConfigError::PrivilegedRootOverlapsContent);
@@ -424,6 +432,42 @@ mod tests {
             EngineConfig::from_json(&overlapping).unwrap_err(),
             ConfigError::PrivilegedRootOverlapsContent
         );
+    }
+
+    #[test]
+    fn accepts_the_panel_layout_with_credentials_under_state() {
+        // Byte-for-byte the layout `website-control-panel` converges on
+        // every enrolled server.
+        let panel = r#"{
+          "schemaVersion": 4,
+          "contentRoots": ["/var/www"],
+          "stateRoot": "/var/lib/operations-engine",
+          "credentialRoot": "/var/lib/operations-engine/credentials",
+          "ingressRoot": "/etc/wcp/ingress.d",
+          "runtimeRoot": "/etc/wcp/runtimes",
+          "siteServicesRoot": "/etc/wcp/site-services"
+        }"#;
+        EngineConfig::from_json(panel).expect("the panel's config layout must load");
+    }
+
+    #[test]
+    fn site_services_root_must_not_overlap_other_privileged_roots() {
+        for other in [
+            "/var/lib/operations-engine",
+            "/var/lib/operations-engine-credentials",
+            "/var/lib/operations-engine-ingress",
+            "/var/lib/operations-engine-runtimes/nested",
+        ] {
+            let overlapping = config_json().replace(
+                "\"/var/lib/operations-engine-site-services\"",
+                &format!("\"{other}\""),
+            );
+            assert_eq!(
+                EngineConfig::from_json(&overlapping).unwrap_err(),
+                ConfigError::PrivilegedRootOverlapsContent,
+                "siteServicesRoot {other} must be rejected"
+            );
+        }
     }
 
     #[test]
