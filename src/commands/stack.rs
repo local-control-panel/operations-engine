@@ -100,7 +100,44 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        StackCommand::RemoveSiteService {
+            runtime_id,
+            domain,
+            request_id,
+            idempotency_key,
+        } => remove_site_service(
+            &runtime_id,
+            &domain,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
     }
+}
+
+fn remove_site_service(
+    runtime_id: &str,
+    domain: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::stack_service::{
+        REMOVE_SITE_SERVICE_OPERATION, RemoveSiteServiceRequest, remove_site_service,
+    };
+
+    let request =
+        match RemoveSiteServiceRequest::parse(runtime_id, domain, request_id, idempotency_key) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    REMOVE_SITE_SERVICE_OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+    run_service_operation(REMOVE_SITE_SERVICE_OPERATION, |ctx, cancel| {
+        remove_site_service(ctx, &request, cancel)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

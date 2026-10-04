@@ -95,6 +95,9 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "stack.ensureRuntime",
                 "stack.reloadWorkers",
                 "stack.flushFpc",
+                "stack.writeSiteService",
+                "stack.activateSiteConfig",
+                "stack.removeSiteService",
             ],
             output_formats: ["json"],
             features: Features {

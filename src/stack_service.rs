@@ -50,6 +50,7 @@ pub const RELOAD_WORKERS_OPERATION: &str = "stack.reloadWorkers";
 pub const FLUSH_FPC_OPERATION: &str = "stack.flushFpc";
 pub const WRITE_SITE_SERVICE_OPERATION: &str = "stack.writeSiteService";
 pub const ACTIVATE_SITE_CONFIG_OPERATION: &str = "stack.activateSiteConfig";
+pub const REMOVE_SITE_SERVICE_OPERATION: &str = "stack.removeSiteService";
 
 /// Where each pool sees its own `site_services_root/<runtime id>/` subtree,
 /// bind-mounted bare so the path is the same inside every pool. A site's
@@ -335,6 +336,7 @@ pub enum Stage {
     ValidateConfig,
     RestartService,
     SiteProbe,
+    StopService,
 }
 
 impl Stage {
@@ -350,6 +352,7 @@ impl Stage {
             Self::ValidateConfig => "the site's Caddy config is invalid",
             Self::RestartService => "the site process could not be restarted",
             Self::SiteProbe => "the site process did not become ready",
+            Self::StopService => "the site process could not be stopped",
         }
     }
 }
@@ -953,6 +956,106 @@ pub fn activate_site_config(
                     cancel,
                 )),
             }
+        },
+    )
+}
+
+pub struct RemoveSiteServiceRequest {
+    pub runtime_id: RuntimeId,
+    pub domain: Domain,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl RemoveSiteServiceRequest {
+    pub fn parse(
+        runtime_id: &str,
+        domain: &str,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        let runtime_id =
+            RuntimeId::parse(runtime_id).map_err(|_| RequestError::InvalidRuntimeId)?;
+        let domain = Domain::parse(domain).map_err(|_| RequestError::InvalidDomain)?;
+        let (request_id, idempotency_key) = parse_ids(request_id, key)?;
+        Ok(Self {
+            runtime_id,
+            domain,
+            request_id,
+            idempotency_key,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveSiteServiceResult {
+    pub runtime_id: String,
+    pub domain: String,
+    /// `false` when there was no service directory to remove: a site whose
+    /// service was never created (or is already gone) is a no-op, not an
+    /// error, so cleanup paths can call this unconditionally.
+    pub removed: bool,
+    /// Whether the pool was running, i.e. whether a process could exist to
+    /// be stopped and an `s6-svscan` to tell about the removal.
+    pub pool_running: bool,
+    pub completed_at_unix_secs: u64,
+}
+
+/// Tears down one site's s6 service: `s6-svc -d` stops its FrankenPHP
+/// child, the service directory is removed, and `s6-svscanctl -a` drops
+/// its supervisor. A failed stop changes nothing on disk (brief decision 3:
+/// a visible `FAILED`, never a half-removed service reported as success).
+/// A stopped pool has no process to stop, so only the directory goes.
+pub fn remove_site_service(
+    ctx: &Context<'_>,
+    req: &RemoveSiteServiceRequest,
+    cancel: &CancellationToken,
+) -> Result<RemoveSiteServiceResult, Error> {
+    run_admitted(
+        ctx,
+        REMOVE_SITE_SERVICE_OPERATION,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        || {
+            let root = ManagedRoot::open(ctx.site_services_root).map_err(Error::Io)?;
+            let dir_rel = service_rel(&req.runtime_id, &req.domain, "");
+            let result = |removed, pool_running| RemoveSiteServiceResult {
+                runtime_id: req.runtime_id.as_str().to_owned(),
+                domain: req.domain.as_str().to_owned(),
+                removed,
+                pool_running,
+                completed_at_unix_secs: unix_now_secs(),
+            };
+            if !root.exists(&dir_rel) {
+                return Ok(result(false, false));
+            }
+
+            let service = runtime_service(&req.runtime_id);
+            let running = !compose(
+                ctx,
+                Stage::Probe,
+                &["ps", "-q", &service],
+                PROBE_TIMEOUT,
+                cancel,
+            )?
+            .trim()
+            .is_empty();
+            let cdir = container_dir(&req.domain);
+            if running {
+                compose(
+                    ctx,
+                    Stage::StopService,
+                    &["exec", "-T", &service, "s6-svc", "-d", &cdir],
+                    SIGNAL_TIMEOUT,
+                    cancel,
+                )?;
+            }
+            root.remove_dir_all(&dir_rel).map_err(Error::Io)?;
+            if running {
+                scan_services(ctx, &req.runtime_id, cancel)?;
+            }
+            Ok(result(true, running))
         },
     )
 }
@@ -1759,6 +1862,168 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::StackBusy));
         assert!(fixture.calls().is_empty());
+    }
+
+    fn remove_req(id: &str, key: Option<&str>) -> RemoveSiteServiceRequest {
+        RemoveSiteServiceRequest::parse("fp1-php83", "example.test", id, key).unwrap()
+    }
+
+    fn service_dir_exists(fixture: &Fixture) -> bool {
+        fixture
+            .site_services_root
+            .as_path()
+            .join("fp1-php83/example.test")
+            .exists()
+    }
+
+    #[test]
+    fn remove_site_service_stops_removes_and_rescans_in_order() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        write_site_service(
+            &fixture.ctx(),
+            &write_req(OTHER_ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        fs::remove_file(&fixture.calls).unwrap();
+
+        let result = remove_site_service(
+            &fixture.ctx(),
+            &remove_req(ID, Some("rs-1")),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(result.removed);
+        assert!(result.pool_running);
+        assert!(!service_dir_exists(&fixture));
+        // A retried request replays the outcome without a second stop.
+        let replayed = remove_site_service(
+            &fixture.ctx(),
+            &remove_req(ID, Some("rs-1")),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(replayed.removed);
+
+        let prefix = compose_prefix(&fixture);
+        assert_eq!(
+            fixture.calls(),
+            vec![
+                format!("{prefix} ps -q runtime-fp1-php83"),
+                format!(
+                    "{prefix} exec -T runtime-fp1-php83 s6-svc -d \
+                     /etc/wcp/site-services/example.test"
+                ),
+                format!(
+                    "{prefix} exec -T runtime-fp1-php83 sh -c i=0; while [ \"$i\" -lt 10 ]; do \
+                     s6-svscanctl -a /etc/wcp/site-services && exit 0; i=$((i+1)); sleep 0.3; \
+                     done; exit 1"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_site_service_without_a_directory_is_a_no_op() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+
+        let result = remove_site_service(
+            &fixture.ctx(),
+            &remove_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(!result.removed);
+        assert!(fixture.calls().is_empty());
+    }
+
+    #[test]
+    fn a_failed_stop_leaves_the_service_directory_in_place() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.seed_dir("fp1-php83", "example.test");
+        // `ps -q` must report the pool running for the stop to be attempted.
+        fs::write(
+            &fixture.docker,
+            format!(
+                "#!/bin/sh\necho \"$(pwd) $*\" >> '{calls}'\n\
+                 case \"$*\" in *' ps -q '*) echo c0ffee ;; *'s6-svc -d'*) exit 1 ;; esac\nexit 0\n",
+                calls = fixture.calls.display(),
+            ),
+        )
+        .unwrap();
+
+        let error = remove_site_service(
+            &fixture.ctx(),
+            &remove_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Rejected(Stage::StopService, _)));
+        assert!(service_dir_exists(&fixture));
+        assert!(!fixture.calls().iter().any(|c| c.contains("s6-svscanctl")));
+    }
+
+    #[test]
+    fn a_stopped_pool_only_loses_the_directory() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.seed_dir("fp1-php83", "example.test");
+        // Empty `ps -q` output: no running container for the pool.
+        fixture.fail_on("never-matches");
+
+        let result = remove_site_service(
+            &fixture.ctx(),
+            &remove_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(result.removed);
+        assert!(!result.pool_running);
+        assert!(!service_dir_exists(&fixture));
+        assert_eq!(
+            fixture.calls().len(),
+            1,
+            "only the ps probe: {:?}",
+            fixture.calls()
+        );
+    }
+
+    #[test]
+    fn a_held_stack_lock_blocks_a_site_removal_before_docker_runs() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.seed_dir("fp1-php83", "example.test");
+        let stack_scope = crate::stack_deploy::open_scope(&fixture.state).unwrap();
+        let _held = crate::stack_deploy::acquire_stack_lock(
+            &stack_scope,
+            RequestId::parse(OTHER_ID).unwrap(),
+        )
+        .unwrap();
+
+        let error = remove_site_service(
+            &fixture.ctx(),
+            &remove_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::StackBusy));
+        assert!(fixture.calls().is_empty());
+        assert!(service_dir_exists(&fixture));
+    }
+
+    #[test]
+    fn remove_site_service_rejects_malformed_fields() {
+        assert_eq!(
+            RemoveSiteServiceRequest::parse("fp1-php83", "../etc", ID, None).err(),
+            Some(RequestError::InvalidDomain)
+        );
+        assert_eq!(
+            RemoveSiteServiceRequest::parse("bad id", "example.test", ID, None).err(),
+            Some(RequestError::InvalidRuntimeId)
+        );
     }
 
     #[test]

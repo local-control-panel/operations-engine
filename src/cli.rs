@@ -943,6 +943,19 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Stop one site's s6-supervised process, remove its service directory
+    /// under `siteServicesRoot` and drop it from the pool's s6-svscan, under
+    /// the shared stack lock. A site with no service directory is a no-op.
+    RemoveSiteService {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "domain")]
+        domain: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl StackCommand {
@@ -956,6 +969,7 @@ impl StackCommand {
             Self::FlushFpc { .. } => "stack.flushFpc",
             Self::WriteSiteService { .. } => "stack.writeSiteService",
             Self::ActivateSiteConfig { .. } => "stack.activateSiteConfig",
+            Self::RemoveSiteService { .. } => "stack.removeSiteService",
         }
     }
 }
