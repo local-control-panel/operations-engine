@@ -130,6 +130,7 @@ pub fn execute(
             "0",
             log_path,
         ],
+        None,
         cancel,
     );
     if let Err(error) = truncate {
@@ -173,35 +174,37 @@ fn run_mariadb(
     sql: &str,
     cancel: &CancellationToken,
 ) -> Result<String, Error> {
-    let password = format!("-p{}", req.root_password);
     let args = [
         "exec",
+        "-e",
+        "MYSQL_PWD",
         req.container.as_str(),
         "mariadb",
         "-uroot",
-        password.as_str(),
         "-Nse",
         sql,
     ];
-    let output = run_fixed(ctx, args, cancel)?;
+    let output = run_fixed(ctx, args, Some(&req.root_password), cancel)?;
     String::from_utf8(output.stdout.bytes).map_err(|_| Error::InvalidStatus)
 }
 
+/// `password`, when given, is passed as `MYSQL_PWD` in this process's
+/// environment (the argv forwards it by name), never in argv.
 fn run_fixed<I, S>(
     ctx: &Context<'_>,
     args: I,
+    password: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<process::ProcessOutput, Error>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
-    let output = process::run(
-        &ProcessRequest::new(ctx.docker_program).args(args),
-        &ProcessLimits::default(),
-        cancel,
-    )
-    .map_err(Error::Run)?;
+    let mut request = ProcessRequest::new(ctx.docker_program).args(args);
+    if let Some(password) = password {
+        request = request.env("MYSQL_PWD", password);
+    }
+    let output = process::run(&request, &ProcessLimits::default(), cancel).map_err(Error::Run)?;
     if !matches!(
         output.termination,
         ProcessTermination::Exited { success: true, .. }

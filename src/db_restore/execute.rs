@@ -173,28 +173,30 @@ pub fn execute(
     Ok(result)
 }
 
-/// Builds the `docker exec` client invocation for `request`, matching
-/// `website-control-panel`'s own `build_restore_command` argument-for-
-/// argument (mariadb: `-uroot -p<password>`; postgres: `-e
-/// PGPASSWORD=<password>` ahead of the container name, `psql -v
-/// ON_ERROR_STOP=1 -U postgres`) - argv elements here, never a shell
-/// string, so nothing needs escaping the way the client-side shell-string
-/// builder does.
+/// Upper bound for the archive check and for loading one dump.
+const RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Builds the `docker exec` client invocation for `request`
+/// (mariadb: `mariadb -uroot <db>`; postgres: `psql -v ON_ERROR_STOP=1 -U
+/// postgres <db>`). The root password is only in this process's
+/// environment (`MYSQL_PWD` / `PGPASSWORD`), forwarded by name with
+/// `docker exec -e NAME`, so it never appears in any argv.
 fn client_request(context: &RestoreContext<'_>, request: &RestoreRequest) -> ProcessRequest {
-    let mut args: Vec<String> = vec!["exec".to_owned(), "-i".to_owned()];
-    match request.db_type {
-        DbType::Postgres => {
-            args.push("-e".to_owned());
-            args.push(format!("PGPASSWORD={}", request.root_password));
-        }
-        DbType::Mariadb => {}
-    }
+    let password_env = match request.db_type {
+        DbType::Mariadb => "MYSQL_PWD",
+        DbType::Postgres => "PGPASSWORD",
+    };
+    let mut args: Vec<String> = vec![
+        "exec".to_owned(),
+        "-i".to_owned(),
+        "-e".to_owned(),
+        password_env.to_owned(),
+    ];
     args.push(request.container.as_str().to_owned());
     match request.db_type {
         DbType::Mariadb => {
             args.push("mariadb".to_owned());
             args.push("-uroot".to_owned());
-            args.push(format!("-p{}", request.root_password));
             args.push(request.database.as_str().to_owned());
         }
         DbType::Postgres => {
@@ -206,7 +208,9 @@ fn client_request(context: &RestoreContext<'_>, request: &RestoreRequest) -> Pro
             args.push(request.database.as_str().to_owned());
         }
     }
-    ProcessRequest::new(context.docker_program).args(args)
+    ProcessRequest::new(context.docker_program)
+        .env(password_env, &request.root_password)
+        .args(args)
 }
 
 /// Runs the bounded restore-client subprocess for `request` against
@@ -220,7 +224,11 @@ pub(crate) fn run_restore(
     request: &RestoreRequest,
     cancellation: &CancellationToken,
 ) -> Result<(), RestoreError> {
-    let limits = ProcessLimits::default();
+    // A real dump takes far longer than the 30 s default to check and load.
+    let limits = ProcessLimits {
+        timeout: RESTORE_TIMEOUT,
+        ..ProcessLimits::default()
+    };
     let client = client_request(context, request);
 
     let output = if request.file_path.ends_with(".gz") {
@@ -376,6 +384,7 @@ mod tests {
         gunzip_program: String,
         dump_path: String,
         received: std::path::PathBuf,
+        argv_log: std::path::PathBuf,
     }
 
     /// A fake `docker` that only understands `exec -i [-e K=V] <container>
@@ -398,8 +407,11 @@ mod tests {
         if reject {
             fs::write(&reject_flag, "").unwrap();
         }
+        let argv_log = fake_dir.path().join("argv.log");
         let docker_script = format!(
-            "#!/bin/sh\n[ -f {reject} ] && exit 1\ncat > {received}\nexit 0\n",
+            "#!/bin/sh\necho \"$* pw=${{MYSQL_PWD:-}}\" >> {argv_log}\n\
+             [ -f {reject} ] && exit 1\ncat > {received}\nexit 0\n",
+            argv_log = shell_quote(&argv_log),
             reject = shell_quote(&reject_flag),
             received = shell_quote(&received),
         );
@@ -431,6 +443,7 @@ mod tests {
             gunzip_program: gunzip_program.to_str().unwrap().to_owned(),
             dump_path: dump_path.to_str().unwrap().to_owned(),
             received,
+            argv_log,
         }
     }
 
@@ -474,6 +487,26 @@ mod tests {
             fs::read_to_string(&host.received).unwrap(),
             "INSERT INTO t VALUES (1);\n"
         );
+    }
+
+    #[test]
+    fn the_root_password_reaches_the_client_only_through_the_environment() {
+        let host = host(false, false);
+        execute(
+            &context(&host),
+            &request(&host, REQUEST_ID, None),
+            &CancellationToken::default(),
+        )
+        .expect("restore should succeed");
+
+        let log = fs::read_to_string(&host.argv_log).unwrap();
+        let (argv, env) = log.trim().split_once(" pw=").unwrap();
+        assert!(!argv.contains("s3cret"), "{argv}");
+        assert!(
+            argv.contains("exec -i -e MYSQL_PWD wcp-mariadb-1 mariadb -uroot site_db"),
+            "{argv}"
+        );
+        assert_eq!(env, "s3cret");
     }
 
     #[test]
