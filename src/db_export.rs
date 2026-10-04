@@ -83,17 +83,23 @@ pub fn execute(
     request: &Request,
     docker_program: &str,
 ) -> std::result::Result<ExportResult, ExecuteError> {
-    let mut args = vec!["exec".to_owned(), "-i".to_owned()];
-    if request.db_type == DbType::Postgres {
-        args.push("-e".to_owned());
-        args.push(format!("PGPASSWORD={}", request.root_password));
-    }
+    // The password is only in this process's environment, forwarded to the
+    // container by name, never in argv.
+    let password_env = match request.db_type {
+        DbType::Mariadb => "MYSQL_PWD",
+        DbType::Postgres => "PGPASSWORD",
+    };
+    let mut args = vec![
+        "exec".to_owned(),
+        "-i".to_owned(),
+        "-e".to_owned(),
+        password_env.to_owned(),
+    ];
     args.push(request.container.as_str().to_owned());
     match request.db_type {
         DbType::Mariadb => args.extend([
             "mariadb-dump".to_owned(),
             "-uroot".to_owned(),
-            format!("-p{}", request.root_password),
             "--single-transaction".to_owned(),
             "--routines".to_owned(),
             "--triggers".to_owned(),
@@ -112,7 +118,9 @@ pub fn execute(
         max_stderr_bytes: 64 * 1024,
     };
     let output = process::run(
-        &ProcessRequest::new(docker_program).args(args),
+        &ProcessRequest::new(docker_program)
+            .env(password_env, &request.root_password)
+            .args(args),
         &limits,
         &CancellationToken::default(),
     )

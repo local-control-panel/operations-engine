@@ -1148,7 +1148,9 @@ fn restart_service(
 }
 
 /// The readiness probe the panel ran: up to 20 one-second tries for any
-/// HTTP status on the site's loopback port.
+/// HTTP status on the site's loopback port. Each `curl` is capped at 5 s,
+/// so a process that accepts the connection but never answers cannot hold
+/// the probe (and the stack lock) until the `compose exec` timeout.
 fn site_probe(
     ctx: &Context<'_>,
     runtime_id: &RuntimeId,
@@ -1157,7 +1159,7 @@ fn site_probe(
 ) -> Result<(), Error> {
     let service = runtime_service(runtime_id);
     let probe = format!(
-        "i=0; while [ \"$i\" -lt 20 ]; do code=$(curl -s -o /dev/null -w '%{{http_code}}' -H 'Host: 127.0.0.1' http://127.0.0.1:{port}/ || true); [ \"$code\" != 000 ] && exit 0; i=$((i+1)); sleep 1; done; exit 1"
+        "i=0; while [ \"$i\" -lt 20 ]; do code=$(curl -s --max-time 5 -o /dev/null -w '%{{http_code}}' -H 'Host: 127.0.0.1' http://127.0.0.1:{port}/ || true); [ \"$code\" != 000 ] && exit 0; i=$((i+1)); sleep 1; done; exit 1"
     );
     compose(
         ctx,
@@ -1713,7 +1715,11 @@ mod tests {
                  /etc/wcp/site-services/example.test"
             )
         );
-        assert!(calls[2].contains("curl -s -o /dev/null"), "{}", calls[2]);
+        assert!(
+            calls[2].contains("curl -s --max-time 5 -o /dev/null"),
+            "{}",
+            calls[2]
+        );
         // The validated Caddyfile is live and no staging file is left behind.
         assert!(
             fixture

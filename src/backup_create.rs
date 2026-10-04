@@ -283,16 +283,23 @@ pub fn execute(
     let file = backup_root
         .create_new_file(&temp_path)
         .map_err(ExecuteError::Io)?;
-    let mut args = vec!["exec".to_owned(), "-i".to_owned()];
-    if request.db_type == DbType::Postgres {
-        args.extend(["-e".into(), format!("PGPASSWORD={}", request.root_password)]);
-    }
+    // The password is only in this process's environment, forwarded to the
+    // container by name, never in argv.
+    let password_env = match request.db_type {
+        DbType::Mariadb => "MYSQL_PWD",
+        DbType::Postgres => "PGPASSWORD",
+    };
+    let mut args = vec![
+        "exec".to_owned(),
+        "-i".to_owned(),
+        "-e".to_owned(),
+        password_env.to_owned(),
+    ];
     args.push(request.container.as_str().to_owned());
     match request.db_type {
         DbType::Mariadb => args.extend([
             "mariadb-dump".into(),
             "-uroot".into(),
-            format!("-p{}", request.root_password),
             "--single-transaction".into(),
             "--routines".into(),
             "--triggers".into(),
@@ -310,7 +317,9 @@ pub fn execute(
         ]),
     }
     let output = match process::run_with_stdout_file(
-        &ProcessRequest::new(docker_program).args(args),
+        &ProcessRequest::new(docker_program)
+            .env(password_env, &request.root_password)
+            .args(args),
         file,
         &ProcessLimits {
             timeout: Duration::from_secs(1800),
