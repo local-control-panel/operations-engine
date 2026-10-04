@@ -35,6 +35,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "backup.triggerNow",
                 "site.deploy",
                 "site.rollback",
+                "site.moveRoot",
                 "engine.install",
                 "engine.rollback",
                 "ingress.activateConfig",

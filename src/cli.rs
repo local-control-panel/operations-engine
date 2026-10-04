@@ -582,6 +582,20 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Rename a site's content directory from `<content root>/<from>` to
+    /// `<content root>/<to>` (a single rename(2) inside one content root),
+    /// refusing a missing source or an existing target.
+    MoveRoot {
+        #[arg(long = "from-domain")]
+        from_domain: String,
+        #[arg(long = "to-domain")]
+        to_domain: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SiteCommand {
@@ -589,6 +603,7 @@ impl SiteCommand {
         match self {
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
+            Self::MoveRoot { .. } => "site.moveRoot",
         }
     }
 }

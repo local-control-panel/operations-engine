@@ -49,6 +49,7 @@ fn capabilities_describe_only_implemented_operations() {
             "backup.triggerNow",
             "site.deploy",
             "site.rollback",
+            "site.moveRoot",
             "engine.install",
             "engine.rollback",
             "ingress.activateConfig",
