@@ -72,6 +72,9 @@ struct Plan {
     dest_gid: u32,
     dest_domain: String,
     mariadb_container: String,
+    /// `DB_HOST` for `wp-config.php`: the stable Compose service name, which
+    /// is not the container name `docker exec` uses.
+    db_host: String,
     db_root_password: String,
     db_name: String,
     db_user: String,
@@ -87,6 +90,7 @@ pub struct Request {
     dest_gid: u32,
     dest_domain: Domain,
     mariadb_container: ContainerName,
+    db_host: ContainerName,
     db_root_password: String,
     db_name: DatabaseName,
     db_user: DatabaseName,
@@ -147,6 +151,7 @@ impl Request {
             dest_domain: Domain::parse(&plan.dest_domain).map_err(|_| RequestError)?,
             mariadb_container: ContainerName::parse(&plan.mariadb_container)
                 .map_err(|_| RequestError)?,
+            db_host: ContainerName::parse(&plan.db_host).map_err(|_| RequestError)?,
             db_root_password: plan.db_root_password,
             db_name: DatabaseName::parse(&plan.db_name).map_err(|_| RequestError)?,
             db_user: DatabaseName::parse(&plan.db_user).map_err(|_| RequestError)?,
@@ -525,7 +530,7 @@ fn import_with_recovery(
             ("DB_NAME", req.db_name.as_str()),
             ("DB_USER", req.db_user.as_str()),
             ("DB_PASSWORD", req.db_password.as_str()),
-            ("DB_HOST", req.mariadb_container.as_str()),
+            ("DB_HOST", req.db_host.as_str()),
         ] {
             // WP-CLI reads the value from stdin, keeping credentials out of argv.
             critical(process::run_with_stdin_bytes(
@@ -868,7 +873,8 @@ mod tests {
                 "destUid": self.uid,
                 "destGid": self.gid,
                 "destDomain": "dest.test",
-                "mariadbContainer": "mariadb",
+                "mariadbContainer": "wcp-mariadb-1",
+                "dbHost": "mariadb",
                 "dbRootPassword": ROOT_PW,
                 "dbName": "wp_dest",
                 "dbUser": "wp_dest_user",
