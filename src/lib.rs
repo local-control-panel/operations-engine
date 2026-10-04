@@ -47,6 +47,7 @@ pub mod system_install_docker;
 pub mod system_start_docker;
 #[cfg(unix)]
 pub mod system_swap;
+pub mod tar_extract;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;
