@@ -196,8 +196,12 @@ pub fn execute(
         ));
     }
 
+    // A host with no ingress routes yet has no `ingressRoot` directory (it is
+    // created by the first activation), so a missing root is an empty sweep -
+    // the same call `runtime_config::reconcile` makes for a missing pool dir.
     let ingress_root = match ManagedRoot::open(context.ingress_root) {
-        Ok(root) => root,
+        Ok(root) => Some(root),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => {
             return Err(fail(
                 &ingress_state,
@@ -208,9 +212,10 @@ pub fn execute(
             ));
         }
     };
-    let names = match ingress_root.file_names() {
-        Ok(names) => names,
-        Err(error) => {
+    let names = match ingress_root.as_ref().map(ManagedRoot::file_names) {
+        None => Vec::new(),
+        Some(Ok(names)) => names,
+        Some(Err(error)) => {
             return Err(fail(
                 &ingress_state,
                 &state_path,
@@ -238,6 +243,9 @@ pub fn execute(
     let mut preserved_maintenance_backups = Vec::new();
 
     for name in names {
+        let ingress_root = ingress_root
+            .as_ref()
+            .expect("names is only non-empty when the root opened");
         let Ok(path) = SiteRelativePath::parse(&name) else {
             continue;
         };
@@ -442,6 +450,28 @@ mod tests {
 
     fn request(id: &str) -> ReconcileRequest {
         ReconcileRequest::parse(id, None).expect("test request should parse")
+    }
+
+    #[test]
+    fn a_missing_ingress_root_is_an_empty_sweep() {
+        let (parent, _parent_root, _parent_managed) = managed_root();
+        let (_state_dir, _state_root, engine_state) = managed_root();
+        let missing = parent.path().join("ingress.d");
+        let ingress_root = TrustedRoot::parse(&missing).expect("root path should be valid");
+
+        let context = ReconcileContext {
+            ingress_root: &ingress_root,
+            engine_state: &engine_state,
+        };
+        let result = execute(
+            &context,
+            &request("3c9d8a10-1111-4222-8333-444455556666"),
+            &CancellationToken::default(),
+        )
+        .expect("a missing ingress root must not fail the sweep");
+
+        assert!(result.removed_temp_files.is_empty());
+        assert!(result.restored_recoverable_backups.is_empty());
     }
 
     #[test]
