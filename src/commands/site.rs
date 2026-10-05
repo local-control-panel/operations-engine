@@ -27,6 +27,100 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => rollback(&site_id, &release, &request_id, idempotency_key.as_deref()),
+        SiteCommand::MoveRoot {
+            from_domain,
+            to_domain,
+            request_id,
+            idempotency_key,
+        } => move_root(
+            &from_domain,
+            &to_domain,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+    }
+}
+
+fn move_root(
+    from_domain: &str,
+    to_domain: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_root::{MOVE_OPERATION, MoveRequest};
+
+    let request = match MoveRequest::parse(from_domain, to_domain, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                MOVE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_move_root(&request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            MOVE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.moveRoot requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_move_root(request: &crate::site_root::MoveRequest) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{
+        config::EngineConfig,
+        filesystem::ManagedRoot,
+        site_root::{self, MOVE_OPERATION},
+    };
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                MOVE_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                MOVE_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    match site_root::move_root(&engine_state, &engine_config.content_roots, request) {
+        Ok(result) => Response::success(MOVE_OPERATION, result),
+        Err(site_root::Error::PostCommit(result)) => {
+            Response::success(MOVE_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the operation completed but its transaction record could not be \
+                              saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(MOVE_OPERATION, code, &message))
+        }
     }
 }
 

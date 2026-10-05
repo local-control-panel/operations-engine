@@ -101,4 +101,6 @@ limits, and [PLAN.md](./PLAN.md) for current priorities.
 
 ## License
 
-This project is licensed under [LICENSE](./LICENSE).
+This project is licensed under the PolyForm Noncommercial License 1.0.0 with
+additional public-source conditions; see [LICENSE](./LICENSE). Commercial use
+requires separate written permission.

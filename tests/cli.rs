@@ -49,6 +49,7 @@ fn capabilities_describe_only_implemented_operations() {
             "backup.triggerNow",
             "site.deploy",
             "site.rollback",
+            "site.moveRoot",
             "engine.install",
             "engine.rollback",
             "ingress.activateConfig",
@@ -83,6 +84,9 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.install",
             "wordpress.import",
             "wordpress.clone",
+            "wordpress.migrateExport",
+            "wordpress.migrateDiscard",
+            "wordpress.migrateImport",
             "wordpress.updateCore",
             "wordpress.updatePlugins",
             "wordpress.updateThemes",
@@ -99,7 +103,15 @@ fn capabilities_describe_only_implemented_operations() {
             "system.createSwap",
             "system.deleteSwap",
             "system.resizeSwap",
-            "stack.deploy"
+            "stack.deploy",
+            "stack.reloadCaddy",
+            "stack.stopIdleRuntime",
+            "stack.ensureRuntime",
+            "stack.reloadWorkers",
+            "stack.flushFpc",
+            "stack.writeSiteService",
+            "stack.activateSiteConfig",
+            "stack.removeSiteService"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

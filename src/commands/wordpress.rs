@@ -26,6 +26,20 @@ pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => clone(&request_file, &request_id, idempotency_key.as_deref()),
+        WordpressCommand::MigrateExport {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => migrate_export(&request_file, &request_id, idempotency_key.as_deref()),
+        WordpressCommand::MigrateImport {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => migrate_import(&request_file, &request_id, idempotency_key.as_deref()),
+        WordpressCommand::MigrateDiscard {
+            export_id,
+            request_id,
+        } => migrate_discard(&export_id, &request_id),
         WordpressCommand::UpdateCore {
             request_file,
             request_id,
@@ -999,6 +1013,202 @@ fn cleanup(path: &std::path::Path) -> Result<Response, ResponseBuildError> {
             wordpress::OPERATION,
             ErrorCode::UnsupportedPlatform,
             "wordpress.cleanup requires a Unix host",
+        ))
+    }
+}
+
+fn migrate_export(
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::wordpress_migrate_export::{self as export, EXPORT_OPERATION};
+    #[cfg(unix)]
+    {
+        use crate::filesystem::ManagedRoot;
+        let fail = |code, message: &str| Ok(Response::failure(EXPORT_OPERATION, code, message));
+        let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return fail(
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            );
+        };
+        let Ok(json) = read_root_owned_content_file(path) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            );
+        };
+        let Ok(request) = export::ExportRequest::parse(&json, request_id, idempotency_key) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file is not a valid WordPress migration export plan",
+            );
+        };
+        let Some(content_root) = config
+            .content_roots
+            .iter()
+            .find(|root| request.source_root().starts_with(root.as_path()))
+        else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "WordPress source root is outside configured content roots",
+            );
+        };
+        let Ok(state) = ManagedRoot::open(&config.state_root) else {
+            return fail(ErrorCode::Internal, "engine state root is unavailable");
+        };
+        let context = export::Context {
+            engine_state: &state,
+            state_root: &config.state_root,
+            content_root,
+            docker_program: "docker",
+            tar_program: "tar",
+            gzip_program: "gzip",
+        };
+        match export::export(
+            &context,
+            &request,
+            &crate::process::CancellationToken::default(),
+        ) {
+            Ok(result) => Response::success(EXPORT_OPERATION, result),
+            Err(export::Error::PostCommit(result)) => Response::success(EXPORT_OPERATION, *result),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(EXPORT_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            EXPORT_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "wordpress.migrateExport requires a Unix host",
+        ))
+    }
+}
+
+fn migrate_discard(export_id: &str, request_id: &str) -> Result<Response, ResponseBuildError> {
+    use crate::wordpress_migrate_export::{self as export, DISCARD_OPERATION};
+    let Ok(request) = export::DiscardRequest::parse(export_id, request_id) else {
+        return Ok(Response::failure(
+            DISCARD_OPERATION,
+            ErrorCode::InvalidInput,
+            "export-id and request-id must be canonical UUIDs",
+        ));
+    };
+    let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+        "/etc/operations-engine/config.json",
+    )) else {
+        return Ok(Response::failure(
+            DISCARD_OPERATION,
+            ErrorCode::Internal,
+            crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+        ));
+    };
+    let Ok(state) = crate::filesystem::ManagedRoot::open(&config.state_root) else {
+        return Ok(Response::failure(
+            DISCARD_OPERATION,
+            ErrorCode::Internal,
+            "engine state root is unavailable",
+        ));
+    };
+    match export::discard(&state, &request) {
+        Ok(result) => Response::success(DISCARD_OPERATION, result),
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(DISCARD_OPERATION, code, &message))
+        }
+    }
+}
+
+fn migrate_import(
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::wordpress_migrate_import::{self as import, OPERATION};
+    #[cfg(unix)]
+    {
+        use crate::{backup_delete::BACKUP_ROOT, filesystem::ManagedRoot, site::TrustedRoot};
+        let fail = |code, message: &str| Ok(Response::failure(OPERATION, code, message));
+        let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return fail(
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            );
+        };
+        let Ok(json) = read_root_owned_content_file(path) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            );
+        };
+        let Ok(request) = import::Request::parse(&json, request_id, idempotency_key) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file is not a valid WordPress migration import plan",
+            );
+        };
+        let Some(content_root) = config
+            .content_roots
+            .iter()
+            .find(|root| request.dest_root().starts_with(root.as_path()))
+        else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "WordPress destination root is outside configured content roots",
+            );
+        };
+        let Ok(state) = ManagedRoot::open(&config.state_root) else {
+            return fail(ErrorCode::Internal, "engine state root is unavailable");
+        };
+        if std::fs::create_dir_all(BACKUP_ROOT).is_err() {
+            return fail(ErrorCode::Internal, "backup root is unavailable");
+        }
+        let Ok(recovery_root) = TrustedRoot::parse(std::path::Path::new(BACKUP_ROOT)) else {
+            return fail(ErrorCode::Internal, "backup root is unavailable");
+        };
+        let Ok(recovery_managed) = ManagedRoot::open(&recovery_root) else {
+            return fail(ErrorCode::Internal, "backup root is unavailable");
+        };
+        let context = import::Context {
+            engine_state: &state,
+            content_root,
+            recovery_managed: &recovery_managed,
+            recovery_root: &recovery_root,
+            artifact_dir: std::path::Path::new("/etc/operations-engine/staging"),
+            artifact_owner_uid: 0,
+            docker_program: "docker",
+            gunzip_program: "gunzip",
+        };
+        match import::execute(
+            &context,
+            &request,
+            &crate::process::CancellationToken::default(),
+        ) {
+            Ok(result) | Err(import::Error::PostCommit(result)) => {
+                Response::success(OPERATION, result)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "wordpress.migrateImport requires a Unix host",
         ))
     }
 }

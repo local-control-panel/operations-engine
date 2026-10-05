@@ -311,6 +311,33 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Export one WordPress site (database dump + files archive + SHA-256
+    /// manifest) for a cross-server migration. Never changes the site.
+    MigrateExport {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Import a migration export (verified against its manifest) into a
+    /// destination site, snapshotting and restoring it on failure.
+    MigrateImport {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove one migration export directory (it holds a full DB dump).
+    MigrateDiscard {
+        #[arg(long = "export-id")]
+        export_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
     /// Snapshot and update WordPress core through fixed WP-CLI argv.
     UpdateCore {
         #[arg(long = "request-file")]
@@ -392,6 +419,9 @@ impl WordpressCommand {
             Self::Cleanup { .. } => "wordpress.cleanup",
             Self::Install { .. } => "wordpress.install",
             Self::Clone { .. } => "wordpress.clone",
+            Self::MigrateExport { .. } => "wordpress.migrateExport",
+            Self::MigrateDiscard { .. } => "wordpress.migrateDiscard",
+            Self::MigrateImport { .. } => "wordpress.migrateImport",
             Self::UpdateCore { .. } => "wordpress.updateCore",
             Self::UpdatePlugins { .. } => "wordpress.updatePlugins",
             Self::UpdateThemes { .. } => "wordpress.updateThemes",
@@ -582,6 +612,20 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Rename a site's content directory from `<content root>/<from>` to
+    /// `<content root>/<to>` (a single rename(2) inside one content root),
+    /// refusing a missing source or an existing target.
+    MoveRoot {
+        #[arg(long = "from-domain")]
+        from_domain: String,
+        #[arg(long = "to-domain")]
+        to_domain: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SiteCommand {
@@ -589,6 +633,7 @@ impl SiteCommand {
         match self {
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
+            Self::MoveRoot { .. } => "site.moveRoot",
         }
     }
 }
@@ -830,12 +875,146 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Reload Caddy inside one service of the managed WCP stack (the
+    /// ingress or one runtime pool) through a fixed argv, under the shared
+    /// stack lock.
+    ReloadCaddy {
+        /// `ingress` or `runtime-<runtime id>`.
+        #[arg(long = "service")]
+        service: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Stop one runtime pool's service, but only if no site exec config is
+    /// left under its runtime directory; otherwise leave it running.
+    StopIdleRuntime {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Start one runtime pool's service (`up -d`) and wait until its
+    /// healthcheck reports `healthy`, under the shared stack lock.
+    EnsureRuntime {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        /// `php-<major>.<minor>` for a non-default pool gated behind a
+        /// Compose profile; omitted for the default runtime.
+        #[arg(long = "profile")]
+        profile: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Restart every site process (and so its PHP workers) in one runtime
+    /// pool through s6, under the shared stack lock.
+    ReloadWorkers {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Purge the Souin full-page cache inside one runtime pool, under the
+    /// shared stack lock.
+    FlushFpc {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Write one site's s6 service directory (run script, dedicated
+    /// Caddyfile and open-basedir.ini) under `siteServicesRoot` and
+    /// register it with the pool's s6-svscan, under the shared stack lock.
+    WriteSiteService {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "domain")]
+        domain: String,
+        /// The site's dedicated UID the run script drops privileges to.
+        #[arg(long = "uid")]
+        uid: u32,
+        #[arg(long = "gid")]
+        gid: u32,
+        /// The site process's loopback port.
+        #[arg(long = "port")]
+        port: u16,
+        /// The site's document root inside the container.
+        #[arg(long = "root")]
+        root: String,
+        /// Enable FrankenPHP worker mode for this site (`true`/`false`).
+        #[arg(long = "worker-mode", action = clap::ArgAction::Set)]
+        worker_mode: bool,
+        #[arg(long = "worker-count", default_value_t = 0)]
+        worker_count: i64,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Regenerate one site's Caddyfile (and open-basedir.ini) from typed
+    /// parameters, validate it inside the pool, swap it in, restart the
+    /// site process and probe it — restoring the previous config if the
+    /// restarted process never becomes ready. Under the shared stack lock.
+    ActivateSiteConfig {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "domain")]
+        domain: String,
+        #[arg(long = "port")]
+        port: u16,
+        /// The document root, used to regenerate `open-basedir.ini`.
+        #[arg(long = "root")]
+        root: String,
+        /// Root-owned file holding the complete new Caddyfile contents
+        /// (the panel edits this file textually, so it is opaque here and
+        /// validated inside the pool before it can take effect).
+        #[arg(long = "content-file")]
+        content_file: PathBuf,
+        /// 64 hex digits the live Caddyfile must currently hash to; omit
+        /// for a first write that must not overwrite an existing file.
+        #[arg(long = "expected-prior-hash")]
+        expected_prior_hash: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Stop one site's s6-supervised process, remove its service directory
+    /// under `siteServicesRoot` and drop it from the pool's s6-svscan, under
+    /// the shared stack lock. A site with no service directory is a no-op.
+    RemoveSiteService {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "domain")]
+        domain: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl StackCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Deploy { .. } => "stack.deploy",
+            Self::ReloadCaddy { .. } => "stack.reloadCaddy",
+            Self::StopIdleRuntime { .. } => "stack.stopIdleRuntime",
+            Self::EnsureRuntime { .. } => "stack.ensureRuntime",
+            Self::ReloadWorkers { .. } => "stack.reloadWorkers",
+            Self::FlushFpc { .. } => "stack.flushFpc",
+            Self::WriteSiteService { .. } => "stack.writeSiteService",
+            Self::ActivateSiteConfig { .. } => "stack.activateSiteConfig",
+            Self::RemoveSiteService { .. } => "stack.removeSiteService",
         }
     }
 }

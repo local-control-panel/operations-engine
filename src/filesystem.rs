@@ -1,6 +1,6 @@
 use std::{
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use cap_std::{
@@ -278,6 +278,19 @@ impl ManagedRoot {
     /// unique temporary name, then `rename` it over the real one.
     pub fn symlink(&self, link: &SiteRelativePath, target: &SiteRelativePath) -> io::Result<()> {
         self.directory.symlink(target.as_path(), link.as_path())
+    }
+
+    /// Like `symlink`, but the target is a raw relative path that may use
+    /// `..` (a `SiteRelativePath` cannot). The caller decides whether the
+    /// target is acceptable; it is never resolved here.
+    pub fn symlink_relative(&self, link: &SiteRelativePath, target: &Path) -> io::Result<()> {
+        if target.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "symlink target must be relative",
+            ));
+        }
+        self.directory.symlink(target, link.as_path())
     }
 
     pub fn read_link(&self, link: &SiteRelativePath) -> io::Result<PathBuf> {

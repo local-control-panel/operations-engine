@@ -103,18 +103,21 @@ pub fn execute(
     }
 
     let sql = sql(req);
-    let password = format!("-p{}", req.root_password);
+    // The password is only in this process's environment, never in argv.
     let args = [
         "exec",
+        "-e",
+        "MYSQL_PWD",
         req.container.as_str(),
         "mariadb",
         "-uroot",
-        password.as_str(),
         "-e",
         sql.as_str(),
     ];
     let output = process::run(
-        &ProcessRequest::new(ctx.docker_program).args(args),
+        &ProcessRequest::new(ctx.docker_program)
+            .env("MYSQL_PWD", &req.root_password)
+            .args(args),
         &ProcessLimits::default(),
         cancel,
     )
