@@ -77,6 +77,166 @@ pub fn load_stack(
     load_scoped(engine_state, &scope_path, request_id)
 }
 
+/// Largest page `operation.list` will return; larger requests are clamped.
+pub const LIST_MAX_LIMIT: usize = 100;
+pub const LIST_DEFAULT_LIMIT: usize = 20;
+
+/// The only safe next step the engine can name for a transaction. `unknown`
+/// or interrupted work never maps to an automatic destructive retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NextAction {
+    /// Finished; nothing to recover.
+    None,
+    /// The owning request still holds the mutation lock.
+    Wait,
+    /// Interrupted with no live owner: needs operation-specific recovery.
+    ManualRecovery,
+}
+
+/// Redacted one-line view of a transaction. Never carries the stored result,
+/// the error message text or the idempotency key.
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationSummary {
+    pub request_id: RequestId,
+    pub operation: String,
+    pub status: TransactionStatus,
+    pub started_at_unix_secs: u64,
+    pub finished_at_unix_secs: Option<u64>,
+    pub error_code: Option<crate::error::ErrorCode>,
+    pub active: bool,
+    pub next_action: NextAction,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationList {
+    pub operations: Vec<OperationSummary>,
+    /// Records that exist but could not be read; never silently dropped.
+    pub unreadable: usize,
+    /// True when more records exist than `operations` holds.
+    pub truncated: bool,
+}
+
+fn scope_path(
+    site_id: Option<&str>,
+    database: Option<&str>,
+    backup_database: Option<&str>,
+    stack: Option<&str>,
+) -> Result<SiteRelativePath, StatusError> {
+    let path = match (site_id, database, backup_database, stack) {
+        (Some(site_id), None, None, None) => {
+            let site_id = SiteId::parse(site_id).map_err(|_| StatusError::InvalidSiteId)?;
+            format!("sites/{site_id}")
+        }
+        (None, Some(database), None, None) => {
+            let database = crate::db_restore::DatabaseName::parse(database)
+                .map_err(|_| StatusError::InvalidDatabase)?;
+            format!("db-restore/{}", database.as_str())
+        }
+        (None, None, Some(database), None) => {
+            let database = crate::db_restore::DatabaseName::parse(database)
+                .map_err(|_| StatusError::InvalidDatabase)?;
+            format!("db-backup/{}", database.as_str())
+        }
+        (None, None, None, Some("wcp")) => "stacks/wcp".to_owned(),
+        _ => return Err(StatusError::InvalidScope),
+    };
+    Ok(SiteRelativePath::parse(path).expect("validated identifiers produce safe relative paths"))
+}
+
+/// Lists the newest transactions of one scope without executing anything.
+/// A scope that never ran a mutation is an empty list, not `NotFound`.
+pub fn list(
+    engine_state: &ManagedRoot,
+    site_id: Option<&str>,
+    database: Option<&str>,
+    backup_database: Option<&str>,
+    stack: Option<&str>,
+    limit: Option<usize>,
+) -> Result<OperationList, StatusError> {
+    let scope = scope_path(site_id, database, backup_database, stack)?;
+    let limit = limit.unwrap_or(LIST_DEFAULT_LIMIT).clamp(1, LIST_MAX_LIMIT);
+    let scope_dir = match engine_state.open_managed_dir(&scope) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OperationList {
+                operations: Vec::new(),
+                unreadable: 0,
+                truncated: false,
+            });
+        }
+        Err(_) => return Err(StatusError::Io),
+    };
+    let transactions = SiteRelativePath::parse("transactions").unwrap();
+    let transactions_dir = match scope_dir.open_managed_dir(&transactions) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OperationList {
+                operations: Vec::new(),
+                unreadable: 0,
+                truncated: false,
+            });
+        }
+        Err(_) => return Err(StatusError::Io),
+    };
+    let lock_path = SiteRelativePath::parse("locks/mutation.lock").unwrap();
+    let owner = lock::holder(&scope_dir, &lock_path).map_err(|_| StatusError::Io)?;
+    let mut names = transactions_dir.file_names().map_err(|_| StatusError::Io)?;
+    names.retain(|name| name.ends_with(".json"));
+
+    let mut unreadable = 0;
+    let mut records = Vec::new();
+    for name in names {
+        let path = match SiteRelativePath::parse(&name) {
+            Ok(path) => path,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        match state::load(&transactions_dir, &path) {
+            Ok(record) => records.push(record),
+            Err(_) => unreadable += 1,
+        }
+    }
+    records.sort_by(|a, b| {
+        b.started_at_unix_secs
+            .cmp(&a.started_at_unix_secs)
+            .then_with(|| a.request_id.to_string().cmp(&b.request_id.to_string()))
+    });
+    let truncated = records.len() > limit;
+    let operations = records
+        .into_iter()
+        .take(limit)
+        .map(|record| {
+            let in_progress = record.status == TransactionStatus::InProgress;
+            let active = in_progress && owner == Some(record.request_id);
+            let next_action = match (in_progress, active) {
+                (false, _) => NextAction::None,
+                (true, true) => NextAction::Wait,
+                (true, false) => NextAction::ManualRecovery,
+            };
+            OperationSummary {
+                request_id: record.request_id,
+                operation: record.operation,
+                status: record.status,
+                started_at_unix_secs: record.started_at_unix_secs,
+                finished_at_unix_secs: record.finished_at_unix_secs,
+                error_code: record.outcome.and_then(|outcome| outcome.error_code),
+                active,
+                next_action,
+            }
+        })
+        .collect();
+    Ok(OperationList {
+        operations,
+        unreadable,
+        truncated,
+    })
+}
+
 fn load_scoped(
     engine_state: &ManagedRoot,
     scope_path: &SiteRelativePath,
@@ -248,5 +408,98 @@ mod tests {
         let loaded = load_backup(&root, "site_db", REQUEST_ID).unwrap();
         assert_eq!(loaded.transaction.operation, "backup.createDatabase");
         assert!(!loaded.active);
+    }
+
+    #[test]
+    fn lists_newest_first_redacted_with_next_actions() {
+        let (_directory, root) = state_root();
+        let site = root
+            .open_managed_dir(&SiteRelativePath::parse(format!("sites/{SITE_ID}")).unwrap())
+            .unwrap();
+        let ids = [
+            "123e4567-e89b-12d3-a456-426614174000",
+            "223e4567-e89b-12d3-a456-426614174000",
+            "323e4567-e89b-12d3-a456-426614174000",
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            let request_id = RequestId::parse(id).unwrap();
+            let mut state = TransactionState::start(request_id, None, "site.deploy");
+            state.started_at_unix_secs = 1_000 + index as u64;
+            if index == 0 {
+                state
+                    .mark_failed(crate::error::ErrorCode::Internal, "secret path /root/x")
+                    .unwrap();
+            }
+            create(
+                &site,
+                &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+                &state,
+            )
+            .unwrap();
+        }
+        let guard = crate::transaction::lock::acquire(
+            &site,
+            &SiteRelativePath::parse("locks/mutation.lock").unwrap(),
+            RequestId::parse(ids[2]).unwrap(),
+        )
+        .unwrap();
+
+        let listed = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
+        let order: Vec<String> = listed
+            .operations
+            .iter()
+            .map(|entry| entry.request_id.to_string())
+            .collect();
+        assert_eq!(order, [ids[2], ids[1], ids[0]]);
+        assert_eq!(listed.operations[0].next_action, NextAction::Wait);
+        assert!(listed.operations[0].active);
+        assert_eq!(listed.operations[1].next_action, NextAction::ManualRecovery);
+        assert_eq!(listed.operations[2].next_action, NextAction::None);
+        let json = serde_json::to_string(&listed).unwrap();
+        assert!(!json.contains("secret path"));
+        assert!(!json.contains("idempotencyKey"));
+        drop(guard);
+
+        let page = list(&root, Some(SITE_ID), None, None, None, Some(2)).unwrap();
+        assert_eq!(page.operations.len(), 2);
+        assert!(page.truncated);
+    }
+
+    #[test]
+    fn list_of_an_unused_scope_is_empty_and_bad_scopes_are_rejected() {
+        let (_directory, root) = state_root();
+        let empty = list(
+            &root,
+            Some("660e8400-e29b-41d4-a716-446655440000"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(empty.operations.is_empty() && !empty.truncated);
+        assert_eq!(
+            list(&root, None, None, None, Some("other"), None),
+            Err(StatusError::InvalidScope)
+        );
+        assert_eq!(
+            list(&root, None, None, None, None, None),
+            Err(StatusError::InvalidScope)
+        );
+    }
+
+    #[test]
+    fn list_counts_unreadable_records_instead_of_hiding_them() {
+        let (_directory, root) = state_root();
+        let site = root
+            .open_managed_dir(&SiteRelativePath::parse(format!("sites/{SITE_ID}")).unwrap())
+            .unwrap();
+        site.write_atomic(
+            &SiteRelativePath::parse("transactions/garbage.json").unwrap(),
+            b"{",
+        )
+        .unwrap();
+        let listed = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
+        assert_eq!(listed.unreadable, 1);
     }
 }

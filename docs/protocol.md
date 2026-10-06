@@ -63,6 +63,22 @@ interrupted transaction that requires operation-specific recovery; stale lock
 file contents alone never make it active. A missing transaction returns
 `NOT_FOUND` and never creates a replacement transaction.
 
+## `operation.list`
+
+`operation list` takes exactly one scope selector (`--site-id`, `--database`,
+`--backup-database` or `--stack wcp`) and an optional `--limit` (default 20,
+clamped to 100). It returns the newest durable transactions of that scope
+first and never executes or retries a mutation. Each entry carries only
+`requestId`, `operation`, `status`, start/finish times, `errorCode`, `active`
+and `nextAction`; the stored result, the error message text and the
+idempotency key are deliberately omitted. `nextAction` is `none` for a
+finished transaction, `wait` while the same request owns the mutation lock and
+`manualRecovery` for an interrupted `IN_PROGRESS` transaction without a live
+owner. The engine never names an automatic retry for interrupted work. A
+scope that never ran a mutation returns an empty list. `unreadable` counts
+records that exist but could not be parsed and `truncated` is true when more
+records exist than were returned.
+
 ## `cron.installTab`
 
 `cron install-tab` atomically replaces a complete crontab with an optimistic
