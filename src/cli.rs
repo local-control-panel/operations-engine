@@ -243,12 +243,32 @@ pub enum OperationCommand {
         #[arg(long = "request-id")]
         request_id: String,
     },
+    /// List the newest durable transactions of one scope, redacted.
+    List {
+        #[arg(long = "site-id")]
+        site_id: Option<String>,
+
+        #[arg(long)]
+        database: Option<String>,
+
+        #[arg(long = "backup-database")]
+        backup_database: Option<String>,
+
+        /// A managed Compose stack; only `wcp` exists.
+        #[arg(long)]
+        stack: Option<String>,
+
+        /// Page size; defaults to 20 and is clamped to 100.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 impl OperationCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Status { .. } => "operation.status",
+            Self::List { .. } => "operation.list",
         }
     }
 }
