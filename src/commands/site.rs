@@ -57,12 +57,14 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
         ),
         SiteCommand::RemoveRoot {
             domain,
+            relative_root,
             site_id,
             confirm_contents,
             request_id,
             idempotency_key,
         } => remove_root(
             &domain,
+            relative_root.as_deref(),
             site_id.as_deref(),
             confirm_contents,
             &request_id,
@@ -305,6 +307,7 @@ fn prepare_root(
 
 fn remove_root(
     domain: &str,
+    relative_root: Option<&str>,
     site_id: Option<&str>,
     confirm_contents: bool,
     request_id: &str,
@@ -314,6 +317,7 @@ fn remove_root(
 
     let request = match RemoveRequest::parse(
         domain,
+        relative_root,
         site_id,
         confirm_contents,
         request_id,

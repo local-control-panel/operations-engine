@@ -712,6 +712,11 @@ pub enum SiteCommand {
     RemoveRoot {
         #[arg(long)]
         domain: String,
+        /// Remove only this directory below the site directory (and the
+        /// site directory itself if that leaves it empty). Omit to remove
+        /// the whole site directory.
+        #[arg(long = "relative-root")]
+        relative_root: Option<String>,
         #[arg(long = "site-id")]
         site_id: Option<String>,
         /// Confirm that deleting a non-empty directory is intended

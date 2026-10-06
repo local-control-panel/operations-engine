@@ -346,6 +346,24 @@ fn parse_domain(value: &str) -> Result<Domain, RequestError> {
     Ok(domain)
 }
 
+fn parse_relative_root(relative_root: Option<&str>) -> Result<Vec<SiteRelativePath>, RequestError> {
+    let mut components = Vec::new();
+    if let Some(relative) = relative_root.filter(|relative| !relative.is_empty()) {
+        let parsed =
+            SiteRelativePath::parse(relative).map_err(|_| RequestError::InvalidRelativeRoot)?;
+        for component in parsed.as_path().components() {
+            components.push(
+                SiteRelativePath::parse(component.as_os_str())
+                    .map_err(|_| RequestError::InvalidRelativeRoot)?,
+            );
+        }
+        if components.len() > MAX_RELATIVE_COMPONENTS {
+            return Err(RequestError::InvalidRelativeRoot);
+        }
+    }
+    Ok(components)
+}
+
 fn parse_ids(
     request_id: &str,
     key: Option<&str>,
@@ -410,20 +428,7 @@ impl PrepareRequest {
     ) -> Result<Self, RequestError> {
         let domain = parse_domain(domain)?;
         let existing = ExistingPolicy::parse(existing)?;
-        let mut components = Vec::new();
-        if let Some(relative) = relative_root.filter(|relative| !relative.is_empty()) {
-            let parsed =
-                SiteRelativePath::parse(relative).map_err(|_| RequestError::InvalidRelativeRoot)?;
-            for component in parsed.as_path().components() {
-                components.push(
-                    SiteRelativePath::parse(component.as_os_str())
-                        .map_err(|_| RequestError::InvalidRelativeRoot)?,
-                );
-            }
-            if components.len() > MAX_RELATIVE_COMPONENTS {
-                return Err(RequestError::InvalidRelativeRoot);
-            }
-        }
+        let components = parse_relative_root(relative_root)?;
         for id in [uid, gid] {
             if !(MIN_SITE_ID..=MAX_SITE_ID).contains(&id) {
                 return Err(RequestError::InvalidIdentity);
@@ -460,6 +465,10 @@ pub struct PrepareResult {
 /// release tree).
 pub struct RemoveRequest {
     pub domain: Domain,
+    /// Directories below the site directory to remove instead of the whole
+    /// site directory; the site directory and the levels between are then
+    /// removed too, but only while they are left empty.
+    relative_root: Vec<SiteRelativePath>,
     pub site_id: Option<SiteId>,
     /// The caller confirms that deleting a non-empty directory is intended.
     pub confirm_contents: bool,
@@ -470,12 +479,14 @@ pub struct RemoveRequest {
 impl RemoveRequest {
     pub fn parse(
         domain: &str,
+        relative_root: Option<&str>,
         site_id: Option<&str>,
         confirm_contents: bool,
         request_id: &str,
         key: Option<&str>,
     ) -> Result<Self, RequestError> {
         let domain = parse_domain(domain)?;
+        let relative_root = parse_relative_root(relative_root)?;
         let site_id = site_id
             .map(SiteId::parse)
             .transpose()
@@ -483,6 +494,7 @@ impl RemoveRequest {
         let (request_id, idempotency_key) = parse_ids(request_id, key)?;
         Ok(Self {
             domain,
+            relative_root,
             site_id,
             confirm_contents,
             request_id,
@@ -521,7 +533,7 @@ impl ReleaseRequest {
             request_id,
             idempotency_key,
             ..
-        } = RemoveRequest::parse(domain, site_id, false, request_id, key)?;
+        } = RemoveRequest::parse(domain, None, site_id, false, request_id, key)?;
         Ok(Self {
             domain,
             site_id,
@@ -759,13 +771,16 @@ fn walk_and_own(
 
 /// One directory a removal or release will act on.
 struct Target {
-    parent: ManagedRoot,
-    name: SiteRelativePath,
+    /// `parents[level]` is the directory `names[level]` lives in.
+    parents: Vec<ManagedRoot>,
+    names: Vec<SiteRelativePath>,
     dir: ManagedRoot,
     path: PathBuf,
     /// Entries below it that are not directories (files, symlinks, ...):
     /// a tree of empty directories holds no content.
     contents: usize,
+    /// Remove the ancestors named by `names[..len - 1]` too, while empty.
+    prune: bool,
 }
 
 /// Removes `<content root>/<domain>` and, when the request names a site id,
@@ -848,6 +863,7 @@ pub fn release_root(
                 manifests_dir,
                 manifest_owner_uid,
                 &req.domain,
+                &[],
                 req.site_id.as_ref(),
             )?;
             let mut released = Vec::new();
@@ -878,6 +894,7 @@ fn remove(
         manifests_dir,
         manifest_owner_uid,
         &req.domain,
+        &req.relative_root,
         req.site_id.as_ref(),
     )?;
     if !req.confirm_contents && targets.iter().any(|target| target.contents > 0) {
@@ -890,7 +907,21 @@ fn remove(
     for target in &targets {
         let mut remaining = MAX_REMOVE_ENTRIES;
         empty_dir(&target.dir, 0, &mut remaining)?;
-        target.parent.remove_dir(&target.name).map_err(Error::Io)?;
+        let last = target.names.len() - 1;
+        target.parents[last]
+            .remove_dir(&target.names[last])
+            .map_err(Error::Io)?;
+        if target.prune {
+            // Best effort: stops at the first level that is not empty.
+            for level in (0..last).rev() {
+                if target.parents[level]
+                    .remove_dir(&target.names[level])
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
         removed.push(target.path.to_string_lossy().into_owned());
         entries_removed += (MAX_REMOVE_ENTRIES - remaining) as u64;
     }
@@ -909,61 +940,70 @@ fn resolve_targets(
     manifests_dir: &Path,
     manifest_owner_uid: u32,
     domain: &Domain,
+    relative_root: &[SiteRelativePath],
     site_id: Option<&SiteId>,
 ) -> Result<Vec<Target>, Error> {
     refuse_system_dir(content_root)?;
     let mut targets = Vec::new();
 
+    let mut names = vec![domain_rel(domain)];
+    names.extend(relative_root.iter().cloned());
+    let mut path = content_root.as_path().join(domain.as_str());
+    for component in relative_root {
+        path.push(component.as_path());
+    }
     let base = ManagedRoot::open(content_root).map_err(Error::Io)?;
-    let path = content_root.as_path().join(domain.as_str());
-    if let Some(target) = open_target(base, domain_rel(domain), path)? {
+    if let Some(target) = open_target(base, names, path, !relative_root.is_empty())? {
         targets.push(target);
     }
 
     if let Some(id) = site_id {
+        let names = vec![rel(RELEASE_TREES_DIR), rel(&id.to_string())];
+        let path = content_root
+            .as_path()
+            .join(RELEASE_TREES_DIR)
+            .join(id.to_string());
         let base = ManagedRoot::open(content_root).map_err(Error::Io)?;
-        let trees = match base.symlink_metadata(&rel(RELEASE_TREES_DIR)) {
-            Ok(_) => Some(
-                base.open_child_dir_nofollow(&rel(RELEASE_TREES_DIR))
-                    .map_err(open_error)?,
-            ),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(Error::Io(error)),
-        };
-        if let Some(trees) = trees {
-            let name = rel(&id.to_string());
-            let path = content_root
-                .as_path()
-                .join(RELEASE_TREES_DIR)
-                .join(id.to_string());
-            if let Some(target) = open_target(trees, name, path)? {
-                let manifest_path = manifests_dir.join(format!("{id}.json"));
-                let manifest = SiteManifest::load_owned_by(&manifest_path, manifest_owner_uid, *id)
-                    .map_err(|_| Error::ManifestMismatch)?;
-                if manifest.domain != domain.as_str() {
-                    return Err(Error::ManifestMismatch);
-                }
-                targets.push(target);
+        if let Some(target) = open_target(base, names, path, false)? {
+            let manifest_path = manifests_dir.join(format!("{id}.json"));
+            let manifest = SiteManifest::load_owned_by(&manifest_path, manifest_owner_uid, *id)
+                .map_err(|_| Error::ManifestMismatch)?;
+            if manifest.domain != domain.as_str() {
+                return Err(Error::ManifestMismatch);
             }
+            targets.push(target);
         }
     }
     Ok(targets)
 }
 
-/// Opens `name` under `parent` as a target, or `None` when it does not
-/// exist. Applies every refusal that does not need the other target.
+/// Walks `names` down from `base` without following a symlink and returns
+/// the last directory as a target, or `None` when any level does not exist.
+/// Applies every refusal that does not need the other target.
 fn open_target(
-    parent: ManagedRoot,
-    name: SiteRelativePath,
+    base: ManagedRoot,
+    names: Vec<SiteRelativePath>,
     path: PathBuf,
+    prune: bool,
 ) -> Result<Option<Target>, Error> {
-    match parent.symlink_metadata(&name) {
-        Ok(metadata) if metadata.is_dir() => {}
-        Ok(_) => return Err(Error::UnsafePath),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(Error::Io(error)),
+    let mut parents = vec![base];
+    let mut dir = None;
+    for (level, name) in names.iter().enumerate() {
+        let parent = &parents[level];
+        match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(Error::UnsafePath),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::Io(error)),
+        }
+        let child = parent.open_child_dir_nofollow(name).map_err(open_error)?;
+        if level + 1 == names.len() {
+            dir = Some(child);
+        } else {
+            parents.push(child);
+        }
     }
-    let dir = parent.open_child_dir_nofollow(&name).map_err(open_error)?;
+    let dir = dir.expect("a target has at least one name");
     let metadata = dir.own_metadata().map_err(Error::Io)?;
     if !owner_allowed(metadata.uid()) {
         return Err(Error::UnknownOwner);
@@ -971,11 +1011,12 @@ fn open_target(
     let mut counts = Counts::default();
     scan(&dir, metadata.dev(), 0, &mut counts)?;
     Ok(Some(Target {
-        parent,
-        name,
+        parents,
+        names,
         dir,
         path,
         contents: counts.contents,
+        prune,
     }))
 }
 
@@ -1381,7 +1422,7 @@ mod tests {
     }
 
     fn rm(domain: &str, site: Option<&str>, confirm: bool, id: &str) -> RemoveRequest {
-        RemoveRequest::parse(domain, site, confirm, id, None).unwrap()
+        RemoveRequest::parse(domain, None, site, confirm, id, None).unwrap()
     }
 
     const SITE: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -1620,11 +1661,11 @@ mod tests {
         assert!(parse("a.test", Some(""), 10000, 10000).is_none());
 
         assert_eq!(
-            RemoveRequest::parse("sites", None, true, ID, None).err(),
+            RemoveRequest::parse("sites", None, None, true, ID, None).err(),
             Some(RequestError::ReservedDomain)
         );
         assert_eq!(
-            RemoveRequest::parse("a.test", Some("not-a-uuid"), true, ID, None).err(),
+            RemoveRequest::parse("a.test", None, Some("not-a-uuid"), true, ID, None).err(),
             Some(RequestError::InvalidSiteId)
         );
         assert_eq!(
@@ -1939,5 +1980,38 @@ mod tests {
         }
         // The symlink was neither followed nor changed.
         assert_eq!(fs::metadata(&outside).unwrap().uid(), 777);
+    }
+
+    #[test]
+    fn remove_with_a_relative_root_takes_only_that_directory_and_prunes_empty_parents() {
+        let fixture = Fixture::new();
+        let remove = |domain: &str, id: &str| {
+            fixture
+                .remove(
+                    &RemoveRequest::parse(domain, Some("public"), None, true, id, None).unwrap(),
+                )
+                .unwrap()
+        };
+
+        // Only the root goes; the site directory stays while it holds
+        // anything else.
+        fs::create_dir_all(fixture.path("s.test/public")).unwrap();
+        fs::write(fixture.path("s.test/public/index.php"), "x").unwrap();
+        fs::write(fixture.path("s.test/notes.txt"), "keep").unwrap();
+        let result = remove("s.test", ID);
+        assert_eq!(
+            result.removed,
+            vec![fixture.path("s.test/public").to_string_lossy()]
+        );
+        assert!(!fixture.path("s.test/public").exists());
+        assert!(fixture.path("s.test/notes.txt").exists());
+
+        // An otherwise empty site directory is removed with its root.
+        fs::create_dir_all(fixture.path("t.test/public")).unwrap();
+        remove("t.test", OTHER_ID);
+        assert!(!fixture.path("t.test").exists());
+
+        // A missing root is a no-op.
+        assert!(remove("u.test", THIRD_ID).removed.is_empty());
     }
 }
