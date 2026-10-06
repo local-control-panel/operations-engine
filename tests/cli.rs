@@ -55,6 +55,8 @@ fn capabilities_describe_only_implemented_operations() {
             "site.removeRoot",
             "site.releaseRoot",
             "site.renameManifest",
+            "site.enroll",
+            "site.unenroll",
             "engine.install",
             "engine.rollback",
             "ingress.activateConfig",

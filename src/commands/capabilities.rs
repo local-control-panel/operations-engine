@@ -41,6 +41,8 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "site.removeRoot",
                 "site.releaseRoot",
                 "site.renameManifest",
+                "site.enroll",
+                "site.unenroll",
                 "engine.install",
                 "engine.rollback",
                 "ingress.activateConfig",
