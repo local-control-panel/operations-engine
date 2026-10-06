@@ -500,18 +500,20 @@ mod tests {
         let program = dir.path().join(name);
         fs::copy(which_sleep(), &program).unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-        let child = Command::new(&program).arg("300").spawn().unwrap();
+        let mut child = Command::new(&program).arg("300").spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let want: String = name.chars().take(MAX_COMM_LEN).collect();
-        loop {
+        while Instant::now() < deadline {
             if let Ok(id) = read_identity(Path::new(PROC_ROOT), child.id()) {
                 if id.comm == want {
                     return (dir, child);
                 }
             }
-            assert!(Instant::now() < deadline, "child never reached its comm");
             std::thread::sleep(Duration::from_millis(10));
         }
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child never reached its comm");
     }
 
     fn request(pid: u32, signal: &str, id: &str) -> Request {
