@@ -38,6 +38,97 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SiteCommand::RenameManifest {
+            site_id,
+            domain,
+            request_id,
+            idempotency_key,
+        } => rename_manifest(&site_id, &domain, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn rename_manifest(
+    site_id: &str,
+    domain: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_manifest::{RENAME_OPERATION, RenameRequest};
+
+    let request = match RenameRequest::parse(site_id, domain, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                RENAME_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_rename_manifest(&request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            RENAME_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.renameManifest requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_rename_manifest(
+    request: &crate::site_manifest::RenameRequest,
+) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{
+        config::EngineConfig,
+        filesystem::ManagedRoot,
+        site_manifest::{self, RENAME_OPERATION},
+    };
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                RENAME_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                RENAME_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    match site_manifest::rename_manifest(&engine_state, Path::new(SITES_DIR), 0, request) {
+        Ok(result) => Response::success(RENAME_OPERATION, result),
+        Err(site_manifest::Error::PostCommit(result)) => {
+            Response::success(RENAME_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the operation completed but its transaction record could not be \
+                              saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(RENAME_OPERATION, code, &message))
+        }
     }
 }
 

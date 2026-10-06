@@ -646,6 +646,20 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+
+    /// Point a site's engine manifest at its new domain after a panel
+    /// rename. Only `domain` changes; a repeat for the same domain is a
+    /// no-op and the result names the previous domain for a rollback.
+    RenameManifest {
+        #[arg(long = "site-id")]
+        site_id: String,
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SiteCommand {
@@ -654,6 +668,7 @@ impl SiteCommand {
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
             Self::MoveRoot { .. } => "site.moveRoot",
+            Self::RenameManifest { .. } => "site.renameManifest",
         }
     }
 }
