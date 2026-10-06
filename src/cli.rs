@@ -181,6 +181,21 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Send one allowlisted signal to a verified, non-protected process.
+    SignalProcess {
+        #[arg(long)]
+        pid: u32,
+        /// `TERM` (default), `KILL`, `HUP` or `INT`.
+        #[arg(long)]
+        signal: Option<String>,
+        /// Refuse unless the process still has this `comm` name.
+        #[arg(long = "expect-comm")]
+        expect_comm: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Create, format, enable and persist the managed `/swapfile`.
     CreateSwap {
         #[arg(long = "size-mb")]
@@ -216,6 +231,7 @@ impl SystemCommand {
             Self::InstallAutoupdates { .. } => "system.installAutoupdates",
             Self::InstallDocker { .. } => "system.installDocker",
             Self::StartDocker { .. } => "system.startDocker",
+            Self::SignalProcess { .. } => "system.signalProcess",
             Self::CreateSwap { .. } => "system.createSwap",
             Self::DeleteSwap { .. } => "system.deleteSwap",
             Self::ResizeSwap { .. } => "system.resizeSwap",
