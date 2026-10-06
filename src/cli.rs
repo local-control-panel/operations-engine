@@ -677,6 +677,46 @@ pub enum SiteCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Create a new site's content directory
+    /// `<content root>/<domain>[/<relative root>]` and give the final
+    /// directory to the site identity (mode 0700). Refuses symlinks,
+    /// system uids/gids and an existing non-empty directory owned by
+    /// anyone else; nothing is changed recursively.
+    PrepareRoot {
+        #[arg(long)]
+        domain: String,
+        /// Directory below the site directory that becomes the root, e.g.
+        /// `public`. Omit for the site directory itself.
+        #[arg(long = "relative-root")]
+        relative_root: Option<String>,
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        gid: u32,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
+    /// Delete a site's directory `<content root>/<domain>` and, with
+    /// `--site-id`, its engine release tree. Refuses symlinks, system-owned
+    /// directories, oversized trees and (without `--confirm-contents`)
+    /// non-empty directories.
+    RemoveRoot {
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "site-id")]
+        site_id: Option<String>,
+        /// Confirm that deleting a non-empty directory is intended.
+        #[arg(long = "confirm-contents")]
+        confirm_contents: bool,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Point a site's engine manifest at its new domain after a panel
     /// rename. Only `domain` changes; a repeat for the same domain is a
     /// no-op and the result names the previous domain for a rollback.
@@ -698,6 +738,8 @@ impl SiteCommand {
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
             Self::MoveRoot { .. } => "site.moveRoot",
+            Self::PrepareRoot { .. } => "site.prepareRoot",
+            Self::RemoveRoot { .. } => "site.removeRoot",
             Self::RenameManifest { .. } => "site.renameManifest",
         }
     }

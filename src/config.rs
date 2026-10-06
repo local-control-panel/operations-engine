@@ -124,7 +124,18 @@ pub struct SiteManifest {
 impl SiteManifest {
     #[cfg(unix)]
     pub fn load_root_owned(path: &Path, expected: SiteId) -> Result<Self, ConfigError> {
-        let json = read_owned_by(path, 0)?;
+        Self::load_owned_by(path, 0, expected)
+    }
+
+    /// `required_uid` is the owner the manifest must have (0 in
+    /// production).
+    #[cfg(unix)]
+    pub fn load_owned_by(
+        path: &Path,
+        required_uid: u32,
+        expected: SiteId,
+    ) -> Result<Self, ConfigError> {
+        let json = read_owned_by(path, required_uid)?;
         Self::from_json_for_site(&json, expected)
     }
 
