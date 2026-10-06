@@ -51,6 +51,7 @@ fn capabilities_describe_only_implemented_operations() {
             "site.deploy",
             "site.rollback",
             "site.moveRoot",
+            "site.renameManifest",
             "engine.install",
             "engine.rollback",
             "ingress.activateConfig",
