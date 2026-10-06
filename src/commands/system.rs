@@ -28,6 +28,19 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => start_docker(&request_id, idempotency_key.as_deref()),
+        SystemCommand::SignalProcess {
+            pid,
+            signal,
+            expect_comm,
+            request_id,
+            idempotency_key,
+        } => signal_process(
+            pid,
+            signal.as_deref(),
+            expect_comm.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SystemCommand::CreateSwap {
             size_mb,
             request_id,
@@ -273,6 +286,73 @@ fn install_docker(request_id: &str, key: Option<&str>) -> Result<Response, Respo
             OPERATION,
             ErrorCode::UnsupportedPlatform,
             "system.installDocker requires a Debian or Ubuntu host",
+        ))
+    }
+}
+
+fn signal_process(
+    pid: u32,
+    signal: Option<&str>,
+    expect_comm: Option<&str>,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(target_os = "linux")]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot, system_signal};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_signal::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let request = match system_signal::Request::parse(pid, signal, expect_comm, request_id, key)
+        {
+            Ok(v) => v,
+            Err(error) => {
+                return Ok(Response::failure(
+                    system_signal::OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_signal::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let ctx = system_signal::Context {
+            engine_state: &state,
+            proc_root: std::path::Path::new(system_signal::PROC_ROOT),
+            engine_pid: std::process::id(),
+        };
+        match system_signal::execute(&ctx, &request) {
+            Ok(v) | Err(system_signal::Error::PostCommit { result: v }) => {
+                Response::success(system_signal::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(system_signal::OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, signal, expect_comm, request_id, key);
+        Ok(Response::failure(
+            "system.signalProcess",
+            ErrorCode::UnsupportedPlatform,
+            "system.signalProcess requires a Linux host",
         ))
     }
 }

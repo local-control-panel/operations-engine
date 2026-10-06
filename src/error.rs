@@ -69,6 +69,9 @@ pub enum ErrorCode {
     /// about the domain's current state (parked vs. not) that turned out to
     /// be false.
     IngressNotParked,
+    /// The kernel refused an otherwise valid request for lack of privilege
+    /// (`EPERM`), e.g. signalling a process the engine may not signal.
+    PermissionDenied,
 }
 
 impl ErrorCode {
@@ -92,6 +95,7 @@ impl ErrorCode {
             Self::ConfigReloadFailed => "CONFIG_RELOAD_FAILED",
             Self::ConfigRecoveryFailed => "CONFIG_RECOVERY_FAILED",
             Self::IngressNotParked => "INGRESS_NOT_PARKED",
+            Self::PermissionDenied => "PERMISSION_DENIED",
         }
     }
 }
@@ -128,6 +132,7 @@ mod tests {
         );
         assert_eq!(ErrorCode::Timeout.as_str(), "TIMEOUT");
         assert_eq!(ErrorCode::NotFound.as_str(), "NOT_FOUND");
+        assert_eq!(ErrorCode::PermissionDenied.as_str(), "PERMISSION_DENIED");
     }
 
     #[test]
