@@ -53,6 +53,7 @@ fn capabilities_describe_only_implemented_operations() {
             "site.moveRoot",
             "site.prepareRoot",
             "site.removeRoot",
+            "site.releaseRoot",
             "site.renameManifest",
             "engine.install",
             "engine.rollback",

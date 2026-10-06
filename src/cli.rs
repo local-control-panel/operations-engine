@@ -717,6 +717,20 @@ pub enum SiteCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Give everything left in a deleted site's directory (and, with
+    /// `--site-id`, its release tree) to root:root, so a freed numeric uid
+    /// keeps no access. Same safe walk as `permissions fix-ownership`.
+    ReleaseRoot {
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "site-id")]
+        site_id: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Point a site's engine manifest at its new domain after a panel
     /// rename. Only `domain` changes; a repeat for the same domain is a
     /// no-op and the result names the previous domain for a rollback.
@@ -740,6 +754,7 @@ impl SiteCommand {
             Self::MoveRoot { .. } => "site.moveRoot",
             Self::PrepareRoot { .. } => "site.prepareRoot",
             Self::RemoveRoot { .. } => "site.removeRoot",
+            Self::ReleaseRoot { .. } => "site.releaseRoot",
             Self::RenameManifest { .. } => "site.renameManifest",
         }
     }

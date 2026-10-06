@@ -39,6 +39,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "site.moveRoot",
                 "site.prepareRoot",
                 "site.removeRoot",
+                "site.releaseRoot",
                 "site.renameManifest",
                 "engine.install",
                 "engine.rollback",

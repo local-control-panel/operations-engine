@@ -66,6 +66,17 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SiteCommand::ReleaseRoot {
+            domain,
+            site_id,
+            request_id,
+            idempotency_key,
+        } => release_root(
+            &domain,
+            site_id.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SiteCommand::RenameManifest {
             site_id,
             domain,
@@ -327,6 +338,48 @@ fn remove_root(
             REMOVE_OPERATION,
             ErrorCode::UnsupportedPlatform,
             "site.removeRoot requires a Unix host",
+        ))
+    }
+}
+
+fn release_root(
+    domain: &str,
+    site_id: Option<&str>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_root::{RELEASE_OPERATION, ReleaseRequest};
+
+    let request = match ReleaseRequest::parse(domain, site_id, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                RELEASE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_site_root(RELEASE_OPERATION, |engine_state, config| {
+            crate::site_root::release_root(
+                engine_state,
+                &config.content_roots,
+                std::path::Path::new(SITES_DIR),
+                0,
+                &request,
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            RELEASE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.releaseRoot requires a Unix host",
         ))
     }
 }
