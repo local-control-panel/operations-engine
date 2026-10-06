@@ -28,6 +28,17 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => start_docker(&request_id, idempotency_key.as_deref()),
+        SystemCommand::PruneDocker {
+            kind,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => prune_docker(
+            &kind,
+            &confirmation,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SystemCommand::SignalProcess {
             pid,
             signal,
@@ -422,6 +433,79 @@ fn start_docker(request_id: &str, key: Option<&str>) -> Result<Response, Respons
             system_start_docker::OPERATION,
             ErrorCode::UnsupportedPlatform,
             "system.startDocker requires a Unix host",
+        ))
+    }
+}
+
+fn prune_docker(
+    kind: &str,
+    confirmation: &str,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, docker_prune, filesystem::ManagedRoot};
+        let request = match docker_prune::Request::parse(kind, confirmation, request_id, key) {
+            Ok(v) => v,
+            Err(error) => {
+                let message = match error {
+                    docker_prune::RequestError::InvalidKind => {
+                        "kind must be image, volume or system"
+                    }
+                    docker_prune::RequestError::InvalidConfirmation => {
+                        "confirmation does not match the prune kind"
+                    }
+                    _ => "request-id or idempotency-key is invalid",
+                };
+                return Ok(Response::failure(
+                    docker_prune::OPERATION,
+                    ErrorCode::InvalidInput,
+                    message,
+                ));
+            }
+        };
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    docker_prune::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    docker_prune::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let ctx = docker_prune::Context {
+            engine_state: &state,
+            docker_program: "docker",
+        };
+        match docker_prune::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) | Err(docker_prune::Error::PostCommit { result: v }) => {
+                Response::success(docker_prune::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(docker_prune::OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (kind, confirmation, request_id, key);
+        Ok(Response::failure(
+            "docker.prune",
+            ErrorCode::UnsupportedPlatform,
+            "docker.prune requires a Unix host",
         ))
     }
 }

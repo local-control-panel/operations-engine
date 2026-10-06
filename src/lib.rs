@@ -17,6 +17,8 @@ pub mod db_provision;
 pub mod db_restore;
 pub mod db_tool;
 pub mod deploy;
+#[cfg(unix)]
+pub mod docker_prune;
 pub mod engine;
 pub mod error;
 pub mod filesystem;

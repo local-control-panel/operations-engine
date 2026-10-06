@@ -114,7 +114,8 @@ fn capabilities_describe_only_implemented_operations() {
             "stack.flushFpc",
             "stack.writeSiteService",
             "stack.activateSiteConfig",
-            "stack.removeSiteService"
+            "stack.removeSiteService",
+            "docker.prune"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

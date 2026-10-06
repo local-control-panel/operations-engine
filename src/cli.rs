@@ -181,6 +181,19 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Prune unused Docker resources of one kind (`image`, `volume` or
+    /// `system`) under a fixed argv, after the kind's exact confirmation
+    /// token. The engine-managed `wcp` stack is never a candidate.
+    PruneDocker {
+        #[arg(long)]
+        kind: String,
+        #[arg(long)]
+        confirmation: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Send one allowlisted signal to a verified, non-protected process.
     SignalProcess {
         #[arg(long)]
@@ -231,6 +244,7 @@ impl SystemCommand {
             Self::InstallAutoupdates { .. } => "system.installAutoupdates",
             Self::InstallDocker { .. } => "system.installDocker",
             Self::StartDocker { .. } => "system.startDocker",
+            Self::PruneDocker { .. } => "docker.prune",
             Self::SignalProcess { .. } => "system.signalProcess",
             Self::CreateSwap { .. } => "system.createSwap",
             Self::DeleteSwap { .. } => "system.deleteSwap",
