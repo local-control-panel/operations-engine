@@ -43,6 +43,7 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             relative_root,
             uid,
             gid,
+            existing,
             request_id,
             idempotency_key,
         } => prepare_root(
@@ -50,6 +51,7 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             relative_root.as_deref(),
             uid,
             gid,
+            existing.as_deref(),
             &request_id,
             idempotency_key.as_deref(),
         ),
@@ -259,22 +261,30 @@ fn prepare_root(
     relative_root: Option<&str>,
     uid: u32,
     gid: u32,
+    existing: Option<&str>,
     request_id: &str,
     idempotency_key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
     use crate::site_root::{PREPARE_OPERATION, PrepareRequest};
 
-    let request =
-        match PrepareRequest::parse(domain, relative_root, uid, gid, request_id, idempotency_key) {
-            Ok(request) => request,
-            Err(error) => {
-                return Ok(Response::failure(
-                    PREPARE_OPERATION,
-                    ErrorCode::InvalidInput,
-                    error.message(),
-                ));
-            }
-        };
+    let request = match PrepareRequest::parse(
+        domain,
+        relative_root,
+        uid,
+        gid,
+        existing,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                PREPARE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
 
     #[cfg(unix)]
     {

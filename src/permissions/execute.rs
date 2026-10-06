@@ -178,7 +178,6 @@ pub(crate) fn repair_tree(
     exclusions: &[&Path],
 ) -> io::Result<u64> {
     let root = open_directory(path)?;
-    let root_stat = stat_fd(root.as_raw_fd())?;
     let relative_exclusions: Vec<Vec<OsString>> = exclusions
         .iter()
         .filter_map(|excluded| excluded.strip_prefix(path).ok())
@@ -189,12 +188,24 @@ pub(crate) fn repair_tree(
                 .collect()
         })
         .collect();
+    repair_open_directory(&root, uid, gid, &relative_exclusions)
+}
+
+/// `repair_tree` for a directory the caller already holds open (so a path
+/// the caller resolved cannot be swapped between its checks and the walk).
+pub(crate) fn repair_open_directory(
+    root: &OwnedFd,
+    uid: u32,
+    gid: u32,
+    relative_exclusions: &[Vec<OsString>],
+) -> io::Result<u64> {
+    let root_stat = stat_fd(root.as_raw_fd())?;
     let mut repaired = repair_directory(
-        &root,
+        root,
         uid,
         gid,
         root_stat.st_dev as u64,
-        &relative_exclusions,
+        relative_exclusions,
         &[],
     )?;
     if root_stat.st_uid != uid || root_stat.st_gid != gid {

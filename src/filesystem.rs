@@ -123,6 +123,15 @@ impl ManagedRoot {
         })
     }
 
+    /// A duplicate of this directory's descriptor, for the descriptor-based
+    /// ownership walk.
+    #[cfg(unix)]
+    pub fn try_clone_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        Ok(std::os::fd::OwnedFd::from(
+            self.directory.try_clone()?.into_std_file(),
+        ))
+    }
+
     /// Metadata of this directory itself (an `fstat` on the open handle).
     pub fn own_metadata(&self) -> io::Result<cap_std::fs::Metadata> {
         self.directory.dir_metadata()

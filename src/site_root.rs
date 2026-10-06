@@ -60,6 +60,7 @@ pub enum RequestError {
     InvalidRelativeRoot,
     InvalidIdentity,
     InvalidSiteId,
+    InvalidExistingPolicy,
 }
 
 impl RequestError {
@@ -75,6 +76,7 @@ impl RequestError {
             }
             Self::InvalidIdentity => "uid and gid must be site identities (1000 or higher)",
             Self::InvalidSiteId => "site-id must be a canonical UUID",
+            Self::InvalidExistingPolicy => "existing must be refuse, adopt-directory or adopt-tree",
         }
     }
 }
@@ -356,6 +358,32 @@ fn parse_ids(
     Ok((request_id, key))
 }
 
+/// What `prepareRoot` does with a final directory that already exists and
+/// holds content owned by someone else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExistingPolicy {
+    /// Refuse (the default): nothing is changed.
+    Refuse,
+    /// Hand over the directory itself only; the files inside keep their
+    /// owners.
+    AdoptDirectory,
+    /// Hand over the directory and everything below it, as one safe
+    /// descriptor walk (no symlink is followed or changed, nothing on
+    /// another filesystem is touched). Not reverted if it fails part-way.
+    AdoptTree,
+}
+
+impl ExistingPolicy {
+    fn parse(value: Option<&str>) -> Result<Self, RequestError> {
+        match value {
+            None | Some("refuse") => Ok(Self::Refuse),
+            Some("adopt-directory") => Ok(Self::AdoptDirectory),
+            Some("adopt-tree") => Ok(Self::AdoptTree),
+            Some(_) => Err(RequestError::InvalidExistingPolicy),
+        }
+    }
+}
+
 /// Creates (or adopts) `<content root>/<domain>/<relative root>` for a new
 /// site and hands it to the site identity.
 pub struct PrepareRequest {
@@ -365,6 +393,7 @@ pub struct PrepareRequest {
     relative_root: Vec<SiteRelativePath>,
     pub uid: u32,
     pub gid: u32,
+    pub existing: ExistingPolicy,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -375,10 +404,12 @@ impl PrepareRequest {
         relative_root: Option<&str>,
         uid: u32,
         gid: u32,
+        existing: Option<&str>,
         request_id: &str,
         key: Option<&str>,
     ) -> Result<Self, RequestError> {
         let domain = parse_domain(domain)?;
+        let existing = ExistingPolicy::parse(existing)?;
         let mut components = Vec::new();
         if let Some(relative) = relative_root.filter(|relative| !relative.is_empty()) {
             let parsed =
@@ -404,6 +435,7 @@ impl PrepareRequest {
             relative_root: components,
             uid,
             gid,
+            existing,
             request_id,
             idempotency_key,
         })
@@ -605,10 +637,10 @@ fn open_error(error: io::Error) -> Error {
 /// handed to the site identity, and only that one directory is touched:
 /// nothing is ever changed recursively.
 ///
-/// An existing final directory is adopted only when it is empty or already
-/// owned by the requested identity (so a replay without an idempotency key
-/// is a no-op); a non-empty directory owned by anyone else is refused with
-/// nothing changed. Any failure removes the directories this request
+/// An existing final directory is adopted when it is empty or already owned
+/// by the requested identity (so a replay without an idempotency key is a
+/// no-op); a non-empty directory owned by anyone else is refused with
+/// nothing changed unless the request opts in with an `ExistingPolicy`. Any failure removes the directories this request
 /// created and restores an adopted directory's previous owner and mode.
 pub fn prepare_root(
     engine_state: &ManagedRoot,
@@ -705,6 +737,7 @@ fn walk_and_own(
     let final_dir = handles.last().expect("the site directory level exists");
     let metadata = final_dir.own_metadata().map_err(Error::Io)?;
     if !final_created
+        && req.existing == ExistingPolicy::Refuse
         && (metadata.uid() != req.uid || metadata.gid() != req.gid)
         && !final_dir.child_entries().map_err(Error::Io)?.is_empty()
     {
@@ -713,7 +746,13 @@ fn walk_and_own(
     if !final_created {
         *previous = Some((metadata.uid(), metadata.gid(), metadata.mode() & 0o7777));
     }
-    final_dir.chown_self(req.uid, req.gid).map_err(Error::Io)?;
+    if !final_created && req.existing == ExistingPolicy::AdoptTree {
+        let fd = final_dir.try_clone_fd().map_err(Error::Io)?;
+        crate::permissions::execute::repair_open_directory(&fd, req.uid, req.gid, &[])
+            .map_err(Error::Io)?;
+    } else {
+        final_dir.chown_self(req.uid, req.gid).map_err(Error::Io)?;
+    }
     final_dir.set_own_mode(ROOT_MODE).map_err(Error::Io)?;
     Ok(final_created)
 }
@@ -1291,6 +1330,7 @@ mod tests {
                 .collect(),
             uid,
             gid,
+            existing: ExistingPolicy::Refuse,
             request_id: RequestId::parse(id).unwrap(),
             idempotency_key: None,
         }
@@ -1538,7 +1578,7 @@ mod tests {
     #[test]
     fn prepare_and_remove_reject_malformed_requests() {
         let parse = |domain: &str, rel: Option<&str>, uid: u32, gid: u32| {
-            PrepareRequest::parse(domain, rel, uid, gid, ID, None).err()
+            PrepareRequest::parse(domain, rel, uid, gid, None, ID, None).err()
         };
         assert_eq!(
             parse("sites", None, 10000, 10000),
@@ -1821,6 +1861,83 @@ mod tests {
             let metadata = fs::symlink_metadata(fixture.path(path)).unwrap();
             assert_eq!((metadata.uid(), metadata.gid()), (0, 0), "{path}");
         }
+        assert_eq!(fs::metadata(&outside).unwrap().uid(), 777);
+    }
+
+    #[test]
+    fn prepare_parses_the_existing_policy() {
+        let parse = |existing: Option<&str>| {
+            PrepareRequest::parse("a.test", None, 10000, 10000, existing, ID, None)
+                .map(|req| req.existing)
+        };
+        assert_eq!(parse(None).unwrap(), ExistingPolicy::Refuse);
+        assert_eq!(parse(Some("refuse")).unwrap(), ExistingPolicy::Refuse);
+        assert_eq!(
+            parse(Some("adopt-directory")).unwrap(),
+            ExistingPolicy::AdoptDirectory
+        );
+        assert_eq!(
+            parse(Some("adopt-tree")).unwrap(),
+            ExistingPolicy::AdoptTree
+        );
+        assert_eq!(
+            parse(Some("recursive")).err(),
+            Some(RequestError::InvalidExistingPolicy)
+        );
+    }
+
+    #[test]
+    fn prepare_adopts_existing_content_only_when_asked_when_run_as_root() {
+        if !is_root() {
+            return;
+        }
+        let fixture = Fixture::new();
+        let outside = fixture.content.as_path().parent().unwrap().join("keep");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::chown(&outside, Some(777), Some(777)).unwrap();
+        let build = |site: &str| {
+            fixture.site(site);
+            fs::create_dir_all(fixture.path(&format!("{site}/sub"))).unwrap();
+            fs::write(fixture.path(&format!("{site}/sub/f.php")), "x").unwrap();
+            symlink(&outside, fixture.path(&format!("{site}/sub/out"))).unwrap();
+            for path in ["", "/index.php", "/sub", "/sub/f.php"] {
+                std::os::unix::fs::chown(
+                    fixture.path(&format!("{site}{path}")),
+                    Some(500),
+                    Some(500),
+                )
+                .unwrap();
+            }
+        };
+        let owner = |path: String| fs::symlink_metadata(fixture.path(&path)).unwrap().uid();
+
+        build("q.test");
+        assert!(matches!(
+            fixture.prepare(&prep("q.test", &[], 12345, 12345, ID)),
+            Err(Error::ExistingContent)
+        ));
+        assert_eq!(owner("q.test".into()), 500);
+
+        let mut req = prep("q.test", &[], 12345, 12345, OTHER_ID);
+        req.existing = ExistingPolicy::AdoptDirectory;
+        fixture.prepare(&req).unwrap();
+        assert_eq!(owner("q.test".into()), 12345);
+        assert_eq!(owner("q.test/index.php".into()), 500);
+        assert_eq!(mode_of(&fixture.path("q.test")), 0o700);
+
+        build("r.test");
+        let mut req = prep("r.test", &[], 12345, 12345, THIRD_ID);
+        req.existing = ExistingPolicy::AdoptTree;
+        fixture.prepare(&req).unwrap();
+        for path in [
+            "r.test",
+            "r.test/index.php",
+            "r.test/sub",
+            "r.test/sub/f.php",
+        ] {
+            assert_eq!(owner(path.into()), 12345, "{path}");
+        }
+        // The symlink was neither followed nor changed.
         assert_eq!(fs::metadata(&outside).unwrap().uid(), 777);
     }
 }

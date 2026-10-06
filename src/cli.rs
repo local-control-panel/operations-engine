@@ -693,6 +693,12 @@ pub enum SiteCommand {
         uid: u32,
         #[arg(long)]
         gid: u32,
+        /// What to do with an existing non-empty directory owned by
+        /// someone else: `refuse` (default), `adopt-directory` (hand over
+        /// the directory only) or `adopt-tree` (hand over everything below
+        /// it too, without following symlinks).
+        #[arg(long)]
+        existing: Option<String>,
         #[arg(long = "request-id")]
         request_id: String,
         #[arg(long = "idempotency-key")]
