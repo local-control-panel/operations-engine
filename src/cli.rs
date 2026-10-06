@@ -677,6 +677,72 @@ pub enum SiteCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Create a new site's content directory
+    /// `<content root>/<domain>[/<relative root>]` and give the final
+    /// directory to the site identity (mode 0700). Refuses symlinks,
+    /// system uids/gids and an existing non-empty directory owned by
+    /// anyone else; nothing is changed recursively.
+    PrepareRoot {
+        #[arg(long)]
+        domain: String,
+        /// Directory below the site directory that becomes the root, e.g.
+        /// `public`. Omit for the site directory itself.
+        #[arg(long = "relative-root")]
+        relative_root: Option<String>,
+        #[arg(long)]
+        uid: u32,
+        #[arg(long)]
+        gid: u32,
+        /// What to do with an existing non-empty directory owned by
+        /// someone else: `refuse` (default), `adopt-directory` (hand over
+        /// the directory only) or `adopt-tree` (hand over everything below
+        /// it too, without following symlinks).
+        #[arg(long)]
+        existing: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
+    /// Delete a site's directory `<content root>/<domain>` and, with
+    /// `--site-id`, its engine release tree. Refuses symlinks, system-owned
+    /// directories, oversized trees and (without `--confirm-contents true`)
+    /// non-empty directories.
+    RemoveRoot {
+        #[arg(long)]
+        domain: String,
+        /// Remove only this directory below the site directory (and the
+        /// site directory itself if that leaves it empty). Omit to remove
+        /// the whole site directory.
+        #[arg(long = "relative-root")]
+        relative_root: Option<String>,
+        #[arg(long = "site-id")]
+        site_id: Option<String>,
+        /// Confirm that deleting a non-empty directory is intended
+        /// (`true`/`false`).
+        #[arg(long = "confirm-contents", action = clap::ArgAction::Set)]
+        confirm_contents: bool,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
+    /// Give everything left in a deleted site's directory (and, with
+    /// `--site-id`, its release tree) to root:root, so a freed numeric uid
+    /// keeps no access. Same safe walk as `permissions fix-ownership`.
+    ReleaseRoot {
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "site-id")]
+        site_id: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Point a site's engine manifest at its new domain after a panel
     /// rename. Only `domain` changes; a repeat for the same domain is a
     /// no-op and the result names the previous domain for a rollback.
@@ -698,6 +764,9 @@ impl SiteCommand {
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
             Self::MoveRoot { .. } => "site.moveRoot",
+            Self::PrepareRoot { .. } => "site.prepareRoot",
+            Self::RemoveRoot { .. } => "site.removeRoot",
+            Self::ReleaseRoot { .. } => "site.releaseRoot",
             Self::RenameManifest { .. } => "site.renameManifest",
         }
     }

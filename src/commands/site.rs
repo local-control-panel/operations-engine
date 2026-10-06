@@ -38,6 +38,49 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SiteCommand::PrepareRoot {
+            domain,
+            relative_root,
+            uid,
+            gid,
+            existing,
+            request_id,
+            idempotency_key,
+        } => prepare_root(
+            &domain,
+            relative_root.as_deref(),
+            uid,
+            gid,
+            existing.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SiteCommand::RemoveRoot {
+            domain,
+            relative_root,
+            site_id,
+            confirm_contents,
+            request_id,
+            idempotency_key,
+        } => remove_root(
+            &domain,
+            relative_root.as_deref(),
+            site_id.as_deref(),
+            confirm_contents,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SiteCommand::ReleaseRoot {
+            domain,
+            site_id,
+            request_id,
+            idempotency_key,
+        } => release_root(
+            &domain,
+            site_id.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SiteCommand::RenameManifest {
             site_id,
             domain,
@@ -211,6 +254,199 @@ fn run_move_root(request: &crate::site_root::MoveRequest) -> Result<Response, Re
         Err(error) => {
             let (code, message) = error.protocol();
             Ok(Response::failure(MOVE_OPERATION, code, &message))
+        }
+    }
+}
+
+fn prepare_root(
+    domain: &str,
+    relative_root: Option<&str>,
+    uid: u32,
+    gid: u32,
+    existing: Option<&str>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_root::{PREPARE_OPERATION, PrepareRequest};
+
+    let request = match PrepareRequest::parse(
+        domain,
+        relative_root,
+        uid,
+        gid,
+        existing,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                PREPARE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_site_root(PREPARE_OPERATION, |engine_state, config| {
+            crate::site_root::prepare_root(engine_state, &config.content_roots, &request)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            PREPARE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.prepareRoot requires a Unix host",
+        ))
+    }
+}
+
+fn remove_root(
+    domain: &str,
+    relative_root: Option<&str>,
+    site_id: Option<&str>,
+    confirm_contents: bool,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_root::{REMOVE_OPERATION, RemoveRequest};
+
+    let request = match RemoveRequest::parse(
+        domain,
+        relative_root,
+        site_id,
+        confirm_contents,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                REMOVE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_site_root(REMOVE_OPERATION, |engine_state, config| {
+            crate::site_root::remove_root(
+                engine_state,
+                &config.content_roots,
+                std::path::Path::new(SITES_DIR),
+                0,
+                &request,
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            REMOVE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.removeRoot requires a Unix host",
+        ))
+    }
+}
+
+fn release_root(
+    domain: &str,
+    site_id: Option<&str>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_root::{RELEASE_OPERATION, ReleaseRequest};
+
+    let request = match ReleaseRequest::parse(domain, site_id, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                RELEASE_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_site_root(RELEASE_OPERATION, |engine_state, config| {
+            crate::site_root::release_root(
+                engine_state,
+                &config.content_roots,
+                std::path::Path::new(SITES_DIR),
+                0,
+                &request,
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            RELEASE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.releaseRoot requires a Unix host",
+        ))
+    }
+}
+
+/// Loads the engine config and state root, runs one `site_root` operation
+/// and maps its outcome to a protocol response.
+#[cfg(unix)]
+fn run_site_root<T: serde::Serialize>(
+    operation: &'static str,
+    run: impl FnOnce(
+        &crate::filesystem::ManagedRoot,
+        &crate::config::EngineConfig,
+    ) -> Result<T, crate::site_root::Error>,
+) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{config::EngineConfig, filesystem::ManagedRoot, site_root};
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    match run(&engine_state, &engine_config) {
+        Ok(result) => Response::success(operation, result),
+        Err(site_root::Error::PostCommit(result)) => {
+            Response::success(operation, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the operation completed but its transaction record could not be \
+                              saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(operation, code, &message))
         }
     }
 }

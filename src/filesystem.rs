@@ -10,6 +10,13 @@ use cap_std::{
 
 use crate::site::{SiteRelativePath, TrustedRoot};
 
+/// One direct child of a directory, as reported by
+/// `ManagedRoot::child_entries`.
+pub struct ChildEntry {
+    pub name: std::ffi::OsString,
+    pub is_dir: bool,
+}
+
 pub struct ManagedRoot {
     directory: Dir,
 }
@@ -70,6 +77,127 @@ impl ManagedRoot {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Opens the direct child directory `name` without following a symlink
+    /// in the final component (`openat` with `O_NOFOLLOW | O_DIRECTORY`),
+    /// returning it as its own capability-scoped root. A symlink or a
+    /// non-directory there fails with `ELOOP`/`ENOTDIR`; unlike
+    /// `open_managed_dir`, a link swapped in under a tenant-writable
+    /// directory can never redirect the caller to another site's tree.
+    #[cfg(unix)]
+    pub fn open_child_dir_nofollow(&self, name: &SiteRelativePath) -> io::Result<Self> {
+        use std::{
+            ffi::CString,
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::ffi::OsStrExt,
+            },
+        };
+
+        let mut components = name.as_path().components();
+        let (Some(_), None) = (components.next(), components.next()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a single path component is required",
+            ));
+        };
+        let c_name = CString::new(name.as_path().as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid name"))?;
+        // SAFETY: the directory descriptor is open for the call and `c_name`
+        // is a valid NUL-terminated string.
+        let fd = unsafe {
+            libc::openat(
+                self.directory.as_raw_fd(),
+                c_name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `fd` is a freshly opened descriptor owned by nobody else.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        Ok(Self {
+            directory: Dir::from_std_file(file),
+        })
+    }
+
+    /// A duplicate of this directory's descriptor, for the descriptor-based
+    /// ownership walk.
+    #[cfg(unix)]
+    pub fn try_clone_fd(&self) -> io::Result<std::os::fd::OwnedFd> {
+        Ok(std::os::fd::OwnedFd::from(
+            self.directory.try_clone()?.into_std_file(),
+        ))
+    }
+
+    /// Metadata of this directory itself (an `fstat` on the open handle).
+    pub fn own_metadata(&self) -> io::Result<cap_std::fs::Metadata> {
+        self.directory.dir_metadata()
+    }
+
+    /// Metadata of `path` without following a symlink in the final
+    /// component.
+    pub fn symlink_metadata(&self, path: &SiteRelativePath) -> io::Result<cap_std::fs::Metadata> {
+        self.directory.symlink_metadata(path.as_path())
+    }
+
+    /// Changes the owner of this directory itself through its own
+    /// descriptor. Never recursive.
+    #[cfg(unix)]
+    pub fn chown_self(&self, uid: u32, gid: u32) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let target = self.directory.try_clone()?.into_std_file();
+        #[cfg(target_os = "linux")]
+        // SAFETY: `target` is open for the call and the path is a valid,
+        // NUL-terminated empty string.
+        let result = unsafe {
+            libc::fchownat(
+                target.as_raw_fd(),
+                c"".as_ptr(),
+                uid,
+                gid,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        // SAFETY: `target` is an open descriptor for the duration of the call.
+        let result = unsafe { libc::fchown(target.as_raw_fd(), uid, gid) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Sets the permission bits of this directory itself.
+    #[cfg(unix)]
+    pub fn set_own_mode(&self, mode: u32) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        self.directory.set_permissions(
+            ".",
+            cap_std::fs::Permissions::from_std(std::fs::Permissions::from_mode(mode)),
+        )
+    }
+
+    /// The direct children of this directory, with whether each is a real
+    /// directory (not a symlink to one).
+    pub fn child_entries(&self) -> io::Result<Vec<ChildEntry>> {
+        let mut children = Vec::new();
+        for entry in self.directory.entries()? {
+            let entry = entry?;
+            children.push(ChildEntry {
+                name: entry.file_name(),
+                is_dir: entry.file_type()?.is_dir(),
+            });
+        }
+        Ok(children)
+    }
+
+    /// Removes the empty directory `path` (never recursive).
+    pub fn remove_dir(&self, path: &SiteRelativePath) -> io::Result<()> {
+        self.directory.remove_dir(path.as_path())
     }
 
     /// Creates `path` as a new directory, failing if it already exists (its
