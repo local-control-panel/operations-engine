@@ -276,7 +276,18 @@ mod tests {
             libc::close(fd);
         }
 
-        let reclaimed = acquire(&managed, &path, second);
+        // Other tests in this process spawn subprocesses. A child sitting
+        // between `fork` and `exec` briefly holds a duplicate of the closed
+        // descriptor (and with it the flock) until it execs, so the release
+        // is immediate only once those children are gone. The lock has no
+        // time-based staleness bound, so a short retry cannot mask a lock
+        // that is only reclaimable after a timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut reclaimed = acquire(&managed, &path, second);
+        while reclaimed.is_err() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            reclaimed = acquire(&managed, &path, second);
+        }
         assert!(
             reclaimed.is_ok(),
             "a lock left by a crashed holder must be immediately available, not merely \
