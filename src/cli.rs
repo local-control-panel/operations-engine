@@ -701,15 +701,16 @@ pub enum SiteCommand {
 
     /// Delete a site's directory `<content root>/<domain>` and, with
     /// `--site-id`, its engine release tree. Refuses symlinks, system-owned
-    /// directories, oversized trees and (without `--confirm-contents`)
+    /// directories, oversized trees and (without `--confirm-contents true`)
     /// non-empty directories.
     RemoveRoot {
         #[arg(long)]
         domain: String,
         #[arg(long = "site-id")]
         site_id: Option<String>,
-        /// Confirm that deleting a non-empty directory is intended.
-        #[arg(long = "confirm-contents")]
+        /// Confirm that deleting a non-empty directory is intended
+        /// (`true`/`false`).
+        #[arg(long = "confirm-contents", action = clap::ArgAction::Set)]
         confirm_contents: bool,
         #[arg(long = "request-id")]
         request_id: String,
