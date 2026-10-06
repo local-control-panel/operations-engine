@@ -27,6 +27,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "capabilities",
                 "doctor",
                 "operation.status",
+                "operation.list",
                 "backup.delete",
                 "backup.importRemote",
                 "backup.installRclone",

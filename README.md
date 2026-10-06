@@ -64,6 +64,7 @@ JSON Lines progress or cancellation as protocol features. Clients check the
 protocol version and required operation before dispatch.
 
 `operation status` reads durable mutation state; it does not retry a mutation.
+`operation list` shows the newest redacted transactions of one scope.
 Request IDs and optional idempotency keys let callers distinguish a replay
 from a new attempt. Review each operation's contract for its commit point,
 failure state, and recovery limits.
