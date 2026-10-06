@@ -92,6 +92,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "system.installAutoupdates",
                 "system.installDocker",
                 "system.startDocker",
+                "system.signalProcess",
                 "system.createSwap",
                 "system.deleteSwap",
                 "system.resizeSwap",

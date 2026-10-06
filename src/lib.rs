@@ -47,6 +47,8 @@ pub mod system_autoupdates;
 pub mod system_autoupdates_install;
 #[cfg(unix)]
 pub mod system_install_docker;
+#[cfg(target_os = "linux")]
+pub mod system_signal;
 pub mod system_start_docker;
 #[cfg(unix)]
 pub mod system_swap;
