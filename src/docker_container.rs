@@ -673,6 +673,12 @@ pub fn execute_limits(
         cancel,
         |resolved| {
             let plan = plan_limits(ctx, req, resolved)?;
+            if let Some(prelude) = &plan.prelude {
+                let mut argv = vec!["update".to_owned()];
+                argv.extend(prelude.iter().cloned());
+                argv.push(resolved.id.clone());
+                run_docker(ctx, Stage::Update, &argv, ACTION_TIMEOUT, cancel)?;
+            }
             if !plan.flags.is_empty() {
                 let mut argv = vec!["update".to_owned()];
                 argv.extend(plan.flags);
@@ -696,12 +702,26 @@ pub fn execute_limits(
 /// What `docker update` is asked to do and the limits that result.
 #[derive(Debug, PartialEq)]
 struct LimitsPlan {
+    /// A first `docker update` that frees the swap limit at the current
+    /// memory limit, needed before the memory limit can be raised (see
+    /// [`plan_limits`]).
+    prelude: Option<Vec<String>>,
     flags: Vec<String>,
     cpus: f64,
     memory_bytes: u64,
     raised_to_host_max: bool,
 }
 
+/// Raising a memory limit that has a swap limit next to it fails in runc
+/// (`memory+swap limit should be >= memory limit`): Docker validates the pair
+/// together but runc applies the new memory first, against the old swap, and
+/// the daemon refuses to change only one of them. Docker's `run --memory`
+/// sets swap to twice the memory, so this is the usual state of a container.
+/// The engine therefore first re-sets the *current* memory with swap `-1`
+/// (nothing for runc to trip over), then applies the new memory with swap
+/// `-1`. Lowering a limit, or setting one on a container without any, takes a
+/// single call.
+///
 /// `docker update` treats `0` as "leave unchanged", so a limit that is set
 /// cannot be removed from a running container (verified on Docker 29: `--cpus
 /// 0 --memory 0 --memory-swap 0` changes nothing). Asking for `0` therefore
@@ -715,6 +735,7 @@ fn plan_limits(
 ) -> Result<LimitsPlan, Error> {
     let mut flags = Vec::new();
     let mut raised = false;
+    let mut prelude = None;
 
     let cpus = if req.cpus > 0.0 {
         flags.extend(["--cpus".to_owned(), format!("{:.6}", req.cpus)]);
@@ -752,10 +773,19 @@ fn plan_limits(
         0
     };
 
+    if resolved.memory_bytes > 0 && memory_bytes > resolved.memory_bytes {
+        prelude = Some(vec![
+            "--memory".to_owned(),
+            resolved.memory_bytes.to_string(),
+            "--memory-swap".to_owned(),
+            "-1".to_owned(),
+        ]);
+    }
     if let Some(policy) = &req.restart_policy {
         flags.extend(["--restart".to_owned(), policy.clone()]);
     }
     Ok(LimitsPlan {
+        prelude,
         flags,
         cpus,
         memory_bytes,
@@ -1220,12 +1250,16 @@ mod tests {
         let result = execute_limits(&ctx, &limits(LIMITED, 1.0, 0, None, ID2), &token).unwrap();
         assert_eq!(result.cpus, 1.0);
         assert!(result.raised_to_host_max);
+        // Raising the memory limit first frees the swap at the current value.
+        let prelude = format!("update --memory 1073741824 --memory-swap -1 {FULL_LIMITED}");
         assert_eq!(
             f.verb_calls(),
             [
+                prelude.clone(),
                 format!(
                     "update --cpus 4.000000 --memory 8589934592 --memory-swap -1 {FULL_LIMITED}"
                 ),
+                prelude,
                 format!(
                     "update --cpus 1.000000 --memory 8589934592 --memory-swap -1 {FULL_LIMITED}"
                 ),
@@ -1237,7 +1271,28 @@ mod tests {
             execute_limits(&ctx, &limits(LIMITED, 1.0, 0, None, ID3), &token),
             Err(Error::HostResourcesUnknown)
         ));
-        assert_eq!(f.verb_calls().len(), 2);
+        assert_eq!(f.verb_calls().len(), 4);
+    }
+
+    #[test]
+    fn lowering_a_memory_limit_is_a_single_call() {
+        let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new(0);
+        let state = f.state();
+        let ctx = ctx(&f, &state);
+        // LIMITED has 1 GiB: 512 MiB is lower, so no prelude.
+        execute_limits(
+            &ctx,
+            &limits(LIMITED, 0.5, 512 * 1024 * 1024, None, ID),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            f.verb_calls(),
+            [format!(
+                "update --cpus 0.500000 --memory 536870912 --memory-swap -1 {FULL_LIMITED}"
+            )]
+        );
     }
 
     #[test]
