@@ -237,6 +237,46 @@ completion atomically renames it to `<database>_<unix-seconds>.sql`, while a
 failed or cancelled dump removes the temporary artifact. Retention deletes
 only older `.sql` files carrying the same validated database prefix.
 
+## `backup.scheduleDatabase`, `backup.unscheduleDatabase`, `backup.listScheduledDatabase`, `backup.runScheduledDatabase`
+
+Scheduled database backups keep the database root password out of every
+crontab line. `backup schedule-database` accepts a root-owned JSON request
+(`dbType`, `database`, `container`, `rootPassword`, `schedule`,
+`retentionDays`). The schedule is an allowlisted cron expression (five
+`[0-9A-Za-z*/,-]` fields or `@hourly|@daily|@midnight|@weekly|@monthly|@yearly|
+@annually`; `%`, `#`, newlines and `@reboot` are rejected). Under the same
+`cron/root` lock `cron.installTab` uses, the engine writes
+`<credentialRoot>/db-backup/<dbType>_<database>.json` (directory `0700`, file
+`0600`, atomically), then installs the root crontab with one line:
+
+```
+<schedule> /usr/local/bin/ops-engine backup run-scheduled --db-type <t> --database <db> --retention-days <n> >/dev/null # [db-backup] <t>:<db>
+```
+
+The crontab is re-read just before the install and the request fails with
+`CONFIG_HASH_MISMATCH` if it changed meanwhile; a rejected crontab restores the
+previous credential file (or removes the new one). An existing line for the
+same database and schedule, in either format, is replaced; other lines are
+preserved byte for byte.
+
+`backup unschedule-database` takes `dbType`, `database` and `schedule`, removes
+the matching tagged lines (either format, enabled or disabled) and, after the
+install succeeded, deletes the credential file when no engine-format line for
+that database remains.
+
+`backup list-scheduled` is read-only. It returns every `# [db-backup]`
+line as `{line, schedule, dbType, database, retentionDays, enabled, format,
+secretInCrontab}` where `format` is `engine` or `legacy`. For legacy lines
+(the pre-engine `mariadb-dump -p'...'` / `PGPASSWORD='...'` form) the password
+in `line` is replaced by `[redacted]` and `secretInCrontab` is true; they keep
+running unchanged until they are removed or scheduled again.
+
+`backup run-scheduled` is what cron runs. It refuses a credential file that is
+group/other accessible, then goes through the same transactional path as
+`backup.createDatabase` (per-database lock, `MYSQL_PWD`/`PGPASSWORD` only in the
+process environment, atomic publish, retention). A failure is also printed to
+stderr so cron can mail it.
+
 ## `backup.activateConfig`
 
 `backup activate-config` consumes one root-owned bounded JSON plan containing

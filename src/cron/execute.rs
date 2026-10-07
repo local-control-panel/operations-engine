@@ -226,7 +226,7 @@ pub fn execute(
 /// treated as an absent tab, not an error - the same tolerance
 /// `website-control-panel`'s own `crontab -l 2>/dev/null || echo ""` already
 /// applies client-side.
-fn read_current_tab(
+pub(crate) fn read_current_tab(
     crontab_program: &str,
     user: Option<&str>,
 ) -> Result<Option<Vec<u8>>, process::ProcessRunError> {
@@ -249,7 +249,7 @@ fn read_current_tab(
 /// it via `crontab <path>` - not stdin, since `process::run` always spawns
 /// with `Stdio::null()` and this operation would rather reuse that shared
 /// runner unmodified than special-case stdin piping for one caller.
-fn install(
+pub(crate) fn install(
     state_root: &TrustedRoot,
     crontab_program: &str,
     content: &str,
