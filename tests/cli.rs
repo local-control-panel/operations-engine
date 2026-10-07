@@ -134,6 +134,10 @@ fn capabilities_describe_only_implemented_operations() {
             "docker.prune",
             "docker.containerAction",
             "docker.setLimits",
+            "docker.network",
+            "docker.imagePull",
+            "docker.imageRemove",
+            "docker.volumeRemove",
             "system.service",
             "compose.action",
             "compose.remove"

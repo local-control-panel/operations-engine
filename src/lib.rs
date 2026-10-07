@@ -24,6 +24,7 @@ pub mod deploy;
 pub mod docker_container;
 #[cfg(unix)]
 pub mod docker_prune;
+pub mod docker_resource;
 pub mod engine;
 pub mod error;
 pub mod filesystem;

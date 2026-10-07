@@ -234,6 +234,62 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Create or remove a Docker network. Removal needs its confirmation
+    /// token and refuses the built-in networks and the managed `wcp` stack's.
+    DockerNetwork {
+        /// `create` or `remove`.
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        name: String,
+        /// `bridge` (default), `overlay`, `host`, `macvlan` or `none`;
+        /// `create` only.
+        #[arg(long)]
+        driver: Option<String>,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Pull an image from an allowlisted registry, refusing to start with
+    /// little free space under Docker's root directory.
+    PullImage {
+        #[arg(long)]
+        reference: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove an image named by hex id, refusing one that a container of the
+    /// managed `wcp` stack was created from.
+    RemoveImage {
+        #[arg(long = "image-id")]
+        image_id: String,
+        /// Explicit value (`--force true`), as every argument is a pair.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
+        force: bool,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove a Docker volume, refusing one that is attached to a container
+    /// or belongs to the managed `wcp` stack.
+    RemoveVolume {
+        #[arg(long = "volume-name")]
+        volume_name: String,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Start or restart the `netdata` or `docker` systemd unit and verify it
     /// is active afterwards.
     Service {
@@ -301,6 +357,10 @@ impl SystemCommand {
             Self::PruneDocker { .. } => "docker.prune",
             Self::ContainerAction { .. } => "docker.containerAction",
             Self::SetContainerLimits { .. } => "docker.setLimits",
+            Self::DockerNetwork { .. } => "docker.network",
+            Self::PullImage { .. } => "docker.imagePull",
+            Self::RemoveImage { .. } => "docker.imageRemove",
+            Self::RemoveVolume { .. } => "docker.volumeRemove",
             Self::Service { .. } => "system.service",
             Self::SignalProcess { .. } => "system.signalProcess",
             Self::CreateSwap { .. } => "system.createSwap",
