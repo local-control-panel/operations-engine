@@ -87,6 +87,164 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => rename_manifest(&site_id, &domain, &request_id, idempotency_key.as_deref()),
+        SiteCommand::Enroll {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => enroll(&request_file, &request_id, idempotency_key.as_deref()),
+        SiteCommand::Unenroll {
+            site_id,
+            request_id,
+            idempotency_key,
+        } => unenroll(&site_id, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn enroll(
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_enroll::{ENROLL_OPERATION, EnrollRequest};
+
+    #[cfg(unix)]
+    {
+        let json = match crate::commands::read_root_owned_content_file(path) {
+            Ok(json) => json,
+            Err(_) => {
+                return Ok(Response::failure(
+                    ENROLL_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match EnrollRequest::parse(&json, request_id, idempotency_key) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    ENROLL_OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        run_enrollment(ENROLL_OPERATION, |context| {
+            crate::site_enroll::enroll(context, &request).map(serde_json::to_value)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            ENROLL_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.enroll requires a Unix host",
+        ))
+    }
+}
+
+fn unenroll(
+    site_id: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_enroll::{UNENROLL_OPERATION, UnenrollRequest};
+
+    let request = match UnenrollRequest::parse(site_id, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                UNENROLL_OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    #[cfg(unix)]
+    {
+        run_enrollment(UNENROLL_OPERATION, |context| {
+            crate::site_enroll::unenroll(context, &request).map(serde_json::to_value)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            UNENROLL_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.unenroll requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_enrollment(
+    operation: &'static str,
+    run: impl FnOnce(
+        &crate::site_enroll::Context<'_>,
+    ) -> Result<serde_json::Result<serde_json::Value>, crate::site_enroll::Error>,
+) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{
+        config::EngineConfig,
+        deploy::staging::resolve_site_identity,
+        filesystem::ManagedRoot,
+        site_enroll::{Context, Error, MIN_SITE_IDENTITY},
+    };
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let cancellation = CancellationToken::default();
+    let resolve = |user: &str| {
+        resolve_site_identity(user, &cancellation)
+            .ok()
+            .map(|identity| (identity.uid, identity.gid))
+    };
+    let context = Context {
+        engine_state: &engine_state,
+        sites_dir: Path::new(SITES_DIR),
+        credential_dir: engine_config.credential_root.as_path(),
+        required_uid: 0,
+        min_identity: MIN_SITE_IDENTITY,
+        resolve_identity: &resolve,
+    };
+    match run(&context) {
+        Ok(value) => {
+            let value = value.expect("operation results always serialize");
+            Response::success(operation, value)
+        }
+        Err(Error::PostCommit(result)) => Response::success(operation, result).map(|response| {
+            response.with_warnings(vec![Warning {
+                code: WarningCode::TransactionRecordIncomplete,
+                message: "the operation completed but its transaction record could not be \
+                          saved"
+                    .to_owned(),
+            }])
+        }),
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(operation, code, &message))
+        }
     }
 }
 

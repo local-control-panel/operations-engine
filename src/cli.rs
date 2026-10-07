@@ -756,6 +756,27 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Write a git-deploy site's engine manifest and deploy key from a
+    /// staged, root-owned request file (the key never travels as an
+    /// argument). A repeat with identical content is a no-op.
+    Enroll {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove a site's engine manifest and deploy key. Missing files are
+    /// success.
+    Unenroll {
+        #[arg(long = "site-id")]
+        site_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SiteCommand {
@@ -768,6 +789,8 @@ impl SiteCommand {
             Self::RemoveRoot { .. } => "site.removeRoot",
             Self::ReleaseRoot { .. } => "site.releaseRoot",
             Self::RenameManifest { .. } => "site.renameManifest",
+            Self::Enroll { .. } => "site.enroll",
+            Self::Unenroll { .. } => "site.unenroll",
         }
     }
 }
