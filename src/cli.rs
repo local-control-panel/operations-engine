@@ -203,8 +203,10 @@ pub enum SystemCommand {
         container_id: String,
         #[arg(long)]
         action: String,
-        /// Force removal of a running container (`remove` only).
-        #[arg(long)]
+        /// Force removal of a running container (`remove` only). Takes an
+        /// explicit value (`--force true`) so that every argument is a
+        /// name/value pair, as the panel's argv builder emits them.
+        #[arg(long, action = clap::ArgAction::Set, default_value_t = false)]
         force: bool,
         #[arg(long)]
         confirmation: Option<String>,
