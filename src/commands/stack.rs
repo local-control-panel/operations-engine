@@ -169,6 +169,10 @@ fn write_site_service(
             error.message(),
         ));
     }
+    let content_roots = match load_content_roots(WRITE_SITE_SERVICE_OPERATION) {
+        Ok(roots) => roots,
+        Err(response) => return Ok(response),
+    };
     let request = match WriteSiteServiceRequest::parse(
         runtime_id,
         domain,
@@ -178,6 +182,7 @@ fn write_site_service(
         root,
         worker_mode,
         worker_count,
+        &content_roots,
         request_id,
         idempotency_key,
     ) {
@@ -230,6 +235,10 @@ fn activate_site_config(
             ));
         }
     };
+    let content_roots = match load_content_roots(ACTIVATE_SITE_CONFIG_OPERATION) {
+        Ok(roots) => roots,
+        Err(response) => return Ok(response),
+    };
     let request = match ActivateSiteConfigRequest::parse(
         runtime_id,
         domain,
@@ -237,6 +246,7 @@ fn activate_site_config(
         root,
         caddyfile,
         expected_prior_hash,
+        &content_roots,
         request_id,
         idempotency_key,
     ) {
@@ -354,6 +364,29 @@ fn stop_idle_runtime(
 
 /// Loads the config, opens the state root, resolves the stack directory and
 /// runs one `stack_service` operation, mapping its outcome to a response.
+/// The engine's content roots, which a site's document root must lie under.
+#[cfg(unix)]
+fn load_content_roots(operation: &'static str) -> Result<Vec<crate::site::TrustedRoot>, Response> {
+    crate::config::EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH))
+        .map(|config| config.content_roots)
+        .map_err(|_| {
+            Response::failure(
+                operation,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn load_content_roots(operation: &'static str) -> Result<Vec<crate::site::TrustedRoot>, Response> {
+    Err(Response::failure(
+        operation,
+        ErrorCode::UnsupportedPlatform,
+        "stack service operations require a Unix host",
+    ))
+}
+
 #[cfg(unix)]
 fn run_service_operation<T, F>(
     operation: &'static str,

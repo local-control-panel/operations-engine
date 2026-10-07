@@ -138,6 +138,7 @@ pub enum RequestError {
     InvalidPort,
     InvalidPriorHash,
     InvalidIdentity,
+    InvalidRoot,
 }
 
 impl RequestError {
@@ -152,6 +153,9 @@ impl RequestError {
             Self::InvalidPort => "port must be a nonzero TCP port",
             Self::InvalidPriorHash => "expected-prior-hash must be 64 hex digits",
             Self::InvalidIdentity => "uid and gid must be site identities (at least 1000)",
+            Self::InvalidRoot => {
+                "root must be a plain absolute path under a content root, without spaces or dot segments"
+            }
         }
     }
 }
@@ -706,15 +710,25 @@ pub struct SiteConfig {
     pub worker_count: i64,
 }
 
+/// The document root goes verbatim into a `Caddyfile` and an `open_basedir`
+/// ini line, so it gets the validation `site.allocateIdentity` applies: plain
+/// absolute path of path-safe characters, no dot segments, under a content
+/// root. A rejected root never reaches a file.
+fn validate_site_root(root: &str, content_roots: &[TrustedRoot]) -> Result<(), RequestError> {
+    crate::site_identity::validate_root(root, content_roots).map_err(|_| RequestError::InvalidRoot)
+}
+
 fn parse_site_config(
     port: u16,
     root: String,
     worker_mode: bool,
     worker_count: i64,
+    content_roots: &[TrustedRoot],
 ) -> Result<SiteConfig, RequestError> {
     if port == 0 {
         return Err(RequestError::InvalidPort);
     }
+    validate_site_root(&root, content_roots)?;
     Ok(SiteConfig {
         port,
         root,
@@ -754,6 +768,7 @@ impl WriteSiteServiceRequest {
         root: String,
         worker_mode: bool,
         worker_count: i64,
+        content_roots: &[TrustedRoot],
         request_id: &str,
         key: Option<&str>,
     ) -> Result<Self, RequestError> {
@@ -766,7 +781,7 @@ impl WriteSiteServiceRequest {
             domain,
             uid,
             gid,
-            config: parse_site_config(port, root, worker_mode, worker_count)?,
+            config: parse_site_config(port, root, worker_mode, worker_count, content_roots)?,
             request_id,
             idempotency_key,
         })
@@ -802,6 +817,7 @@ impl ActivateSiteConfigRequest {
         root: String,
         caddyfile: String,
         expected_prior_hash: Option<&str>,
+        content_roots: &[TrustedRoot],
         request_id: &str,
         key: Option<&str>,
     ) -> Result<Self, RequestError> {
@@ -811,6 +827,7 @@ impl ActivateSiteConfigRequest {
         if port == 0 {
             return Err(RequestError::InvalidPort);
         }
+        validate_site_root(&root, content_roots)?;
         let guard = match expected_prior_hash {
             None => HashGuard::Absent,
             Some(value) => HashGuard::Sha256(
@@ -1628,6 +1645,10 @@ mod tests {
         }
     }
 
+    fn content_roots() -> Vec<TrustedRoot> {
+        vec![TrustedRoot::parse("/var/www").unwrap()]
+    }
+
     fn write_req(id: &str, key: Option<&str>) -> WriteSiteServiceRequest {
         WriteSiteServiceRequest::parse(
             "fp1-php83",
@@ -1638,6 +1659,7 @@ mod tests {
             "/var/www/example".into(),
             true,
             2,
+            &content_roots(),
             id,
             key,
         )
@@ -1663,6 +1685,7 @@ mod tests {
             "/var/www/example".into(),
             sample_caddyfile(9000),
             hash,
+            &content_roots(),
             id,
             key,
         )
@@ -1731,6 +1754,7 @@ mod tests {
             "/var/www/example".into(),
             false,
             2,
+            &content_roots(),
             ID,
             None,
         )
@@ -1952,6 +1976,7 @@ mod tests {
             "/var/www/example".into(),
             sample_caddyfile(9100),
             Some(live_hash.as_str()),
+            &content_roots(),
             OTHER_ID,
             None,
         )
@@ -2164,9 +2189,10 @@ mod tests {
                 "fp1-php83",
                 "example.test",
                 0,
-                "/r".into(),
+                "/var/www/r".into(),
                 "x {}".into(),
                 None,
+                &content_roots(),
                 ID,
                 None
             )
@@ -2178,9 +2204,10 @@ mod tests {
                 "fp1-php83",
                 "-bad.test",
                 80,
-                "/r".into(),
+                "/var/www/r".into(),
                 "x {}".into(),
                 None,
+                &content_roots(),
                 ID,
                 None
             )
@@ -2192,14 +2219,142 @@ mod tests {
                 "fp1-php83",
                 "example.test",
                 80,
-                "/r".into(),
+                "/var/www/r".into(),
                 "x {}".into(),
                 Some("zz"),
+                &content_roots(),
                 ID,
                 None
             )
             .err(),
             Some(RequestError::InvalidPriorHash)
+        );
+    }
+
+    const HOSTILE_ROOTS: &[&str] = &[
+        "",
+        "/",
+        "/var/www",
+        "/var/www/",
+        "/etc/passwd",
+        "/var/wwwx/a",
+        "var/www/a",
+        "/var/www/a b",
+        "/var/www/a\nroot * /etc",
+        "/var/www/a\r\nimport /etc/x",
+        "/var/www/a}",
+        "/var/www/a {",
+        "/var/www/a{",
+        "/var/www/a}\nhandle {",
+        "/var/www/../etc",
+        "/var/www/a/../../etc",
+        "/var/www/a/./b",
+        "/var/www//a",
+        "/var/www/a;rm",
+        "/var/www/a:/etc",
+        "/var/www/a\"b",
+        "/var/www/a`b",
+        "/var/www/a$HOME",
+        "/var/www/a\0b",
+    ];
+
+    #[test]
+    fn site_requests_reject_hostile_roots() {
+        for root in HOSTILE_ROOTS {
+            assert_eq!(
+                WriteSiteServiceRequest::parse(
+                    "fp1-php83",
+                    "example.test",
+                    10123,
+                    10123,
+                    9000,
+                    (*root).into(),
+                    true,
+                    2,
+                    &content_roots(),
+                    ID,
+                    None,
+                )
+                .err(),
+                Some(RequestError::InvalidRoot),
+                "write {root:?}"
+            );
+            assert_eq!(
+                ActivateSiteConfigRequest::parse(
+                    "fp1-php83",
+                    "example.test",
+                    9000,
+                    (*root).into(),
+                    "x {}".into(),
+                    None,
+                    &content_roots(),
+                    ID,
+                    None,
+                )
+                .err(),
+                Some(RequestError::InvalidRoot),
+                "activate {root:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn site_requests_accept_the_roots_the_panel_sends() {
+        for root in [
+            "/var/www/example.test",
+            "/var/www/example.test/public",
+            "/var/www/sites/0b0c5b0e-6a39-4f55-8b8c-0f6a3d8b7b10/current",
+        ] {
+            assert!(
+                WriteSiteServiceRequest::parse(
+                    "fp1-php83",
+                    "example.test",
+                    10123,
+                    10123,
+                    9000,
+                    root.into(),
+                    false,
+                    1,
+                    &content_roots(),
+                    ID,
+                    None,
+                )
+                .is_ok(),
+                "{root}"
+            );
+            assert!(
+                ActivateSiteConfigRequest::parse(
+                    "fp1-php83",
+                    "example.test",
+                    9000,
+                    root.into(),
+                    "x {}".into(),
+                    None,
+                    &content_roots(),
+                    ID,
+                    None,
+                )
+                .is_ok(),
+                "{root}"
+            );
+        }
+        // No content root configured means nothing is acceptable.
+        assert_eq!(
+            WriteSiteServiceRequest::parse(
+                "fp1-php83",
+                "example.test",
+                10123,
+                10123,
+                9000,
+                "/var/www/example.test".into(),
+                false,
+                1,
+                &[],
+                ID,
+                None,
+            )
+            .err(),
+            Some(RequestError::InvalidRoot)
         );
     }
 
