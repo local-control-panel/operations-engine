@@ -69,6 +69,50 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SystemCommand::DockerNetwork {
+            action,
+            name,
+            driver,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => docker_network(
+            &action,
+            &name,
+            driver.as_deref(),
+            confirmation.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SystemCommand::PullImage {
+            reference,
+            request_id,
+            idempotency_key,
+        } => pull_image(&reference, &request_id, idempotency_key.as_deref()),
+        SystemCommand::RemoveImage {
+            image_id,
+            force,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => remove_image(
+            &image_id,
+            force,
+            confirmation.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SystemCommand::RemoveVolume {
+            volume_name,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => remove_volume(
+            &volume_name,
+            confirmation.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SystemCommand::Service {
             unit,
             action,
@@ -729,6 +773,188 @@ fn set_container_limits(
             ErrorCode::UnsupportedPlatform,
             "docker.setLimits requires a Unix host",
         ))
+    }
+}
+
+#[cfg(unix)]
+fn resource_request_error(
+    operation: &'static str,
+    error: crate::docker_resource::RequestError,
+) -> Result<Response, ResponseBuildError> {
+    use crate::docker_resource::RequestError;
+    let message = match error {
+        RequestError::InvalidAction => "action must be create or remove",
+        RequestError::InvalidName => {
+            "name must start with a letter or digit and use letters, digits, _, . or -"
+        }
+        RequestError::InvalidDriver => "driver is not allowed for this action",
+        RequestError::InvalidReference => "reference is not a valid image reference",
+        RequestError::RegistryNotAllowed => "the image registry is not allowed",
+        RequestError::InvalidImageId => "image-id must be 12 to 64 lowercase hex digits",
+        RequestError::InvalidConfirmation => "confirmation does not match the operation",
+        RequestError::ForceNotApplicable => "force does not apply to this operation",
+        RequestError::InvalidRequestId | RequestError::InvalidIdempotencyKey => {
+            "request-id or idempotency-key is invalid"
+        }
+    };
+    Ok(Response::failure(
+        operation,
+        ErrorCode::InvalidInput,
+        message,
+    ))
+}
+
+#[cfg(unix)]
+fn resource_response<T: serde::Serialize>(
+    operation: &'static str,
+    outcome: Result<T, crate::docker_container::Error>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::docker_container::Error;
+    match outcome {
+        Ok(v) => Response::success(operation, v),
+        Err(Error::PostCommit { result }) => Response::success(operation, result),
+        Err(e) => {
+            let (code, message) = e.protocol();
+            Ok(Response::failure(operation, code, &message))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn with_resource_context(
+    operation: &'static str,
+    run: impl FnOnce(&crate::docker_resource::Context<'_>) -> Result<Response, ResponseBuildError>,
+) -> Result<Response, ResponseBuildError> {
+    let state = match open_engine_state(operation) {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    run(&crate::docker_resource::Context {
+        engine_state: &state,
+        docker_program: "docker",
+        free_bytes: crate::docker_resource::statvfs_free_bytes,
+    })
+}
+
+#[cfg(not(unix))]
+fn resource_unsupported(operation: &'static str) -> Result<Response, ResponseBuildError> {
+    Ok(Response::failure(
+        operation,
+        ErrorCode::UnsupportedPlatform,
+        &format!("{operation} requires a Unix host"),
+    ))
+}
+
+fn docker_network(
+    action: &str,
+    name: &str,
+    driver: Option<&str>,
+    confirmation: Option<&str>,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::docker_resource as dr;
+        let request =
+            match dr::NetworkRequest::parse(action, name, driver, confirmation, request_id, key) {
+                Ok(v) => v,
+                Err(e) => return resource_request_error(dr::NETWORK_OPERATION, e),
+            };
+        with_resource_context(dr::NETWORK_OPERATION, |ctx| {
+            resource_response(
+                dr::NETWORK_OPERATION,
+                dr::execute_network(ctx, &request, &CancellationToken::default()),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (action, name, driver, confirmation, request_id, key);
+        resource_unsupported("docker.network")
+    }
+}
+
+fn pull_image(
+    reference: &str,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::docker_resource as dr;
+        let request = match dr::PullRequest::parse(reference, request_id, key) {
+            Ok(v) => v,
+            Err(e) => return resource_request_error(dr::PULL_OPERATION, e),
+        };
+        with_resource_context(dr::PULL_OPERATION, |ctx| {
+            resource_response(
+                dr::PULL_OPERATION,
+                dr::execute_pull(ctx, &request, &CancellationToken::default()),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (reference, request_id, key);
+        resource_unsupported("docker.imagePull")
+    }
+}
+
+fn remove_image(
+    image_id: &str,
+    force: bool,
+    confirmation: Option<&str>,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::docker_resource as dr;
+        let request =
+            match dr::ImageRemoveRequest::parse(image_id, force, confirmation, request_id, key) {
+                Ok(v) => v,
+                Err(e) => return resource_request_error(dr::IMAGE_REMOVE_OPERATION, e),
+            };
+        with_resource_context(dr::IMAGE_REMOVE_OPERATION, |ctx| {
+            resource_response(
+                dr::IMAGE_REMOVE_OPERATION,
+                dr::execute_image_remove(ctx, &request, &CancellationToken::default()),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (image_id, force, confirmation, request_id, key);
+        resource_unsupported("docker.imageRemove")
+    }
+}
+
+fn remove_volume(
+    volume_name: &str,
+    confirmation: Option<&str>,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::docker_resource as dr;
+        let request =
+            match dr::VolumeRemoveRequest::parse(volume_name, confirmation, request_id, key) {
+                Ok(v) => v,
+                Err(e) => return resource_request_error(dr::VOLUME_REMOVE_OPERATION, e),
+            };
+        with_resource_context(dr::VOLUME_REMOVE_OPERATION, |ctx| {
+            resource_response(
+                dr::VOLUME_REMOVE_OPERATION,
+                dr::execute_volume_remove(ctx, &request, &CancellationToken::default()),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (volume_name, confirmation, request_id, key);
+        resource_unsupported("docker.volumeRemove")
     }
 }
 

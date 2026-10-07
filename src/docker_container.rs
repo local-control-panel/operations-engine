@@ -285,6 +285,14 @@ pub enum Stage {
     Unpause,
     Remove,
     Update,
+    NetworkCreate,
+    NetworkRemove,
+    ImagePull,
+    ImageRemove,
+    VolumeRemove,
+    /// The read-only lookups `docker.network`, `docker.imagePull`,
+    /// `docker.imageRemove` and `docker.volumeRemove` make before acting.
+    Lookup,
 }
 
 impl Stage {
@@ -298,6 +306,12 @@ impl Stage {
             Self::Unpause => "Docker rejected the container unpause",
             Self::Remove => "Docker rejected the container removal",
             Self::Update => "Docker rejected the container limits",
+            Self::NetworkCreate => "Docker rejected the network creation",
+            Self::NetworkRemove => "Docker rejected the network removal",
+            Self::ImagePull => "Docker rejected the image pull",
+            Self::ImageRemove => "Docker rejected the image removal",
+            Self::VolumeRemove => "Docker rejected the volume removal",
+            Self::Lookup => "could not look up the Docker resource",
         }
     }
 }
@@ -348,11 +362,18 @@ pub enum Error {
     StackBusy,
     ReplayInProgress,
     NotFound,
+    /// A network, image or volume that Docker does not know.
+    ResourceNotFound(&'static str),
     /// `remove` of a container of the managed `wcp` stack.
     ManagedRemoveRefused,
     CpusAboveHost,
     MemoryAboveHost,
     HostResourcesUnknown,
+    /// The request names a resource the engine will not touch (a built-in or
+    /// managed network, an image or volume in use); the text says which.
+    Refused(&'static str),
+    /// Not enough free space under Docker's root directory to pull an image.
+    DiskLow,
     Run(Stage, process::ProcessRunError),
     Rejected(Stage, SubprocessDiagnostics),
     PostCommit {
@@ -380,6 +401,7 @@ impl Error {
                 "the original request is still in progress".into(),
             ),
             Self::NotFound => (ErrorCode::NotFound, "no such container".into()),
+            Self::ResourceNotFound(kind) => (ErrorCode::NotFound, format!("no such {kind}")),
             Self::ManagedRemoveRefused => (
                 ErrorCode::InvalidInput,
                 "containers of the managed wcp stack cannot be removed; stop the stack \
@@ -397,6 +419,12 @@ impl Error {
             Self::HostResourcesUnknown => (
                 ErrorCode::DependencyUnavailable,
                 "the host memory size could not be read, so the limit cannot be checked".into(),
+            ),
+            Self::Refused(message) => (ErrorCode::InvalidInput, (*message).into()),
+            Self::DiskLow => (
+                ErrorCode::DependencyUnavailable,
+                "not enough free disk space under the Docker root directory to pull an image"
+                    .into(),
             ),
             Self::Run(stage, error) => (process::spawn_error_code(error), stage.message().into()),
             Self::Rejected(stage, diagnostics) => (
@@ -429,15 +457,15 @@ struct Resolved {
     memory_bytes: u64,
 }
 
-fn run_docker(
-    ctx: &Context<'_>,
+pub(crate) fn run_docker(
+    program: &str,
     stage: Stage,
     argv: &[String],
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<process::ProcessOutput, Error> {
     let output = process::run(
-        &ProcessRequest::new(ctx.docker_program).args(argv),
+        &ProcessRequest::new(program).args(argv),
         &ProcessLimits {
             timeout,
             max_stdout_bytes: 64 * 1024,
@@ -454,7 +482,7 @@ fn run_docker(
         // looked at by the caller for the one case it classifies.
         return Err(Error::Rejected(
             stage,
-            SubprocessDiagnostics::from_output(ctx.docker_program, &output),
+            SubprocessDiagnostics::from_output(program, &output),
         ));
     }
     Ok(output)
@@ -526,7 +554,7 @@ fn parse_inspect(stdout: &str, requested: &ContainerId) -> Result<Resolved, Erro
     })
 }
 
-fn rel(path: &str) -> SiteRelativePath {
+pub(crate) fn rel(path: &str) -> SiteRelativePath {
     SiteRelativePath::parse(path).expect("literal path is valid")
 }
 
@@ -539,7 +567,7 @@ fn open_scope(engine_state: &ManagedRoot) -> std::io::Result<ManagedRoot> {
     Ok(scope)
 }
 
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -626,7 +654,7 @@ pub fn execute_action(
         cancel,
         |resolved| {
             run_docker(
-                ctx,
+                ctx.docker_program,
                 req.action.stage(),
                 &req.action.argv(req.force, &resolved.id),
                 ACTION_TIMEOUT,
@@ -677,7 +705,13 @@ pub fn execute_limits(
                 let mut argv = vec!["update".to_owned()];
                 argv.extend(plan.flags);
                 argv.push(resolved.id.clone());
-                run_docker(ctx, Stage::Update, &argv, ACTION_TIMEOUT, cancel)?;
+                run_docker(
+                    ctx.docker_program,
+                    Stage::Update,
+                    &argv,
+                    ACTION_TIMEOUT,
+                    cancel,
+                )?;
             }
             Ok(LimitsResult {
                 container_id: resolved.id.clone(),
@@ -783,7 +817,7 @@ pub fn parse_meminfo_total(meminfo: &str) -> Option<u64> {
     }
 }
 
-fn replay<T: DeserializeOwned>(
+pub(crate) fn replay<T: DeserializeOwned>(
     scope: &ManagedRoot,
     id: RequestId,
     operation: &'static str,
@@ -812,7 +846,7 @@ fn replay<T: DeserializeOwned>(
     }
 }
 
-fn fail(
+pub(crate) fn fail(
     scope: &ManagedRoot,
     state_path: &SiteRelativePath,
     audit_path: &SiteRelativePath,
