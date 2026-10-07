@@ -2,10 +2,13 @@ use crate::{
     cli::RuntimeCommand,
     commands::{ContentFileError, read_content_file},
     error::{ErrorCode, WarningCode},
+    ingress::transition::LifecycleError,
     process::CancellationToken,
     protocol::{Response, ResponseBuildError, Warning},
     runtime_config::{
-        OPERATION, RuntimeActivateConfigRequest, RuntimeActivateConfigRequestError,
+        OPERATION, REMOVE_OPERATION, RuntimeActivateConfigRequest,
+        RuntimeActivateConfigRequestError, RuntimeRemoveConfigRequest,
+        RuntimeRemoveConfigRequestError,
         execute::{
             RuntimeActivateConfigError, RuntimeActivateContext, execute as execute_activate_config,
         },
@@ -13,6 +16,7 @@ use crate::{
             RECONCILE_OPERATION, RuntimeReconcileContext, RuntimeReconcileError,
             RuntimeReconcileRequest, RuntimeReconcileRequestError, execute as execute_reconcile,
         },
+        remove::execute as execute_remove_config,
     },
     site::{Domain, RuntimeId},
     transaction::{IdempotencyKey, RequestId},
@@ -37,11 +41,131 @@ pub fn run(command: RuntimeCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        RuntimeCommand::RemoveConfig {
+            runtime_id,
+            domain,
+            expected_hash,
+            request_id,
+            idempotency_key,
+        } => remove_config(
+            &runtime_id,
+            &domain,
+            &expected_hash,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         RuntimeCommand::Reconcile {
             runtime_id,
             request_id,
             idempotency_key,
         } => reconcile(&runtime_id, &request_id, idempotency_key.as_deref()),
+    }
+}
+
+fn remove_config(
+    runtime_id: &str,
+    domain: &str,
+    expected_hash: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let request = match RuntimeRemoveConfigRequest::parse(
+        runtime_id,
+        domain,
+        expected_hash,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                REMOVE_OPERATION,
+                ErrorCode::InvalidInput,
+                match error {
+                    RuntimeRemoveConfigRequestError::InvalidRuntimeId => {
+                        "runtime-id is not a valid runtime pool identifier"
+                    }
+                    RuntimeRemoveConfigRequestError::InvalidDomain => {
+                        "domain is not a valid domain name"
+                    }
+                    RuntimeRemoveConfigRequestError::InvalidExpectedHash => {
+                        "expected-hash is not a valid SHA-256 digest"
+                    }
+                    RuntimeRemoveConfigRequestError::InvalidRequestId => {
+                        "request-id is not a canonical UUID"
+                    }
+                    RuntimeRemoveConfigRequestError::InvalidIdempotencyKey => {
+                        "idempotency-key is invalid"
+                    }
+                },
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        run_remove_config(&request)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            REMOVE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "runtime.removeConfig requires a Unix host",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn run_remove_config(request: &RuntimeRemoveConfigRequest) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{compose, config::EngineConfig, filesystem::ManagedRoot};
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                REMOVE_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                REMOVE_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let compose_access = compose::Access::default();
+    let context = RuntimeActivateContext {
+        runtime_root: &engine_config.runtime_root,
+        engine_state: &engine_state,
+        compose: &compose_access,
+    };
+
+    match execute_remove_config(&context, request, &CancellationToken::default()) {
+        Ok(result) => Response::success(REMOVE_OPERATION, result),
+        Err(LifecycleError::PostCommitRecordFailed { result, .. }) => {
+            Response::success(REMOVE_OPERATION, result).map(|response| {
+                response.with_warnings(vec![Warning {
+                    code: WarningCode::TransactionRecordIncomplete,
+                    message: "the configuration was removed but its transaction record could \
+                              not be saved"
+                        .to_owned(),
+                }])
+            })
+        }
+        Err(error) => {
+            let (code, message) = error.protocol();
+            Ok(Response::failure(REMOVE_OPERATION, code, &message))
+        }
     }
 }
 

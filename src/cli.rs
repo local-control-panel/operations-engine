@@ -1025,6 +1025,60 @@ pub enum IngressCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Deletes a domain's route files (live or disabled, plus any
+    /// maintenance backup) and reloads the ingress, putting every file back
+    /// if the reload fails.
+    RemoveRoute {
+        #[arg(long)]
+        domain: String,
+
+        /// SHA-256 digest of the route being removed: the live file, or the
+        /// disabled file when there is no live one.
+        #[arg(long = "expected-hash")]
+        expected_hash: String,
+
+        /// SHA-256 digest of the domain's `.maintenance-backup`. Omit to
+        /// assert that the domain has none.
+        #[arg(long = "expected-backup-hash")]
+        expected_backup_hash: Option<String>,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of removing twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
+    /// Enables or disables a domain by renaming its route between
+    /// `<domain>.caddyfile` and `<domain>.caddyfile.disabled`, reloading the
+    /// ingress and renaming back if the reload fails.
+    SetEnabled {
+        #[arg(long)]
+        domain: String,
+
+        /// `true` to move the disabled route live, `false` to disable the
+        /// live route.
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+
+        /// SHA-256 digest of the route file being moved (the disabled file
+        /// when enabling, the live file when disabling).
+        #[arg(long = "expected-hash")]
+        expected_hash: String,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of toggling twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Sweeps the whole configured ingress root for `.tmp`/`.tmp-*`
     /// staging siblings and `.rollback-*` backup siblings left behind by
     /// an interrupted activate/park/unpark attempt, removing or restoring
@@ -1055,6 +1109,8 @@ impl IngressCommand {
             Self::ActivateConfig { .. } => "ingress.activateConfig",
             Self::Park { .. } => "ingress.park",
             Self::Unpark { .. } => "ingress.unpark",
+            Self::RemoveRoute { .. } => "ingress.removeRoute",
+            Self::SetEnabled { .. } => "ingress.setEnabled",
             Self::Reconcile { .. } => "ingress.reconcile",
         }
     }
@@ -1099,6 +1155,30 @@ pub enum RuntimeCommand {
 
         /// Caller-supplied token so a retried request returns the original
         /// outcome instead of activating twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
+    /// Deletes one site's fragment from one runtime pool and reloads that
+    /// pool, putting the fragment back if the reload fails.
+    RemoveConfig {
+        /// Which runtime pool the fragment belongs to.
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+
+        #[arg(long)]
+        domain: String,
+
+        /// SHA-256 digest of the fragment being removed.
+        #[arg(long = "expected-hash")]
+        expected_hash: String,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of removing twice.
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
@@ -1362,6 +1442,7 @@ impl RuntimeCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateConfig { .. } => "runtime.activateConfig",
+            Self::RemoveConfig { .. } => "runtime.removeConfig",
             Self::Reconcile { .. } => "runtime.reconcile",
         }
     }

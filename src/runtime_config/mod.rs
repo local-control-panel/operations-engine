@@ -29,6 +29,7 @@
 pub mod activate;
 pub mod execute;
 pub mod reconcile;
+pub mod remove;
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +42,9 @@ use crate::{
 /// The stable protocol operation name, and the value recorded as
 /// `TransactionState::operation` for every activation attempt.
 pub const OPERATION: &str = "runtime.activateConfig";
+
+/// The stable protocol operation name for `runtime.removeConfig`.
+pub const REMOVE_OPERATION: &str = "runtime.removeConfig";
 
 /// Where a runtime-service container sees its config fragments, regardless
 /// of which `runtime_id` it is: `website-control-panel`'s
@@ -156,6 +160,63 @@ pub struct RuntimeActivateConfigResult {
     pub activated: bool,
     pub content_sha256: ConfigHash,
     pub activated_at_unix_secs: u64,
+}
+
+/// A validated `runtime.removeConfig` request: deleting one site's fragment
+/// from one runtime pool, guarded by the hash of the fragment the caller
+/// read.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RuntimeRemoveConfigRequest {
+    pub runtime_id: RuntimeId,
+    pub domain: Domain,
+    pub expected_hash: ConfigHash,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeRemoveConfigRequestError {
+    InvalidRuntimeId,
+    InvalidDomain,
+    InvalidExpectedHash,
+    InvalidRequestId,
+    InvalidIdempotencyKey,
+}
+
+impl RuntimeRemoveConfigRequest {
+    pub fn parse(
+        runtime_id: &str,
+        domain: &str,
+        expected_hash: &str,
+        request_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Self, RuntimeRemoveConfigRequestError> {
+        Ok(Self {
+            runtime_id: RuntimeId::parse(runtime_id)
+                .map_err(|_| RuntimeRemoveConfigRequestError::InvalidRuntimeId)?,
+            domain: Domain::parse(domain)
+                .map_err(|_| RuntimeRemoveConfigRequestError::InvalidDomain)?,
+            expected_hash: ConfigHash::parse(expected_hash)
+                .map_err(|_| RuntimeRemoveConfigRequestError::InvalidExpectedHash)?,
+            request_id: RequestId::parse(request_id)
+                .map_err(|_| RuntimeRemoveConfigRequestError::InvalidRequestId)?,
+            idempotency_key: idempotency_key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| RuntimeRemoveConfigRequestError::InvalidIdempotencyKey)?,
+        })
+    }
+}
+
+/// The `result` payload of a successful `runtime.removeConfig` response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeRemoveConfigResult {
+    pub runtime_id: String,
+    pub domain: String,
+    /// The digest of the fragment that was removed.
+    pub content_sha256: ConfigHash,
+    pub removed_at_unix_secs: u64,
 }
 
 /// The path one site's runtime-service Caddyfile fragment lives at,
