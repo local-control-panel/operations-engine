@@ -137,6 +137,7 @@ pub enum RequestError {
     InvalidDomain,
     InvalidPort,
     InvalidPriorHash,
+    InvalidIdentity,
 }
 
 impl RequestError {
@@ -150,6 +151,7 @@ impl RequestError {
             Self::InvalidDomain => "domain is not a valid site domain",
             Self::InvalidPort => "port must be a nonzero TCP port",
             Self::InvalidPriorHash => "expected-prior-hash must be 64 hex digits",
+            Self::InvalidIdentity => "uid and gid must be site identities (at least 1000)",
         }
     }
 }
@@ -317,6 +319,13 @@ pub struct Context<'a> {
     /// `<runtime id>/<domain>/` directory per site. The host side of the
     /// bind mount each pool sees at `SITE_SERVICES_CONTAINER_ROOT`.
     pub site_services_root: &'a TrustedRoot,
+    /// The host's shared Caddy log directory (`/var/log/caddy`), where each
+    /// site's own runtime log is pre-created for it.
+    pub log_root: &'a TrustedRoot,
+    /// Hand each runtime log to the site identity. Always `true` in
+    /// production; unit tests that run unprivileged cannot chown to an
+    /// arbitrary uid.
+    pub chown_logs: bool,
     /// The managed stack directory (`~/compose/wp-stack`).
     pub stack_dir: &'a Path,
     /// `docker` in production; a fixture path in tests.
@@ -714,6 +723,16 @@ fn parse_site_config(
     })
 }
 
+/// The run script drops to this identity and the runtime log is handed to
+/// it: never root or a system account. Checked at the command boundary.
+pub fn validate_site_identity(uid: u32, gid: u32) -> Result<(), RequestError> {
+    let minimum = crate::site_enroll::MIN_SITE_IDENTITY;
+    if uid < minimum || gid < minimum {
+        return Err(RequestError::InvalidIdentity);
+    }
+    Ok(())
+}
+
 pub struct WriteSiteServiceRequest {
     pub runtime_id: RuntimeId,
     pub domain: Domain,
@@ -883,10 +902,36 @@ pub fn write_site_service(
                 .as_bytes(),
             )
             .map_err(Error::Io)?;
+            prepare_runtime_log(ctx, req)?;
             scan_services(ctx, &req.runtime_id, cancel)?;
             Ok(site_result(&req.runtime_id, &req.domain))
         },
     )
+}
+
+/// Pre-creates the site's own runtime log, `0600` and owned by the site
+/// identity, before the service is registered: the site process runs as an
+/// unprivileged uid and cannot create a file in the root-owned shared log
+/// directory. The ingress log has a different name and stays root-owned.
+/// The file is opened through the log directory's capability, must be a
+/// regular file, and is changed through its own descriptor.
+fn prepare_runtime_log(ctx: &Context<'_>, req: &WriteSiteServiceRequest) -> Result<(), Error> {
+    use std::os::unix::fs::{PermissionsExt, fchown};
+
+    let logs = ManagedRoot::open(ctx.log_root).map_err(Error::Io)?;
+    let name = rel(&format!("runtime-{}-{}.log", req.runtime_id, req.domain));
+    let file = logs.open_or_create_file(&name).map_err(Error::Io)?;
+    if !file.metadata().map_err(Error::Io)?.is_file() {
+        return Err(Error::Io(io::Error::other(
+            "runtime log is not a regular file",
+        )));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(Error::Io)?;
+    if ctx.chown_logs {
+        fchown(&file, Some(req.uid), Some(req.gid)).map_err(Error::Io)?;
+    }
+    Ok(())
 }
 
 /// Regenerates a site's `Caddyfile` (and `open-basedir.ini`) from typed
@@ -1468,6 +1513,7 @@ mod tests {
         state: ManagedRoot,
         runtime_root: TrustedRoot,
         site_services_root: TrustedRoot,
+        log_root: TrustedRoot,
         stack_dir: PathBuf,
         docker: String,
         calls: PathBuf,
@@ -1478,7 +1524,7 @@ mod tests {
         fn new(exit: i32) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let base = dir.path().canonicalize().unwrap();
-            for sub in ["state", "runtimes", "site-services", "stack"] {
+            for sub in ["state", "runtimes", "site-services", "stack", "logs"] {
                 fs::create_dir(base.join(sub)).unwrap();
             }
             let calls = base.join("calls.log");
@@ -1501,6 +1547,7 @@ mod tests {
                 state: ManagedRoot::open(&TrustedRoot::parse(base.join("state")).unwrap()).unwrap(),
                 runtime_root: TrustedRoot::parse(base.join("runtimes")).unwrap(),
                 site_services_root: TrustedRoot::parse(base.join("site-services")).unwrap(),
+                log_root: TrustedRoot::parse(base.join("logs")).unwrap(),
                 stack_dir: base.join("stack"),
                 docker: docker.to_string_lossy().into_owned(),
                 health: base.join("health"),
@@ -1514,6 +1561,8 @@ mod tests {
                 engine_state: &self.state,
                 runtime_root: &self.runtime_root,
                 site_services_root: &self.site_services_root,
+                log_root: &self.log_root,
+                chown_logs: false,
                 stack_dir: &self.stack_dir,
                 docker: &self.docker,
                 health: HealthWait {
@@ -1659,6 +1708,82 @@ mod tests {
                 compose_prefix(&fixture)
             )]
         );
+    }
+
+    #[test]
+    fn write_site_service_precreates_the_runtime_log_for_the_site_identity() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        // Chowning to oneself works unprivileged, which is all a unit test
+        // can prove about the handover; the Lima run covers a foreign uid.
+        let own = fs::metadata(fixture.log_root.as_path()).unwrap();
+        let (uid, gid) = (own.uid(), own.gid());
+        let mut ctx = fixture.ctx();
+        ctx.chown_logs = true;
+        let request = WriteSiteServiceRequest::parse(
+            "fp1-php83",
+            "example.test",
+            uid,
+            gid,
+            9000,
+            "/var/www/example".into(),
+            false,
+            2,
+            ID,
+            None,
+        )
+        .unwrap();
+        // A pre-existing wider-mode log is tightened, not truncated.
+        let log = fixture
+            .log_root
+            .as_path()
+            .join("runtime-fp1-php83-example.test.log");
+        fs::write(&log, "kept\n").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_site_service(&ctx, &request, &CancellationToken::default()).unwrap();
+
+        let meta = fs::metadata(&log).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!((meta.uid(), meta.gid()), (uid, gid));
+        assert_eq!(fs::read_to_string(&log).unwrap(), "kept\n");
+        // Only the site's own runtime log is created; the ingress log is not.
+        assert_eq!(fs::read_dir(fixture.log_root.as_path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn write_site_service_refuses_a_runtime_log_that_is_not_a_regular_file() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fs::create_dir(
+            fixture
+                .log_root
+                .as_path()
+                .join("runtime-fp1-php83-example.test.log"),
+        )
+        .unwrap();
+        let error = write_site_service(
+            &fixture.ctx(),
+            &write_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Io(_)));
+        // Nothing was registered with s6.
+        assert!(fixture.calls().is_empty());
+    }
+
+    #[test]
+    fn only_site_identities_may_run_a_service() {
+        assert!(validate_site_identity(1000, 1000).is_ok());
+        for (uid, gid) in [(0, 0), (0, 1000), (1000, 0), (999, 999), (10_000, 33)] {
+            assert_eq!(
+                validate_site_identity(uid, gid),
+                Err(RequestError::InvalidIdentity)
+            );
+        }
     }
 
     #[test]

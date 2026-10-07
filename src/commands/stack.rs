@@ -5,6 +5,10 @@ use crate::{
 };
 
 const OPERATION: &str = "stack.deploy";
+/// Where each site's runtime log lives; a fixed host path like the config
+/// path, bind-mounted into the ingress and runtime containers.
+#[cfg(unix)]
+const RUNTIME_LOG_DIR: &str = "/var/log/caddy";
 #[cfg(unix)]
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
@@ -154,9 +158,17 @@ fn write_site_service(
     idempotency_key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
     use crate::stack_service::{
-        WRITE_SITE_SERVICE_OPERATION, WriteSiteServiceRequest, write_site_service,
+        WRITE_SITE_SERVICE_OPERATION, WriteSiteServiceRequest, validate_site_identity,
+        write_site_service,
     };
 
+    if let Err(error) = validate_site_identity(uid, gid) {
+        return Ok(Response::failure(
+            WRITE_SITE_SERVICE_OPERATION,
+            ErrorCode::InvalidInput,
+            error.message(),
+        ));
+    }
     let request = match WriteSiteServiceRequest::parse(
         runtime_id,
         domain,
@@ -386,10 +398,19 @@ where
             "stack directory is unavailable",
         ));
     };
+    let Ok(log_root) = crate::site::TrustedRoot::parse(RUNTIME_LOG_DIR) else {
+        return Ok(Response::failure(
+            operation,
+            ErrorCode::Internal,
+            "log directory is unavailable",
+        ));
+    };
     let context = stack_service::Context {
         engine_state: &engine_state,
         runtime_root: &config.runtime_root,
         site_services_root: &config.site_services_root,
+        log_root: &log_root,
+        chown_logs: true,
         stack_dir: &stack_dir,
         docker: "docker",
         health: stack_service::HealthWait::PRODUCTION,
