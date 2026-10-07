@@ -137,7 +137,7 @@ fn valid_managed_user(name: &str) -> bool {
 /// A document root: absolute, made of path-safe characters and no dot
 /// segments, so it can sit in a Caddyfile and an identity record line, and it
 /// lies under one of the engine's content roots.
-fn validate_root(root: &str, content_roots: &[TrustedRoot]) -> Result<(), RequestError> {
+pub(crate) fn validate_root(root: &str, content_roots: &[TrustedRoot]) -> Result<(), RequestError> {
     let path = Path::new(root);
     let plain = !root.is_empty()
         && root.len() <= MAX_ROOT_BYTES
