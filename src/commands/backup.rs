@@ -601,6 +601,16 @@ fn schedule_host(operation: &'static str) -> Result<ScheduleHost, Box<Response>>
         .map_err(|_| fail(crate::commands::CONFIG_UNAVAILABLE_MESSAGE))?;
     let engine_state = ManagedRoot::open(&config.state_root)
         .map_err(|_| fail("engine state root is unavailable"))?;
+    // A host with no enrolled git-deploy site has no credential directory
+    // yet; it is engine-owned, so create it private rather than fail.
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(config.credential_root.as_path())
+            .map_err(|_| fail("engine credential root is unavailable"))?;
+    }
     let credential_root = ManagedRoot::open(&config.credential_root)
         .map_err(|_| fail("engine credential root is unavailable"))?;
     let credentials = backup_schedule::execute::open_credentials(&credential_root)
