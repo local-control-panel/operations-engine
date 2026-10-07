@@ -810,6 +810,77 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Make sure a site has its Unix account, a loopback port in the pool
+    /// and an identity record. Creates the account with the next id from a
+    /// monotonic counter that never reuses an id, or reuses the site's
+    /// existing managed account (`--os-user`, for a runtime migration).
+    /// Under the shared stack lock; idempotent.
+    AllocateIdentity {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long)]
+        domain: String,
+        /// An existing `wcp-site-<16 hex>` account to reuse instead of the
+        /// one derived from the domain.
+        #[arg(long = "os-user")]
+        os_user: Option<String>,
+        /// The site's document root, under a content root.
+        #[arg(long)]
+        root: String,
+        /// FrankenPHP worker mode (`true`/`false`).
+        #[arg(long = "worker-mode", action = clap::ArgAction::Set)]
+        worker_mode: bool,
+        #[arg(long = "worker-count")]
+        worker_count: i64,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove a site's identity record from a pool and, with
+    /// `--remove-user true`, its account when no other record uses it and
+    /// its service directory is gone. A missing record is success.
+    ReleaseIdentity {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "remove-user", action = clap::ArgAction::Set)]
+        remove_user: bool,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Change the document root of a site's identity record.
+    UpdateIdentity {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        root: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Move a site's identity record to its new domain (and root) after a
+    /// rename, keeping the account and port.
+    RenameIdentity {
+        #[arg(long = "runtime-id")]
+        runtime_id: String,
+        #[arg(long = "from-domain")]
+        from_domain: String,
+        #[arg(long = "to-domain")]
+        to_domain: String,
+        #[arg(long)]
+        root: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SiteCommand {
@@ -824,6 +895,10 @@ impl SiteCommand {
             Self::RenameManifest { .. } => "site.renameManifest",
             Self::Enroll { .. } => "site.enroll",
             Self::Unenroll { .. } => "site.unenroll",
+            Self::AllocateIdentity { .. } => "site.allocateIdentity",
+            Self::ReleaseIdentity { .. } => "site.releaseIdentity",
+            Self::UpdateIdentity { .. } => "site.updateIdentity",
+            Self::RenameIdentity { .. } => "site.renameIdentity",
         }
     }
 }

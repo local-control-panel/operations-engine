@@ -97,7 +97,309 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => unenroll(&site_id, &request_id, idempotency_key.as_deref()),
+        SiteCommand::AllocateIdentity {
+            runtime_id,
+            domain,
+            os_user,
+            root,
+            worker_mode,
+            worker_count,
+            request_id,
+            idempotency_key,
+        } => identity::allocate(
+            &runtime_id,
+            &domain,
+            os_user.as_deref(),
+            &root,
+            worker_mode,
+            worker_count,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SiteCommand::ReleaseIdentity {
+            runtime_id,
+            domain,
+            remove_user,
+            request_id,
+            idempotency_key,
+        } => identity::release(
+            &runtime_id,
+            &domain,
+            remove_user,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SiteCommand::UpdateIdentity {
+            runtime_id,
+            domain,
+            root,
+            request_id,
+            idempotency_key,
+        } => identity::update(
+            &runtime_id,
+            &domain,
+            &root,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SiteCommand::RenameIdentity {
+            runtime_id,
+            from_domain,
+            to_domain,
+            root,
+            request_id,
+            idempotency_key,
+        } => identity::rename(
+            &runtime_id,
+            &from_domain,
+            &to_domain,
+            &root,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
     }
+}
+
+/// `site.allocateIdentity`, `site.releaseIdentity`, `site.updateIdentity`
+/// and `site.renameIdentity` (milestone 064).
+mod identity {
+    use crate::{
+        error::ErrorCode,
+        protocol::{Response, ResponseBuildError},
+    };
+
+    #[cfg(unix)]
+    use crate::site_identity::{
+        ALLOCATE_OPERATION, AllocateRequest, RELEASE_OPERATION, RENAME_OPERATION, ReleaseRequest,
+        RenameRequest, UPDATE_OPERATION, UpdateRequest,
+    };
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn allocate(
+        runtime_id: &str,
+        domain: &str,
+        os_user: Option<&str>,
+        root: &str,
+        worker_mode: bool,
+        worker_count: i64,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Response, ResponseBuildError> {
+        #[cfg(unix)]
+        {
+            run(ALLOCATE_OPERATION, |config, ctx| {
+                let request = AllocateRequest::parse(
+                    runtime_id,
+                    domain,
+                    os_user,
+                    root,
+                    worker_mode,
+                    worker_count,
+                    &config.content_roots,
+                    request_id,
+                    key,
+                )
+                .map_err(Rejected::Request)?;
+                crate::site_identity::allocate(ctx, &request, &Default::default())
+                    .map(serde_json::to_value)
+                    .map_err(Rejected::Operation)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (runtime_id, domain, os_user, root, worker_mode, worker_count);
+            unsupported("site.allocateIdentity", request_id, key)
+        }
+    }
+
+    pub(super) fn release(
+        runtime_id: &str,
+        domain: &str,
+        remove_user: bool,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Response, ResponseBuildError> {
+        #[cfg(unix)]
+        {
+            run(RELEASE_OPERATION, |_, ctx| {
+                let request =
+                    ReleaseRequest::parse(runtime_id, domain, remove_user, request_id, key)
+                        .map_err(Rejected::Request)?;
+                crate::site_identity::release(ctx, &request, &Default::default())
+                    .map(serde_json::to_value)
+                    .map_err(Rejected::Operation)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (runtime_id, domain, remove_user);
+            unsupported("site.releaseIdentity", request_id, key)
+        }
+    }
+
+    pub(super) fn update(
+        runtime_id: &str,
+        domain: &str,
+        root: &str,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Response, ResponseBuildError> {
+        #[cfg(unix)]
+        {
+            run(UPDATE_OPERATION, |config, ctx| {
+                let request = UpdateRequest::parse(
+                    runtime_id,
+                    domain,
+                    root,
+                    &config.content_roots,
+                    request_id,
+                    key,
+                )
+                .map_err(Rejected::Request)?;
+                crate::site_identity::update(ctx, &request, &Default::default())
+                    .map(serde_json::to_value)
+                    .map_err(Rejected::Operation)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (runtime_id, domain, root);
+            unsupported("site.updateIdentity", request_id, key)
+        }
+    }
+
+    pub(super) fn rename(
+        runtime_id: &str,
+        from_domain: &str,
+        to_domain: &str,
+        root: &str,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Response, ResponseBuildError> {
+        #[cfg(unix)]
+        {
+            run(RENAME_OPERATION, |config, ctx| {
+                let request = RenameRequest::parse(
+                    runtime_id,
+                    from_domain,
+                    to_domain,
+                    root,
+                    &config.content_roots,
+                    request_id,
+                    key,
+                )
+                .map_err(Rejected::Request)?;
+                crate::site_identity::rename(ctx, &request, &Default::default())
+                    .map(serde_json::to_value)
+                    .map_err(Rejected::Operation)
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (runtime_id, from_domain, to_domain, root);
+            unsupported("site.renameIdentity", request_id, key)
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn unsupported(
+        operation: &'static str,
+        _request_id: &str,
+        _key: Option<&str>,
+    ) -> Result<Response, ResponseBuildError> {
+        Ok(Response::failure(
+            operation,
+            ErrorCode::UnsupportedPlatform,
+            "site identity operations require a Unix host",
+        ))
+    }
+
+    #[cfg(unix)]
+    enum Rejected {
+        Request(crate::site_identity::RequestError),
+        Operation(crate::site_identity::Error),
+    }
+
+    /// Loads the engine config, opens the state root, builds the context
+    /// and runs one identity operation, mapping its outcome to a response.
+    #[cfg(unix)]
+    fn run(
+        operation: &'static str,
+        run: impl FnOnce(
+            &crate::config::EngineConfig,
+            &crate::site_identity::Context<'_>,
+        ) -> Result<serde_json::Result<serde_json::Value>, Rejected>,
+    ) -> Result<Response, ResponseBuildError> {
+        use std::path::Path;
+
+        use crate::{
+            config::EngineConfig,
+            error::WarningCode,
+            filesystem::ManagedRoot,
+            protocol::Warning,
+            site_identity::{Context, Error, UserTools},
+        };
+
+        let config = match EngineConfig::load_root_owned(Path::new(super::CONFIG_PATH)) {
+            Ok(config) => config,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let engine_state = match ManagedRoot::open(&config.state_root) {
+            Ok(root) => root,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = Context {
+            engine_state: &engine_state,
+            runtime_root: &config.runtime_root,
+            site_services_root: &config.site_services_root,
+            passwd_file: Path::new("/etc/passwd"),
+            group_file: Path::new("/etc/group"),
+            legacy_uid_counter: Some(Path::new(LEGACY_UID_COUNTER)),
+            tools: UserTools::PRODUCTION,
+        };
+        match run(&config, &context) {
+            Ok(value) => {
+                let value = value.expect("operation results always serialize");
+                Response::success(operation, value)
+            }
+            Err(Rejected::Request(error)) => Ok(Response::failure(
+                operation,
+                ErrorCode::InvalidInput,
+                error.message(),
+            )),
+            Err(Rejected::Operation(Error::PostCommit(result))) => {
+                Response::success(operation, result).map(|response| {
+                    response.with_warnings(vec![Warning {
+                        code: WarningCode::TransactionRecordIncomplete,
+                        message: "the operation completed but its transaction record could \
+                                  not be saved"
+                            .to_owned(),
+                    }])
+                })
+            }
+            Err(Rejected::Operation(error)) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(operation, code, &message))
+            }
+        }
+    }
+
+    /// The control panel's old host-wide counter, read once to seed the
+    /// engine's own.
+    #[cfg(unix)]
+    const LEGACY_UID_COUNTER: &str = "/etc/wcp/site-uid-counter";
 }
 
 fn enroll(
