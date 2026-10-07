@@ -4,7 +4,7 @@ use crate::{
         BACKUP_ROOT, OPERATION, Request, RequestError,
         execute::{Context, Error, execute},
     },
-    backup_deploy, backup_import_remote, backup_trigger,
+    backup_deploy, backup_import_remote, backup_schedule, backup_trigger,
     cli::BackupCommand,
     commands::read_root_owned_content_file,
     error::ErrorCode,
@@ -39,6 +39,22 @@ pub fn run(command: BackupCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => create_database(&request_file, &request_id, idempotency_key.as_deref()),
+        BackupCommand::ScheduleDatabase {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => schedule_database(&request_file, &request_id, idempotency_key.as_deref()),
+        BackupCommand::UnscheduleDatabase {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => unschedule_database(&request_file, &request_id, idempotency_key.as_deref()),
+        BackupCommand::ListScheduled => list_scheduled(),
+        BackupCommand::RunScheduled {
+            db_type,
+            database,
+            retention_days,
+        } => run_scheduled(&db_type, &database, retention_days),
         BackupCommand::Delete {
             request_file,
             request_id,
@@ -565,5 +581,258 @@ fn error_message(error: RequestError) -> &'static str {
         }
         RequestError::InvalidRequestId => "request-id is not a canonical UUID",
         RequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+/// Everything the schedule operations need from the engine config, or the
+/// failure response to return instead.
+#[cfg(unix)]
+struct ScheduleHost {
+    state_root: crate::site::TrustedRoot,
+    engine_state: crate::filesystem::ManagedRoot,
+    credentials: crate::filesystem::ManagedRoot,
+}
+
+#[cfg(unix)]
+fn schedule_host(operation: &'static str) -> Result<ScheduleHost, Box<Response>> {
+    use crate::{config::EngineConfig, filesystem::ManagedRoot};
+    let fail = |message: &str| Box::new(Response::failure(operation, ErrorCode::Internal, message));
+    let config = EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH))
+        .map_err(|_| fail(crate::commands::CONFIG_UNAVAILABLE_MESSAGE))?;
+    let engine_state = ManagedRoot::open(&config.state_root)
+        .map_err(|_| fail("engine state root is unavailable"))?;
+    let credential_root = ManagedRoot::open(&config.credential_root)
+        .map_err(|_| fail("engine credential root is unavailable"))?;
+    let credentials = backup_schedule::execute::open_credentials(&credential_root)
+        .map_err(|_| fail("backup credential directory is unavailable"))?;
+    Ok(ScheduleHost {
+        state_root: config.state_root,
+        engine_state,
+        credentials,
+    })
+}
+
+fn schedule_request_error(
+    operation: &'static str,
+    error: backup_schedule::RequestError,
+) -> Response {
+    use backup_schedule::RequestError;
+    let message = match error {
+        RequestError::InvalidSchedule => {
+            "schedule must be five cron fields or @hourly/@daily/@weekly/@monthly/@yearly"
+        }
+        RequestError::InvalidRetention => "retentionDays is out of range",
+        RequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        RequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+        RequestError::InvalidJson | RequestError::InvalidField(_) => {
+            "request-file is not a valid scheduled backup plan"
+        }
+    };
+    Response::failure(operation, ErrorCode::InvalidInput, message)
+}
+
+fn schedule_database(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use backup_schedule::{SCHEDULE_OPERATION as OP, execute};
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OP,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match backup_schedule::ScheduleRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => return Ok(schedule_request_error(OP, error)),
+        };
+        let host = match schedule_host(OP) {
+            Ok(host) => host,
+            Err(response) => return Ok(*response),
+        };
+        let context = execute::Context {
+            engine_state: &host.engine_state,
+            state_root: &host.state_root,
+            credentials: &host.credentials,
+            crontab_program: "crontab",
+        };
+        match execute::schedule(&context, &request, &CancellationToken::default()) {
+            Ok(value) => Response::success(OP, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OP, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            backup_schedule::SCHEDULE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.scheduleDatabase requires a Unix host",
+        ))
+    }
+}
+
+fn unschedule_database(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use backup_schedule::{UNSCHEDULE_OPERATION as OP, execute};
+        let json = match read_root_owned_content_file(path) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OP,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match backup_schedule::UnscheduleRequest::parse(&json, request_id, key) {
+            Ok(value) => value,
+            Err(error) => return Ok(schedule_request_error(OP, error)),
+        };
+        let host = match schedule_host(OP) {
+            Ok(host) => host,
+            Err(response) => return Ok(*response),
+        };
+        let context = execute::Context {
+            engine_state: &host.engine_state,
+            state_root: &host.state_root,
+            credentials: &host.credentials,
+            crontab_program: "crontab",
+        };
+        match execute::unschedule(&context, &request, &CancellationToken::default()) {
+            Ok(value) => Response::success(OP, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OP, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            backup_schedule::UNSCHEDULE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.unscheduleDatabase requires a Unix host",
+        ))
+    }
+}
+
+fn list_scheduled() -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        match backup_schedule::execute::list("crontab") {
+            Ok(value) => Response::success(backup_schedule::LIST_OPERATION, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(
+                    backup_schedule::LIST_OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Response::failure(
+            backup_schedule::LIST_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.listScheduledDatabase requires a Unix host",
+        ))
+    }
+}
+
+/// The cron entry point. A failure is also written to stderr, because cron
+/// discards stdout (`>/dev/null` in the installed line) and mails stderr.
+fn run_scheduled(
+    db_type: &str,
+    database: &str,
+    retention_days: u16,
+) -> Result<Response, ResponseBuildError> {
+    let response = run_scheduled_inner(db_type, database, retention_days)?;
+    if let Some(error) = &response.error {
+        eprintln!("scheduled backup of {database} failed: {}", error.message);
+    }
+    Ok(response)
+}
+
+fn run_scheduled_inner(
+    db_type: &str,
+    database: &str,
+    retention_days: u16,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{filesystem::ManagedRoot, site::TrustedRoot};
+        use backup_schedule::{RUN_OPERATION as OP, execute};
+        let request = match backup_schedule::RunRequest::parse(db_type, database, retention_days) {
+            Ok(value) => value,
+            Err(error) => return Ok(schedule_request_error(OP, error)),
+        };
+        let host = match schedule_host(OP) {
+            Ok(host) => host,
+            Err(response) => {
+                return Ok(*response);
+            }
+        };
+        if std::fs::create_dir_all(BACKUP_ROOT).is_err() {
+            return Ok(Response::failure(
+                OP,
+                ErrorCode::Internal,
+                "backup root is unavailable",
+            ));
+        }
+        let backup_root = match TrustedRoot::parse(std::path::Path::new(BACKUP_ROOT))
+            .map_err(|_| ())
+            .and_then(|root| ManagedRoot::open(&root).map_err(|_| ()))
+        {
+            Ok(value) => value,
+            Err(()) => {
+                return Ok(Response::failure(
+                    OP,
+                    ErrorCode::Internal,
+                    "backup root is unavailable",
+                ));
+            }
+        };
+        match execute::run(
+            &host.credentials,
+            &request,
+            &host.engine_state,
+            &backup_root,
+            "docker",
+            &CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(OP, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OP, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (db_type, database, retention_days);
+        Ok(Response::failure(
+            backup_schedule::RUN_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "backup.runScheduledDatabase requires a Unix host",
+        ))
     }
 }

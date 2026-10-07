@@ -556,6 +556,35 @@ pub enum BackupCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Schedule a database backup without a secret in the crontab.
+    ScheduleDatabase {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove a scheduled database backup and its stored credentials.
+    UnscheduleDatabase {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// List scheduled database backups with passwords redacted.
+    ListScheduled,
+    /// Run one scheduled database backup. Invoked by cron, not by a client.
+    RunScheduled {
+        #[arg(long = "db-type")]
+        db_type: String,
+        #[arg(long)]
+        database: String,
+        #[arg(long = "retention-days")]
+        retention_days: u16,
+    },
     /// Delete one file constrained beneath the managed backup root.
     Delete {
         #[arg(long = "request-file")]
@@ -575,6 +604,10 @@ impl BackupCommand {
             Self::ActivateConfig { .. } => "backup.activateConfig",
             Self::TriggerNow { .. } => "backup.triggerNow",
             Self::CreateDatabase { .. } => "backup.createDatabase",
+            Self::ScheduleDatabase { .. } => "backup.scheduleDatabase",
+            Self::UnscheduleDatabase { .. } => "backup.unscheduleDatabase",
+            Self::ListScheduled => "backup.listScheduledDatabase",
+            Self::RunScheduled { .. } => "backup.runScheduledDatabase",
             Self::Delete { .. } => "backup.delete",
         }
     }
