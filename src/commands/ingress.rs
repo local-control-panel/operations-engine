@@ -4,14 +4,18 @@ use crate::{
     error::{ErrorCode, WarningCode},
     ingress::{
         ActivateConfigRequest, ActivateConfigRequestError, OPERATION as ACTIVATE_OPERATION,
-        PARK_OPERATION, ParkRequest, ParkRequestError, RouteTarget, UNPARK_OPERATION,
-        UnparkRequest, UnparkRequestError,
+        PARK_OPERATION, ParkRequest, ParkRequestError, REMOVE_ROUTE_OPERATION, RemoveRouteRequest,
+        RemoveRouteRequestError, RouteTarget, SET_ENABLED_OPERATION, SetEnabledRequest,
+        SetEnabledRequestError, UNPARK_OPERATION, UnparkRequest, UnparkRequestError,
         execute::{ActivateConfigError, ActivateContext, execute as execute_activate_config},
         park::{ParkError, execute as execute_park},
         reconcile::{
             RECONCILE_OPERATION, ReconcileContext, ReconcileError, ReconcileRequest,
             ReconcileRequestError, execute as execute_reconcile,
         },
+        remove::execute as execute_remove_route,
+        set_enabled::execute as execute_set_enabled,
+        transition::LifecycleError,
         unpark::{UnparkError, execute as execute_unpark},
     },
     process::CancellationToken,
@@ -55,11 +59,210 @@ pub fn run(command: IngressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => unpark(&domain, &request_id, idempotency_key.as_deref()),
+        IngressCommand::RemoveRoute {
+            domain,
+            expected_hash,
+            expected_backup_hash,
+            request_id,
+            idempotency_key,
+        } => remove_route(
+            &domain,
+            &expected_hash,
+            expected_backup_hash.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        IngressCommand::SetEnabled {
+            domain,
+            enabled,
+            expected_hash,
+            request_id,
+            idempotency_key,
+        } => set_enabled(
+            &domain,
+            enabled,
+            &expected_hash,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         IngressCommand::Reconcile {
             request_id,
             idempotency_key,
         } => reconcile(&request_id, idempotency_key.as_deref()),
     }
+}
+
+fn remove_route(
+    domain: &str,
+    expected_hash: &str,
+    expected_backup_hash: Option<&str>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let request = match RemoveRouteRequest::parse(
+        domain,
+        expected_hash,
+        expected_backup_hash,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                REMOVE_ROUTE_OPERATION,
+                ErrorCode::InvalidInput,
+                match error {
+                    RemoveRouteRequestError::InvalidDomain => "domain is not a valid domain name",
+                    RemoveRouteRequestError::InvalidExpectedHash => {
+                        "expected-hash is not a valid SHA-256 digest"
+                    }
+                    RemoveRouteRequestError::InvalidRequestId => {
+                        "request-id is not a canonical UUID"
+                    }
+                    RemoveRouteRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+                },
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        with_context(
+            REMOVE_ROUTE_OPERATION,
+            |context| match execute_remove_route(context, &request, &CancellationToken::default()) {
+                Ok(result) => Response::success(REMOVE_ROUTE_OPERATION, result),
+                Err(LifecycleError::PostCommitRecordFailed { result, .. }) => {
+                    Response::success(REMOVE_ROUTE_OPERATION, result).map(|response| {
+                        response.with_warnings(vec![Warning {
+                            code: WarningCode::TransactionRecordIncomplete,
+                            message: "the route was removed but its transaction record could \
+                                      not be saved"
+                                .to_owned(),
+                        }])
+                    })
+                }
+                Err(error) => {
+                    let (code, message) = error.protocol();
+                    Ok(Response::failure(REMOVE_ROUTE_OPERATION, code, &message))
+                }
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            REMOVE_ROUTE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "ingress.removeRoute requires a Unix host",
+        ))
+    }
+}
+
+fn set_enabled(
+    domain: &str,
+    enabled: bool,
+    expected_hash: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let request =
+        match SetEnabledRequest::parse(domain, enabled, expected_hash, request_id, idempotency_key)
+        {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    SET_ENABLED_OPERATION,
+                    ErrorCode::InvalidInput,
+                    match error {
+                        SetEnabledRequestError::InvalidDomain => {
+                            "domain is not a valid domain name"
+                        }
+                        SetEnabledRequestError::InvalidExpectedHash => {
+                            "expected-hash is not a valid SHA-256 digest"
+                        }
+                        SetEnabledRequestError::InvalidRequestId => {
+                            "request-id is not a canonical UUID"
+                        }
+                        SetEnabledRequestError::InvalidIdempotencyKey => {
+                            "idempotency-key is invalid"
+                        }
+                    },
+                ));
+            }
+        };
+
+    #[cfg(unix)]
+    {
+        with_context(SET_ENABLED_OPERATION, |context| {
+            match execute_set_enabled(context, &request, &CancellationToken::default()) {
+                Ok(result) => Response::success(SET_ENABLED_OPERATION, result),
+                Err(LifecycleError::PostCommitRecordFailed { result, .. }) => {
+                    Response::success(SET_ENABLED_OPERATION, result).map(|response| {
+                        response.with_warnings(vec![Warning {
+                            code: WarningCode::TransactionRecordIncomplete,
+                            message: "the route was toggled but its transaction record could \
+                                      not be saved"
+                                .to_owned(),
+                        }])
+                    })
+                }
+                Err(error) => {
+                    let (code, message) = error.protocol();
+                    Ok(Response::failure(SET_ENABLED_OPERATION, code, &message))
+                }
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            SET_ENABLED_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "ingress.setEnabled requires a Unix host",
+        ))
+    }
+}
+
+/// Loads the engine config, opens the state root and hands `run` an
+/// `ActivateContext` — the setup `run_park`/`run_unpark` each repeat.
+#[cfg(unix)]
+fn with_context(
+    operation: &'static str,
+    run: impl FnOnce(&ActivateContext<'_>) -> Result<Response, ResponseBuildError>,
+) -> Result<Response, ResponseBuildError> {
+    use std::path::Path;
+
+    use crate::{compose, config::EngineConfig, filesystem::ManagedRoot};
+
+    let engine_config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+        Ok(config) => config,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        }
+    };
+    let engine_state = match ManagedRoot::open(&engine_config.state_root) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        }
+    };
+    let compose_access = compose::Access::default();
+    let context = ActivateContext {
+        ingress_root: &engine_config.ingress_root,
+        engine_state: &engine_state,
+        compose: &compose_access,
+    };
+    run(&context)
 }
 
 fn activate_config(

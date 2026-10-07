@@ -23,6 +23,9 @@ pub mod activate;
 pub mod execute;
 pub mod park;
 pub mod reconcile;
+pub mod remove;
+pub mod set_enabled;
+pub mod transition;
 pub mod unpark;
 
 #[cfg(all(test, unix))]
@@ -55,6 +58,18 @@ pub const PARK_OPERATION: &str = "ingress.park";
 /// its own preflight/transaction/audit cycle, not a variant of either (see
 /// `unpark::execute`'s doc comment).
 pub const UNPARK_OPERATION: &str = "ingress.unpark";
+
+/// The stable protocol operation name for `ingress.removeRoute`: deleting a
+/// domain's live, disabled and maintenance-backup route files together.
+pub const REMOVE_ROUTE_OPERATION: &str = "ingress.removeRoute";
+
+/// The stable protocol operation name for `ingress.setEnabled`: renaming a
+/// domain's route between its live and disabled file names.
+pub const SET_ENABLED_OPERATION: &str = "ingress.setEnabled";
+
+/// The suffix a disabled route carries (`<domain>.caddyfile.disabled`).
+/// Never matched by the ingress container's `*.caddyfile` import glob.
+pub const DISABLED_ROUTE_SUFFIX: &str = "caddyfile.disabled";
 
 /// The Compose service running the shared ingress Caddy. Mirrors
 /// `website-control-panel`'s `INGRESS_CONTAINER`
@@ -421,10 +436,136 @@ pub struct UnparkResult {
     pub activated_at_unix_secs: u64,
 }
 
+/// A validated `ingress.removeRoute` request.
+///
+/// Both hashes are claims about current state that the engine verifies:
+/// `expected_hash` is the digest of the route being removed (the live file,
+/// or the disabled file when there is no live one), and an omitted
+/// `expected_backup_hash` asserts that the domain has no maintenance backup.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RemoveRouteRequest {
+    pub domain: Domain,
+    pub expected_hash: ConfigHash,
+    pub expected_backup_hash: Option<ConfigHash>,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemoveRouteRequestError {
+    InvalidDomain,
+    InvalidExpectedHash,
+    InvalidRequestId,
+    InvalidIdempotencyKey,
+}
+
+impl RemoveRouteRequest {
+    pub fn parse(
+        domain: &str,
+        expected_hash: &str,
+        expected_backup_hash: Option<&str>,
+        request_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Self, RemoveRouteRequestError> {
+        Ok(Self {
+            domain: Domain::parse(domain).map_err(|_| RemoveRouteRequestError::InvalidDomain)?,
+            expected_hash: ConfigHash::parse(expected_hash)
+                .map_err(|_| RemoveRouteRequestError::InvalidExpectedHash)?,
+            expected_backup_hash: expected_backup_hash
+                .map(ConfigHash::parse)
+                .transpose()
+                .map_err(|_| RemoveRouteRequestError::InvalidExpectedHash)?,
+            request_id: RequestId::parse(request_id)
+                .map_err(|_| RemoveRouteRequestError::InvalidRequestId)?,
+            idempotency_key: idempotency_key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| RemoveRouteRequestError::InvalidIdempotencyKey)?,
+        })
+    }
+}
+
+/// The `result` payload of a successful `ingress.removeRoute` response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoveRouteResult {
+    pub domain: String,
+    /// Whether the removed route was the live one (and so the ingress was
+    /// reloaded) rather than a disabled one.
+    pub was_live: bool,
+    pub removed_maintenance_backup: bool,
+    /// The digest of the route that was removed.
+    pub content_sha256: ConfigHash,
+    pub removed_at_unix_secs: u64,
+}
+
+/// A validated `ingress.setEnabled` request.
+#[derive(Debug, Eq, PartialEq)]
+pub struct SetEnabledRequest {
+    pub domain: Domain,
+    pub enabled: bool,
+    /// The digest of the route file being moved: the disabled file when
+    /// enabling, the live file when disabling.
+    pub expected_hash: ConfigHash,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetEnabledRequestError {
+    InvalidDomain,
+    InvalidExpectedHash,
+    InvalidRequestId,
+    InvalidIdempotencyKey,
+}
+
+impl SetEnabledRequest {
+    pub fn parse(
+        domain: &str,
+        enabled: bool,
+        expected_hash: &str,
+        request_id: &str,
+        idempotency_key: Option<&str>,
+    ) -> Result<Self, SetEnabledRequestError> {
+        Ok(Self {
+            domain: Domain::parse(domain).map_err(|_| SetEnabledRequestError::InvalidDomain)?,
+            enabled,
+            expected_hash: ConfigHash::parse(expected_hash)
+                .map_err(|_| SetEnabledRequestError::InvalidExpectedHash)?,
+            request_id: RequestId::parse(request_id)
+                .map_err(|_| SetEnabledRequestError::InvalidRequestId)?,
+            idempotency_key: idempotency_key
+                .map(IdempotencyKey::parse)
+                .transpose()
+                .map_err(|_| SetEnabledRequestError::InvalidIdempotencyKey)?,
+        })
+    }
+}
+
+/// The `result` payload of a successful `ingress.setEnabled` response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEnabledResult {
+    pub domain: String,
+    pub enabled: bool,
+    /// `false` when the route was already in the requested state, so no
+    /// file was renamed (the ingress was still reloaded to confirm it).
+    pub changed: bool,
+    pub content_sha256: ConfigHash,
+    pub changed_at_unix_secs: u64,
+}
+
 /// The route file one domain's live configuration lives in, relative to
 /// `ingress_root`.
 pub fn route_path(domain: &Domain) -> SiteRelativePath {
     SiteRelativePath::parse(format!("{domain}.{ROUTE_EXTENSION}"))
+        .expect("a validated Domain always yields a single valid path component")
+}
+
+/// The route file one domain's disabled route lives in, relative to
+/// `ingress_root`. Never imported by the live Caddyfile.
+pub fn disabled_route_path(domain: &Domain) -> SiteRelativePath {
+    SiteRelativePath::parse(format!("{domain}.{DISABLED_ROUTE_SUFFIX}"))
         .expect("a validated Domain always yields a single valid path component")
 }
 

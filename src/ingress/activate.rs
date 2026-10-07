@@ -362,7 +362,7 @@ pub(crate) fn reload(compose: &compose::Access) -> Result<(), ComposeFailure> {
     )
 }
 
-fn check(
+pub(crate) fn check(
     program: &str,
     outcome: Result<ProcessOutput, compose::Error>,
 ) -> Result<(), ComposeFailure> {
