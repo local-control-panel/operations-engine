@@ -1209,12 +1209,43 @@ pub enum ComposeCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Run one lifecycle verb (`up`, `down`, `restart`, `pull`) on a stack
+    /// under `~/compose` with a fixed argv. `down` needs
+    /// `--confirmation COMPOSE_DOWN` and is refused for the managed hosting
+    /// stack.
+    Action {
+        #[arg(long = "stack-name")]
+        stack_name: String,
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Take a stack down and delete its directory under `~/compose`. Needs
+    /// `--confirmation COMPOSE_REMOVE`; refused for the managed hosting
+    /// stack.
+    Remove {
+        #[arg(long = "stack-name")]
+        stack_name: String,
+        #[arg(long)]
+        confirmation: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl ComposeCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateConfig { .. } => "compose.activateConfig",
+            Self::Action { .. } => "compose.action",
+            Self::Remove { .. } => "compose.remove",
         }
     }
 }

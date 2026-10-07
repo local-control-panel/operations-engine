@@ -29,6 +29,151 @@ pub fn run(command: ComposeCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        ComposeCommand::Action {
+            stack_name,
+            action,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => lifecycle::action(
+            &stack_name,
+            &action,
+            confirmation.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        ComposeCommand::Remove {
+            stack_name,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => lifecycle::remove(
+            &stack_name,
+            &confirmation,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+    }
+}
+
+mod lifecycle {
+    use crate::{
+        commands::CONFIG_UNAVAILABLE_MESSAGE,
+        error::ErrorCode,
+        protocol::{Response, ResponseBuildError},
+    };
+
+    #[cfg(unix)]
+    use crate::{
+        compose, compose_action as ca, config::EngineConfig, filesystem::ManagedRoot,
+        process::CancellationToken, site::TrustedRoot,
+    };
+
+    #[cfg(unix)]
+    fn with_context<T>(
+        operation: &'static str,
+        run: impl FnOnce(&ca::Context<'_>) -> Result<T, ca::Error>,
+    ) -> Result<Response, ResponseBuildError>
+    where
+        T: serde::Serialize,
+    {
+        let fail = |message: &str| Ok(Response::failure(operation, ErrorCode::Internal, message));
+        let Ok(config) = EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return fail(CONFIG_UNAVAILABLE_MESSAGE);
+        };
+        let Ok(state) = ManagedRoot::open(&config.state_root) else {
+            return fail("engine state root is unavailable");
+        };
+        let Ok(root_path) = compose::compose_root_dir() else {
+            return fail("compose root is unavailable");
+        };
+        let Ok(root) = TrustedRoot::parse(&root_path) else {
+            return fail("compose root is unavailable");
+        };
+        let ctx = ca::Context {
+            compose_root: &root,
+            engine_state: &state,
+            docker_program: "docker",
+        };
+        match run(&ctx) {
+            Ok(value) => Response::success(operation, value),
+            Err(ca::Error::PostCommit { result }) => Response::success(operation, result),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(operation, code, &message))
+            }
+        }
+    }
+
+    pub fn action(
+        stack_name: &str,
+        action: &str,
+        confirmation: Option<&str>,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Response, ResponseBuildError> {
+        #[cfg(unix)]
+        {
+            let request =
+                match ca::ActionRequest::parse(stack_name, action, confirmation, request_id, key) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return Ok(Response::failure(
+                            ca::ACTION_OPERATION,
+                            ErrorCode::InvalidInput,
+                            ca::request_error_message(error),
+                        ));
+                    }
+                };
+            with_context(ca::ACTION_OPERATION, |ctx| {
+                ca::execute_action(ctx, &request, &CancellationToken::default())
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (stack_name, action, confirmation, request_id, key);
+            Ok(Response::failure(
+                "compose.action",
+                ErrorCode::UnsupportedPlatform,
+                "compose.action requires a Unix host",
+            ))
+        }
+    }
+
+    pub fn remove(
+        stack_name: &str,
+        confirmation: &str,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Response, ResponseBuildError> {
+        #[cfg(unix)]
+        {
+            let request = match ca::RemoveRequest::parse(stack_name, confirmation, request_id, key)
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    return Ok(Response::failure(
+                        ca::REMOVE_OPERATION,
+                        ErrorCode::InvalidInput,
+                        ca::request_error_message(error),
+                    ));
+                }
+            };
+            with_context(ca::REMOVE_OPERATION, |ctx| {
+                ca::execute_remove(ctx, &request, &CancellationToken::default())
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (stack_name, confirmation, request_id, key);
+            Ok(Response::failure(
+                "compose.remove",
+                ErrorCode::UnsupportedPlatform,
+                "compose.remove requires a Unix host",
+            ))
+        }
     }
 }
 

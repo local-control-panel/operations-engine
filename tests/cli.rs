@@ -120,7 +120,9 @@ fn capabilities_describe_only_implemented_operations() {
             "stack.writeSiteService",
             "stack.activateSiteConfig",
             "stack.removeSiteService",
-            "docker.prune"
+            "docker.prune",
+            "compose.action",
+            "compose.remove"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);

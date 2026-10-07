@@ -9,6 +9,8 @@ pub mod backup_trigger;
 pub mod cli;
 pub mod commands;
 pub mod compose;
+#[cfg(unix)]
+pub mod compose_action;
 pub mod compose_config;
 pub mod config;
 pub mod cron;

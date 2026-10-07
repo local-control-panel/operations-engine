@@ -111,6 +111,8 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "stack.activateSiteConfig",
                 "stack.removeSiteService",
                 "docker.prune",
+                "compose.action",
+                "compose.remove",
             ],
             output_formats: ["json"],
             features: Features {
