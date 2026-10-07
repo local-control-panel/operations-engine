@@ -38,6 +38,7 @@ pub mod protocol;
 pub mod rollback;
 pub mod runtime_config;
 pub mod site;
+pub mod site_enroll;
 pub mod site_manifest;
 pub mod site_root;
 #[cfg(unix)]
