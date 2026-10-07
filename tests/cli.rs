@@ -132,6 +132,9 @@ fn capabilities_describe_only_implemented_operations() {
             "stack.activateSiteConfig",
             "stack.removeSiteService",
             "docker.prune",
+            "docker.containerAction",
+            "docker.setLimits",
+            "system.service",
             "compose.action",
             "compose.remove"
         ])

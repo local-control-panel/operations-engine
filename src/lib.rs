@@ -21,6 +21,8 @@ pub mod db_restore;
 pub mod db_tool;
 pub mod deploy;
 #[cfg(unix)]
+pub mod docker_container;
+#[cfg(unix)]
 pub mod docker_prune;
 pub mod engine;
 pub mod error;
@@ -53,6 +55,8 @@ pub mod system_autoupdates;
 pub mod system_autoupdates_install;
 #[cfg(unix)]
 pub mod system_install_docker;
+#[cfg(unix)]
+pub mod system_service;
 #[cfg(target_os = "linux")]
 pub mod system_signal;
 pub mod system_start_docker;

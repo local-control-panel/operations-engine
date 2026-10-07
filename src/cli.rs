@@ -194,6 +194,58 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Run one lifecycle verb (`start`, `stop`, `restart`, `pause`, `unpause`,
+    /// `remove`) on a container named by hex id. Containers of the managed
+    /// `wcp` stack take the stack lock and cannot be removed; `stop`,
+    /// `restart` and `remove` need their exact confirmation token.
+    ContainerAction {
+        #[arg(long = "container-id")]
+        container_id: String,
+        #[arg(long)]
+        action: String,
+        /// Force removal of a running container (`remove` only).
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Set the runtime CPU, memory and restart-policy limits of a container,
+    /// bound by the host's cores and RAM. Runtime-only: lost when Compose
+    /// recreates the container.
+    SetContainerLimits {
+        #[arg(long = "container-id")]
+        container_id: String,
+        /// CPU count; `0` clears the limit.
+        #[arg(long)]
+        cpus: f64,
+        /// Memory in bytes; `0` clears the limit.
+        #[arg(long = "memory-bytes")]
+        memory_bytes: u64,
+        #[arg(long = "restart-policy")]
+        restart_policy: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Start or restart the `netdata` or `docker` systemd unit and verify it
+    /// is active afterwards.
+    Service {
+        #[arg(long)]
+        unit: String,
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        confirmation: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Send one allowlisted signal to a verified, non-protected process.
     SignalProcess {
         #[arg(long)]
@@ -245,6 +297,9 @@ impl SystemCommand {
             Self::InstallDocker { .. } => "system.installDocker",
             Self::StartDocker { .. } => "system.startDocker",
             Self::PruneDocker { .. } => "docker.prune",
+            Self::ContainerAction { .. } => "docker.containerAction",
+            Self::SetContainerLimits { .. } => "docker.setLimits",
+            Self::Service { .. } => "system.service",
             Self::SignalProcess { .. } => "system.signalProcess",
             Self::CreateSwap { .. } => "system.createSwap",
             Self::DeleteSwap { .. } => "system.deleteSwap",

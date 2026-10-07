@@ -39,6 +39,49 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SystemCommand::ContainerAction {
+            container_id,
+            action,
+            force,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => container_action(
+            &container_id,
+            &action,
+            force,
+            confirmation.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SystemCommand::SetContainerLimits {
+            container_id,
+            cpus,
+            memory_bytes,
+            restart_policy,
+            request_id,
+            idempotency_key,
+        } => set_container_limits(
+            &container_id,
+            cpus,
+            memory_bytes,
+            restart_policy.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SystemCommand::Service {
+            unit,
+            action,
+            confirmation,
+            request_id,
+            idempotency_key,
+        } => service(
+            &unit,
+            &action,
+            confirmation.as_deref(),
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SystemCommand::SignalProcess {
             pid,
             signal,
@@ -506,6 +549,242 @@ fn prune_docker(
             "docker.prune",
             ErrorCode::UnsupportedPlatform,
             "docker.prune requires a Unix host",
+        ))
+    }
+}
+
+/// The engine state root for the three Docker/service operations, or the
+/// failure response the caller should return.
+#[cfg(unix)]
+fn open_engine_state(
+    operation: &'static str,
+) -> Result<crate::filesystem::ManagedRoot, Result<Response, ResponseBuildError>> {
+    use crate::{config::EngineConfig, filesystem::ManagedRoot};
+    let config =
+        EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)).map_err(|_| {
+            Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ))
+        })?;
+    ManagedRoot::open(&config.state_root).map_err(|_| {
+        Ok(Response::failure(
+            operation,
+            ErrorCode::Internal,
+            "engine state root is unavailable",
+        ))
+    })
+}
+
+fn container_action(
+    container_id: &str,
+    action: &str,
+    force: bool,
+    confirmation: Option<&str>,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::docker_container::{self as dc, RequestError};
+        let request = match dc::ActionRequest::parse(
+            container_id,
+            action,
+            force,
+            confirmation,
+            request_id,
+            key,
+        ) {
+            Ok(v) => v,
+            Err(error) => {
+                let message = match error {
+                    RequestError::InvalidContainerId => {
+                        "container-id must be 12 to 64 lowercase hex digits"
+                    }
+                    RequestError::InvalidAction => {
+                        "action must be start, stop, restart, pause, unpause or remove"
+                    }
+                    RequestError::ForceNotApplicable => "force applies to remove only",
+                    RequestError::InvalidConfirmation => {
+                        "confirmation does not match the container action"
+                    }
+                    _ => "request-id or idempotency-key is invalid",
+                };
+                return Ok(Response::failure(
+                    dc::ACTION_OPERATION,
+                    ErrorCode::InvalidInput,
+                    message,
+                ));
+            }
+        };
+        let state = match open_engine_state(dc::ACTION_OPERATION) {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+        let ctx = dc::Context {
+            engine_state: &state,
+            docker_program: "docker",
+            host_cores: 0,
+            host_memory_bytes: None,
+        };
+        match dc::execute_action(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) => Response::success(dc::ACTION_OPERATION, v),
+            Err(dc::Error::PostCommit { result }) => {
+                Response::success(dc::ACTION_OPERATION, result)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(dc::ACTION_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (container_id, action, force, confirmation, request_id, key);
+        Ok(Response::failure(
+            "docker.containerAction",
+            ErrorCode::UnsupportedPlatform,
+            "docker.containerAction requires a Unix host",
+        ))
+    }
+}
+
+fn set_container_limits(
+    container_id: &str,
+    cpus: f64,
+    memory_bytes: u64,
+    restart_policy: Option<&str>,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::docker_container::{self as dc, RequestError};
+        let request = match dc::LimitsRequest::parse(
+            container_id,
+            cpus,
+            memory_bytes,
+            restart_policy,
+            request_id,
+            key,
+        ) {
+            Ok(v) => v,
+            Err(error) => {
+                let message = match error {
+                    RequestError::InvalidContainerId => {
+                        "container-id must be 12 to 64 lowercase hex digits"
+                    }
+                    RequestError::InvalidCpus => "cpus must be a finite number, 0 or more",
+                    RequestError::InvalidMemory => "memory-bytes must be 0 or at least 4 MiB",
+                    RequestError::InvalidRestartPolicy => "restart-policy is not allowed",
+                    _ => "request-id or idempotency-key is invalid",
+                };
+                return Ok(Response::failure(
+                    dc::LIMITS_OPERATION,
+                    ErrorCode::InvalidInput,
+                    message,
+                ));
+            }
+        };
+        let state = match open_engine_state(dc::LIMITS_OPERATION) {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+        let host_cores = std::thread::available_parallelism()
+            .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+            .unwrap_or(1);
+        let host_memory_bytes = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|text| dc::parse_meminfo_total(&text));
+        let ctx = dc::Context {
+            engine_state: &state,
+            docker_program: "docker",
+            host_cores,
+            host_memory_bytes,
+        };
+        match dc::execute_limits(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) => Response::success(dc::LIMITS_OPERATION, v),
+            Err(dc::Error::PostCommit { result }) => {
+                Response::success(dc::LIMITS_OPERATION, result)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(dc::LIMITS_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            container_id,
+            cpus,
+            memory_bytes,
+            restart_policy,
+            request_id,
+            key,
+        );
+        Ok(Response::failure(
+            "docker.setLimits",
+            ErrorCode::UnsupportedPlatform,
+            "docker.setLimits requires a Unix host",
+        ))
+    }
+}
+
+fn service(
+    unit: &str,
+    action: &str,
+    confirmation: Option<&str>,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::system_service::{self as svc, RequestError};
+        let request = match svc::Request::parse(unit, action, confirmation, request_id, key) {
+            Ok(v) => v,
+            Err(error) => {
+                let message = match error {
+                    RequestError::InvalidUnit => "unit must be netdata or docker",
+                    RequestError::InvalidAction => "action must be start or restart",
+                    RequestError::InvalidConfirmation => {
+                        "confirmation does not match the service action"
+                    }
+                    _ => "request-id or idempotency-key is invalid",
+                };
+                return Ok(Response::failure(
+                    svc::OPERATION,
+                    ErrorCode::InvalidInput,
+                    message,
+                ));
+            }
+        };
+        let state = match open_engine_state(svc::OPERATION) {
+            Ok(v) => v,
+            Err(response) => return response,
+        };
+        let ctx = svc::Context {
+            engine_state: &state,
+            systemctl_program: "systemctl",
+        };
+        match svc::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) | Err(svc::Error::PostCommit { result: v }) => {
+                Response::success(svc::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(svc::OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (unit, action, confirmation, request_id, key);
+        Ok(Response::failure(
+            "system.service",
+            ErrorCode::UnsupportedPlatform,
+            "system.service requires a Unix host",
         ))
     }
 }
