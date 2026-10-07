@@ -495,6 +495,8 @@ fn lookup(
     argv: &[String],
     cancel: &CancellationToken,
 ) -> Result<Option<String>, Error> {
+    // Docker words a missing resource differently per object and version:
+    // "No such image: x", "network x not found", "get x: no such volume".
     let output = process::run(
         &ProcessRequest::new(ctx.docker_program).args(argv),
         &ProcessLimits {
@@ -510,7 +512,7 @@ fn lookup(
             String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
         )),
         ProcessTermination::Exited { .. }
-            if String::from_utf8_lossy(&output.stderr.bytes).contains("No such") =>
+            if is_missing(&String::from_utf8_lossy(&output.stderr.bytes)) =>
         {
             Ok(None)
         }
@@ -519,6 +521,11 @@ fn lookup(
             SubprocessDiagnostics::from_output(ctx.docker_program, &output),
         )),
     }
+}
+
+fn is_missing(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("no such") || stderr.contains("not found")
 }
 
 fn argv(parts: &[&str]) -> Vec<String> {
@@ -574,7 +581,7 @@ pub fn execute_network(
                     ]),
                     cancel,
                 )?
-                .ok_or(Error::NotFound)?;
+                .ok_or(Error::ResourceNotFound("network"))?;
                 let line = stdout.lines().next().unwrap_or("");
                 let mut fields = line.splitn(3, ' ');
                 let id = fields.next().unwrap_or("");
@@ -583,7 +590,7 @@ pub fn execute_network(
                 let id_ok = id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit());
                 if !id_ok || name != req.name {
                     // Docker matched an id prefix, not the name.
-                    return Err(Error::NotFound);
+                    return Err(Error::ResourceNotFound("network"));
                 }
                 if project == MANAGED_PROJECT {
                     return Err(Error::Refused(
@@ -695,7 +702,7 @@ pub fn execute_image_remove(
                 &argv(&["image", "inspect", "--format", "{{.Id}}", &req.image_id.0]),
                 cancel,
             )?
-            .ok_or(Error::NotFound)?;
+            .ok_or(Error::ResourceNotFound("image"))?;
             let id = stdout.lines().next().unwrap_or("").trim();
             let digest_ok = id.strip_prefix("sha256:").is_some_and(|hex| {
                 hex.len() == 64
@@ -703,7 +710,7 @@ pub fn execute_image_remove(
                     && hex.starts_with(&req.image_id.0)
             });
             if !digest_ok {
-                return Err(Error::NotFound);
+                return Err(Error::ResourceNotFound("image"));
             }
             let users = lookup(
                 ctx,
@@ -770,11 +777,11 @@ pub fn execute_volume_remove(
                 ]),
                 cancel,
             )?
-            .ok_or(Error::NotFound)?;
+            .ok_or(Error::ResourceNotFound("volume"))?;
             let line = stdout.lines().next().unwrap_or("");
             let mut fields = line.splitn(2, ' ');
             if fields.next() != Some(req.name.as_str()) {
-                return Err(Error::NotFound);
+                return Err(Error::ResourceNotFound("volume"));
             }
             if fields.next().unwrap_or("") == MANAGED_PROJECT {
                 return Err(Error::Refused(
@@ -1097,9 +1104,13 @@ mod tests {
         assert_eq!(f.mutating_calls(), [format!("network rm {NET_ID}")]);
         // Docker answering for another network (an id-prefix match) is a miss.
         let err = execute_network(&c, &remove_network("other", ID2), &cancel()).unwrap_err();
-        assert!(matches!(err, Error::NotFound));
+        assert!(matches!(err, Error::ResourceNotFound("network")));
         let err = execute_network(&c, &remove_network("ghost", ID3), &cancel()).unwrap_err();
-        assert!(matches!(err, Error::NotFound));
+        assert!(matches!(err, Error::ResourceNotFound("network")));
+        assert_eq!(
+            err.protocol(),
+            (ErrorCode::NotFound, "no such network".into())
+        );
         assert_eq!(f.mutating_calls().len(), 1);
     }
 
@@ -1180,7 +1191,7 @@ mod tests {
                 ImageRemoveRequest::parse(id, false, Some("IMAGE_REMOVE"), &request, None).unwrap();
             assert!(matches!(
                 execute_image_remove(&c, &req, &cancel()).unwrap_err(),
-                Error::NotFound
+                Error::ResourceNotFound("image")
             ));
         }
         assert!(f.mutating_calls().is_empty());
@@ -1233,7 +1244,10 @@ mod tests {
             remove("wcp_db", ID2).unwrap_err(),
             Error::Refused(_)
         ));
-        assert!(matches!(remove("ghost", ID3).unwrap_err(), Error::NotFound));
+        assert!(matches!(
+            remove("ghost", ID3).unwrap_err(),
+            Error::ResourceNotFound("volume")
+        ));
         assert!(f.mutating_calls().is_empty());
         remove("data", "123e4567-e89b-12d3-a456-426614174009").unwrap();
         assert_eq!(f.mutating_calls(), ["volume rm data"]);
@@ -1254,6 +1268,18 @@ mod tests {
         let done = execute_pull(&ctx(&f, &state, plenty), &req, &cancel()).unwrap();
         assert_eq!(done.reference, "nginx:1.27");
         assert_eq!(f.mutating_calls(), ["pull nginx:1.27"]);
+    }
+
+    #[test]
+    fn recognises_every_wording_docker_uses_for_a_missing_resource() {
+        for text in [
+            "Error: No such image: x",
+            "Error response from daemon: network x not found",
+            "Error response from daemon: get x: no such volume",
+        ] {
+            assert!(is_missing(text), "{text}");
+        }
+        assert!(!is_missing("Cannot connect to the Docker daemon"));
     }
 
     #[test]

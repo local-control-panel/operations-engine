@@ -362,6 +362,8 @@ pub enum Error {
     StackBusy,
     ReplayInProgress,
     NotFound,
+    /// A network, image or volume that Docker does not know.
+    ResourceNotFound(&'static str),
     /// `remove` of a container of the managed `wcp` stack.
     ManagedRemoveRefused,
     CpusAboveHost,
@@ -399,6 +401,7 @@ impl Error {
                 "the original request is still in progress".into(),
             ),
             Self::NotFound => (ErrorCode::NotFound, "no such container".into()),
+            Self::ResourceNotFound(kind) => (ErrorCode::NotFound, format!("no such {kind}")),
             Self::ManagedRemoveRefused => (
                 ErrorCode::InvalidInput,
                 "containers of the managed wcp stack cannot be removed; stop the stack \
