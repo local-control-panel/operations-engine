@@ -26,11 +26,18 @@
 //!   for `docker.prune` rather than silently deleted with it.
 //! - `setLimits` is `docker update --cpus --memory --memory-swap
 //!   [--restart]`, bound by the host: `cpus` must be finite and not above the
-//!   host's core count, `memoryBytes` is `0` (unlimited) or between 4 MiB and
-//!   the host's RAM, the restart policy comes from a fixed allowlist. The
-//!   limits are runtime-only: they live in the container's HostConfig, not in
-//!   its Compose file, and are lost the next time Compose recreates the
+//!   host's core count, `memoryBytes` is `0` or between 4 MiB and the host's
+//!   RAM, the restart policy comes from a fixed allowlist. The limits are
+//!   runtime-only: they live in the container's HostConfig, not in its
+//!   Compose file, and are lost the next time Compose recreates the
 //!   container (`up -d` after an image or config change, `stack.deploy`).
+//! - `0` cannot mean "remove the limit": `docker update` treats `0` as
+//!   "unchanged" (the old raw call silently did nothing). The engine reads the
+//!   container's current limits during the inspect: `0` for a limit it does
+//!   not have changes nothing, `0` for one it has raises it to the host's
+//!   cores or RAM (the closest a running container gets to unlimited) and
+//!   says so with `raisedToHostMax`. Recreating the container is the only
+//!   way to truly remove a limit.
 //! - Both operations share one scope (`docker-container`); lock, idempotency
 //!   key, transaction record and audit entry come from `mutation::preflight`.
 //!   The stack lock is taken before the scope's own lock whenever the
@@ -311,6 +318,7 @@ pub struct ActionResult {
 #[serde(rename_all = "camelCase")]
 pub struct LimitsResult {
     pub container_id: String,
+    /// The limit in force afterwards (`0` = none).
     pub cpus: f64,
     pub memory_bytes: u64,
     pub restart_policy: Option<String>,
@@ -318,6 +326,9 @@ pub struct LimitsResult {
     /// Always `true`: the limits are in the running container's HostConfig
     /// only and are lost when Compose recreates it.
     pub runtime_only: bool,
+    /// A requested `0` could not remove a limit the container had (`docker
+    /// update` ignores `0`), so it was raised to the host maximum instead.
+    pub raised_to_host_max: bool,
     pub completed_at_unix_secs: u64,
 }
 
@@ -412,6 +423,10 @@ impl Error {
 struct Resolved {
     id: String,
     managed: bool,
+    /// The CPU limit the container has now (`0` = none).
+    nano_cpus: u64,
+    /// The memory limit the container has now (`0` = none).
+    memory_bytes: u64,
 }
 
 fn run_docker(
@@ -457,7 +472,11 @@ fn resolve(
         "--type".into(),
         "container".into(),
         "--format".into(),
-        format!("{{{{.Id}}}} {{{{index .Config.Labels \"{PROJECT_LABEL}\"}}}}"),
+        // The label goes last: it is free text and may contain spaces.
+        format!(
+            "{{{{.Id}}}} {{{{.HostConfig.NanoCpus}}}} {{{{.HostConfig.Memory}}}} \
+             {{{{index .Config.Labels \"{PROJECT_LABEL}\"}}}}"
+        ),
         requested.as_str().to_owned(),
     ];
     let output = process::run(
@@ -488,16 +507,22 @@ fn resolve(
 }
 
 fn parse_inspect(stdout: &str, requested: &ContainerId) -> Result<Resolved, Error> {
-    // Only the first line: a label value cannot smuggle a second "id project"
-    // pair past this parser.
+    // Only the first line: a label value cannot smuggle a second record past
+    // this parser.
     let line = stdout.lines().next().unwrap_or("");
-    let (id, project) = line.split_once(' ').unwrap_or((line, ""));
+    let mut fields = line.splitn(4, ' ');
+    let id = fields.next().unwrap_or("");
+    let nano_cpus = fields.next().and_then(|v| v.parse::<u64>().ok());
+    let memory_bytes = fields.next().and_then(|v| v.parse::<u64>().ok());
+    let project = fields.next().unwrap_or("");
     let full = ContainerId::parse(id)
         .filter(|full| full.as_str().len() == 64 && full.as_str().starts_with(requested.as_str()))
         .ok_or(Error::NotFound)?;
     Ok(Resolved {
         id: full.0,
         managed: project == MANAGED_PROJECT,
+        nano_cpus: nano_cpus.ok_or(Error::NotFound)?,
+        memory_bytes: memory_bytes.ok_or(Error::NotFound)?,
     })
 }
 
@@ -647,38 +672,95 @@ pub fn execute_limits(
         false,
         cancel,
         |resolved| {
-            let cpus = if req.cpus > 0.0 {
-                format!("{:.6}", req.cpus)
-            } else {
-                "0".to_owned()
-            };
-            let swap = if req.memory_bytes > 0 { "-1" } else { "0" };
-            let mut argv = vec![
-                "update".to_owned(),
-                "--cpus".into(),
-                cpus,
-                "--memory".into(),
-                req.memory_bytes.to_string(),
-                "--memory-swap".into(),
-                swap.into(),
-            ];
-            if let Some(policy) = &req.restart_policy {
-                argv.push("--restart".into());
-                argv.push(policy.clone());
+            let plan = plan_limits(ctx, req, resolved)?;
+            if !plan.flags.is_empty() {
+                let mut argv = vec!["update".to_owned()];
+                argv.extend(plan.flags);
+                argv.push(resolved.id.clone());
+                run_docker(ctx, Stage::Update, &argv, ACTION_TIMEOUT, cancel)?;
             }
-            argv.push(resolved.id.clone());
-            run_docker(ctx, Stage::Update, &argv, ACTION_TIMEOUT, cancel)?;
             Ok(LimitsResult {
                 container_id: resolved.id.clone(),
-                cpus: req.cpus,
-                memory_bytes: req.memory_bytes,
+                cpus: plan.cpus,
+                memory_bytes: plan.memory_bytes,
                 restart_policy: req.restart_policy.clone(),
                 managed: resolved.managed,
                 runtime_only: true,
+                raised_to_host_max: plan.raised_to_host_max,
                 completed_at_unix_secs: now_secs(),
             })
         },
     )
+}
+
+/// What `docker update` is asked to do and the limits that result.
+#[derive(Debug, PartialEq)]
+struct LimitsPlan {
+    flags: Vec<String>,
+    cpus: f64,
+    memory_bytes: u64,
+    raised_to_host_max: bool,
+}
+
+/// `docker update` treats `0` as "leave unchanged", so a limit that is set
+/// cannot be removed from a running container (verified on Docker 29: `--cpus
+/// 0 --memory 0 --memory-swap 0` changes nothing). Asking for `0` therefore
+/// means: nothing to do when the container has no such limit, otherwise raise
+/// it to the host's maximum, which is the closest a running container gets to
+/// unlimited. The result says so (`raisedToHostMax`).
+fn plan_limits(
+    ctx: &Context<'_>,
+    req: &LimitsRequest,
+    resolved: &Resolved,
+) -> Result<LimitsPlan, Error> {
+    let mut flags = Vec::new();
+    let mut raised = false;
+
+    let cpus = if req.cpus > 0.0 {
+        flags.extend(["--cpus".to_owned(), format!("{:.6}", req.cpus)]);
+        req.cpus
+    } else if resolved.nano_cpus > 0 {
+        raised = true;
+        flags.extend([
+            "--cpus".to_owned(),
+            format!("{:.6}", f64::from(ctx.host_cores)),
+        ]);
+        f64::from(ctx.host_cores)
+    } else {
+        0.0
+    };
+
+    let memory_bytes = if req.memory_bytes > 0 {
+        flags.extend([
+            "--memory".to_owned(),
+            req.memory_bytes.to_string(),
+            "--memory-swap".to_owned(),
+            "-1".to_owned(),
+        ]);
+        req.memory_bytes
+    } else if resolved.memory_bytes > 0 {
+        let host = ctx.host_memory_bytes.ok_or(Error::HostResourcesUnknown)?;
+        raised = true;
+        flags.extend([
+            "--memory".to_owned(),
+            host.to_string(),
+            "--memory-swap".to_owned(),
+            "-1".to_owned(),
+        ]);
+        host
+    } else {
+        0
+    };
+
+    if let Some(policy) = &req.restart_policy {
+        flags.extend(["--restart".to_owned(), policy.clone()]);
+    }
+    Ok(LimitsPlan {
+        flags,
+        cpus,
+        memory_bytes,
+        raised_to_host_max: raised,
+    })
 }
 
 /// `MemTotal` of a `/proc/meminfo` text, in bytes.
@@ -749,6 +831,8 @@ mod tests {
     const ID3: &str = "123e4567-e89b-12d3-a456-426614174002";
     const PLAIN: &str = "aaaaaaaaaaaa";
     const MANAGED: &str = "bbbbbbbbbbbb";
+    const LIMITED: &str = "111111111111";
+    const FULL_LIMITED: &str = "1111111111110000000000000000000000000000000000000000000000000000";
     const FULL_PLAIN: &str = "aaaaaaaaaaaa0000000000000000000000000000000000000000000000000000";
     const FULL_MANAGED: &str = "bbbbbbbbbbbb0000000000000000000000000000000000000000000000000000";
 
@@ -774,10 +858,11 @@ mod tests {
                      if [ \"$1\" = inspect ]; then\n\
                        for last; do :; done\n\
                        case \"$last\" in\n\
-                         {PLAIN}) echo '{FULL_PLAIN} ';;\n\
-                         {MANAGED}) echo '{FULL_MANAGED} wcp';;\n\
-                         cccccccccccc) echo '{FULL_PLAIN}X other';;\n\
-                         dddddddddddd) echo 'dddddddddddd0000000000000000000000000000000000000000000000000000 wcp-not';;\n\
+                         {PLAIN}) echo '{FULL_PLAIN} 0 0 ';;\n\
+                         {MANAGED}) echo '{FULL_MANAGED} 0 0 wcp';;\n\
+                         {LIMITED}) echo '{FULL_LIMITED} 2000000000 1073741824 label with spaces';;
+                         cccccccccccc) echo '{FULL_PLAIN}X 0 0 other';;\n\
+                         dddddddddddd) echo 'dddddddddddd0000000000000000000000000000000000000000000000000000 0 0 wcp-not';;\n\
                          *) echo 'Error: No such container: '\"$last\" >&2; exit 1;;\n\
                        esac\n\
                        exit 0\n\
@@ -1099,16 +1184,60 @@ mod tests {
         )
         .unwrap();
         assert!(result.runtime_only);
-        execute_limits(&ctx, &limits(PLAIN, 0.0, 0, None, ID2), &token).unwrap();
+        assert!(!result.raised_to_host_max);
+        // A container without limits: `0` changes nothing, and docker is not
+        // called at all (`docker update` with no flags is an error).
+        let nothing = execute_limits(&ctx, &limits(PLAIN, 0.0, 0, None, ID2), &token).unwrap();
+        assert_eq!((nothing.cpus, nothing.memory_bytes), (0.0, 0));
+        assert!(!nothing.raised_to_host_max);
+        // ...except for the restart policy, which has no such quirk.
+        execute_limits(&ctx, &limits(PLAIN, 0.0, 0, Some("no"), ID3), &token).unwrap();
         assert_eq!(
             f.verb_calls(),
             [
                 format!(
                     "update --cpus 1.500000 --memory 536870912 --memory-swap -1 --restart unless-stopped {FULL_PLAIN}"
                 ),
-                format!("update --cpus 0 --memory 0 --memory-swap 0 {FULL_PLAIN}"),
+                format!("update --restart no {FULL_PLAIN}"),
             ]
         );
+    }
+
+    #[test]
+    fn zero_raises_an_existing_limit_to_the_host_maximum() {
+        let _s = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new(0);
+        let state = f.state();
+        let mut ctx = ctx(&f, &state);
+        let token = CancellationToken::default();
+        // LIMITED has 2 CPUs and 1 GiB; docker ignores `0`, so both are
+        // raised to the host's 4 cores and 8 GiB instead.
+        let result = execute_limits(&ctx, &limits(LIMITED, 0.0, 0, None, ID), &token).unwrap();
+        assert!(result.raised_to_host_max);
+        assert_eq!(result.cpus, 4.0);
+        assert_eq!(result.memory_bytes, 8 * 1024 * 1024 * 1024);
+        // Only the limit being cleared is raised; the other is set as asked.
+        let result = execute_limits(&ctx, &limits(LIMITED, 1.0, 0, None, ID2), &token).unwrap();
+        assert_eq!(result.cpus, 1.0);
+        assert!(result.raised_to_host_max);
+        assert_eq!(
+            f.verb_calls(),
+            [
+                format!(
+                    "update --cpus 4.000000 --memory 8589934592 --memory-swap -1 {FULL_LIMITED}"
+                ),
+                format!(
+                    "update --cpus 1.000000 --memory 8589934592 --memory-swap -1 {FULL_LIMITED}"
+                ),
+            ]
+        );
+        // Without a readable host size the memory limit cannot be raised.
+        ctx.host_memory_bytes = None;
+        assert!(matches!(
+            execute_limits(&ctx, &limits(LIMITED, 1.0, 0, None, ID3), &token),
+            Err(Error::HostResourcesUnknown)
+        ));
+        assert_eq!(f.verb_calls().len(), 2);
     }
 
     #[test]
