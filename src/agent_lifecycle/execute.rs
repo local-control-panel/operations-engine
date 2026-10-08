@@ -450,6 +450,11 @@ pub fn remove(
                     return Err(undo_tab(Error::Io(error)));
                 }
             }
+            // The last-run record of a removed agent would keep showing in
+            // the list; it is a log, so a failure here changes nothing.
+            let _ = ctx
+                .root
+                .remove_file(&rel(&format!("{AGENTS_DIR}/{}.heartbeat", agent.name)));
             Ok(RemoveResult {
                 name: agent.name.to_owned(),
                 removed,
@@ -801,6 +806,7 @@ mod tests {
         assert!(result.removed);
         assert_eq!(result.removed_cron_lines, 1);
         assert!(host.file("agents/cache-warmup.sh").is_none());
+        assert!(host.file("agents/cache-warmup.heartbeat").is_none());
         assert!(host.file("agents/error-log-digest.sh").is_some());
         let manifest: serde_json::Value =
             serde_json::from_str(&host.file("manifest.json").unwrap()).unwrap();
