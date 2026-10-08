@@ -427,12 +427,42 @@ pub enum AgentCommand {
         #[arg(long = "request-file")]
         request_file: PathBuf,
     },
+    /// Install or update a bundled agent: script, manifest entry and cron line.
+    Install {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove a bundled agent: cron line, manifest entry and script.
+    Remove {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Drop one IP from the brute-force ban list and re-apply the guard.
+    BruteforceUnban {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl AgentCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ActivateBruteforceConfig { .. } => "agent.activateBruteforceConfig",
+            Self::Install { .. } => "agent.install",
+            Self::Remove { .. } => "agent.remove",
+            Self::BruteforceUnban { .. } => "agent.bruteforceUnban",
         }
     }
 }
