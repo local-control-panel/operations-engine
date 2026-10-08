@@ -128,6 +128,8 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "docker.imagePull",
                 "docker.imageRemove",
                 "docker.volumeRemove",
+                "site.writeEnvFile",
+                "site.quarantineFile",
                 "system.service",
                 "compose.action",
                 "compose.remove",

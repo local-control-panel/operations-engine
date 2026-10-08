@@ -855,6 +855,28 @@ pub enum SiteCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Replace an environment file (`.env`, `*.env`, `.env.*`) below a site
+    /// directory of a content root, atomically, keeping an existing file's
+    /// owner and mode. The content comes from a root-owned request file.
+    WriteEnvFile {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Move a file below a site directory of a content root into the
+    /// engine's quarantine directory, with a manifest.
+    QuarantineFile {
+        #[arg(long)]
+        path: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Delete a site's directory `<content root>/<domain>` and, with
     /// `--site-id`, its engine release tree. Refuses symlinks, system-owned
     /// directories, oversized trees and (without `--confirm-contents true`)
@@ -1008,6 +1030,8 @@ impl SiteCommand {
             Self::MoveRoot { .. } => "site.moveRoot",
             Self::PrepareRoot { .. } => "site.prepareRoot",
             Self::RemoveRoot { .. } => "site.removeRoot",
+            Self::WriteEnvFile { .. } => "site.writeEnvFile",
+            Self::QuarantineFile { .. } => "site.quarantineFile",
             Self::ReleaseRoot { .. } => "site.releaseRoot",
             Self::RenameManifest { .. } => "site.renameManifest",
             Self::Enroll { .. } => "site.enroll",

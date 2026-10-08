@@ -156,6 +156,23 @@ pub enum Error {
     /// `removeRoot`: the release tree named by `--site-id` has no manifest
     /// for this domain.
     ManifestMismatch,
+    /// `writeEnvFile`: the file's current content is not the one the caller
+    /// read (`expectedHash`).
+    HashMismatch,
+    /// `writeEnvFile`/`quarantineFile`: the target exists but is not a
+    /// regular file.
+    NotRegularFile,
+    /// `writeEnvFile`/`quarantineFile`: no such file (or the directory
+    /// holding it does not exist).
+    FileMissing,
+    /// `quarantineFile`: larger than the quarantine bound.
+    FileTooLarge,
+    /// `quarantineFile`: the file changed while it was being copied; it was
+    /// left where it was.
+    FileChanged,
+    /// `writeEnvFile`/`quarantineFile`: the path is not a file below a site
+    /// directory of a configured content root.
+    OutsideContentRoot,
     PostCommit(serde_json::Value),
     Replayed {
         code: ErrorCode,
@@ -209,6 +226,27 @@ impl Error {
             Self::ManifestMismatch => (
                 ErrorCode::InvalidInput,
                 "no engine manifest for this domain matches the release tree".into(),
+            ),
+            Self::HashMismatch => (
+                ErrorCode::ConfigHashMismatch,
+                "the file changed since it was read; reload it and apply the edit again".into(),
+            ),
+            Self::NotRegularFile => (
+                ErrorCode::InvalidInput,
+                "the path is not a regular file".into(),
+            ),
+            Self::FileMissing => (ErrorCode::NotFound, "no such file".into()),
+            Self::OutsideContentRoot => (
+                ErrorCode::InvalidInput,
+                "the path is not a file inside a site directory of a content root".into(),
+            ),
+            Self::FileTooLarge => (
+                ErrorCode::InvalidInput,
+                "the file is larger than the quarantine limit".into(),
+            ),
+            Self::FileChanged => (
+                ErrorCode::Conflict,
+                "the file changed while it was being quarantined; it was left in place".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit(_) => (
@@ -567,7 +605,33 @@ where
     T: Serialize + DeserializeOwned,
     F: FnOnce() -> Result<T, Error>,
 {
-    let scope = open_scope(engine_state).map_err(Error::Io)?;
+    transact_in(
+        SCOPE,
+        engine_state,
+        operation,
+        request_id,
+        key,
+        lock_paths,
+        body,
+    )
+}
+
+/// `transact` in a named scope, for the file operations of `site_file`
+/// (`site-file`), which share this scaffolding and error type.
+pub(crate) fn transact_in<T, F>(
+    scope_name: &'static str,
+    engine_state: &ManagedRoot,
+    operation: &'static str,
+    request_id: RequestId,
+    key: Option<&IdempotencyKey>,
+    lock_paths: &[&Path],
+    body: F,
+) -> Result<T, Error>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Result<T, Error>,
+{
+    let scope = open_named_scope(engine_state, scope_name).map_err(Error::Io)?;
     let _resource_locks = resource_lock::acquire_many(engine_state, lock_paths, request_id)
         .map_err(|_| Error::ResourceBusy)?;
 
@@ -619,7 +683,7 @@ fn pick_content_root<'a>(
         .ok_or_else(|| Error::Io(io::Error::other("no content root is configured")))
 }
 
-fn refuse_system_dir(content_root: &TrustedRoot) -> Result<(), Error> {
+pub(crate) fn refuse_system_dir(content_root: &TrustedRoot) -> Result<(), Error> {
     if SYSTEM_DIRS
         .iter()
         .any(|dir| content_root.as_path() == Path::new(dir))
@@ -631,7 +695,7 @@ fn refuse_system_dir(content_root: &TrustedRoot) -> Result<(), Error> {
 
 /// `ELOOP`/`ENOTDIR` from a no-follow directory open mean the entry is a
 /// symlink or not a directory.
-fn open_error(error: io::Error) -> Error {
+pub(crate) fn open_error(error: io::Error) -> Error {
     match error.raw_os_error() {
         Some(code) if code == libc::ELOOP || code == libc::ENOTDIR => Error::UnsafePath,
         _ => Error::Io(error),
@@ -1107,8 +1171,12 @@ fn domain_rel(domain: &Domain) -> SiteRelativePath {
 }
 
 fn open_scope(engine_state: &ManagedRoot) -> io::Result<ManagedRoot> {
-    engine_state.create_dir_all(&rel(SCOPE))?;
-    let scope = engine_state.open_managed_dir(&rel(SCOPE))?;
+    open_named_scope(engine_state, SCOPE)
+}
+
+fn open_named_scope(engine_state: &ManagedRoot, name: &str) -> io::Result<ManagedRoot> {
+    engine_state.create_dir_all(&rel(name))?;
+    let scope = engine_state.open_managed_dir(&rel(name))?;
     for child in ["locks", "transactions", "audit"] {
         scope.create_dir_all(&rel(child))?;
     }
@@ -1170,11 +1238,11 @@ fn transaction_path(request_id: RequestId) -> SiteRelativePath {
     rel(&format!("transactions/{request_id}.json"))
 }
 
-fn rel(path: &str) -> SiteRelativePath {
+pub(crate) fn rel(path: &str) -> SiteRelativePath {
     SiteRelativePath::parse(path).expect("literal path is valid")
 }
 
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
