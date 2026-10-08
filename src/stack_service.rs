@@ -1643,6 +1643,11 @@ mod tests {
         }
 
         fn ctx(&self) -> Context<'_> {
+            self.ctx_waiting(Duration::from_millis(200))
+        }
+
+        /// A context whose health wait gives up after `timeout`.
+        fn ctx_waiting(&self, timeout: Duration) -> Context<'_> {
             Context {
                 engine_state: &self.state,
                 runtime_root: &self.runtime_root,
@@ -1652,7 +1657,7 @@ mod tests {
                 stack_dir: &self.stack_dir,
                 docker: &self.docker,
                 health: HealthWait {
-                    timeout: Duration::from_millis(200),
+                    timeout,
                     interval: Duration::from_millis(20),
                 },
             }
@@ -2637,12 +2642,19 @@ mod tests {
         fixture.health("starting");
         let req = EnsureRequest::parse("fp1-php83", None, ID, Some("up-2")).unwrap();
 
-        let error =
-            ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()).unwrap_err();
+        // Each poll starts a shell script, so on a loaded machine a short
+        // window can hold fewer than two of them; a generous one cannot.
+        let waiting = fixture.ctx_waiting(Duration::from_secs(3));
+        let error = ensure_runtime(&waiting, &req, &CancellationToken::default()).unwrap_err();
         assert!(matches!(&error, Error::Unhealthy(Some(status)) if status == "starting"));
         assert_eq!(error.protocol().0, ErrorCode::Timeout);
+        let polls = fixture
+            .calls()
+            .iter()
+            .filter(|call| call.contains(" inspect"))
+            .count();
+        assert!(polls >= 2, "polled more than once: {polls}");
         let calls = fixture.calls().len();
-        assert!(calls > 3, "polled more than once: {calls}");
         assert!(matches!(
             ensure_runtime(&fixture.ctx(), &req, &CancellationToken::default()),
             Err(Error::Replayed {
