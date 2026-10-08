@@ -79,6 +79,62 @@ impl ManagedRoot {
         Ok(())
     }
 
+    /// Sets the modification time of the file, directory or symlink at `path`
+    /// (the access time is left alone). The entry's parent is opened through
+    /// this root's capability and the time is set with `utimensat` and
+    /// `AT_SYMLINK_NOFOLLOW`, so a symlink is changed itself and never its target.
+    #[cfg(unix)]
+    pub fn set_modified_nofollow(
+        &self,
+        path: &SiteRelativePath,
+        secs: i64,
+        nanos: u32,
+    ) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let name = path.as_path().file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "path has no final component")
+        })?;
+        let name = std::ffi::CString::new(name.as_encoded_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "name contains NUL"))?;
+        let parent_dir;
+        let parent = match path
+            .as_path()
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            Some(parent) => {
+                parent_dir = self.directory.open_dir(parent)?;
+                &parent_dir
+            }
+            None => &self.directory,
+        };
+        let times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+            libc::timespec {
+                tv_sec: secs as libc::time_t,
+                tv_nsec: nanos as _,
+            },
+        ];
+        // SAFETY: the descriptor is open for the call, `name` is a valid
+        // NUL-terminated string and `times` points at two timespecs.
+        let result = unsafe {
+            libc::utimensat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Opens the direct child directory `name` without following a symlink
     /// in the final component (`openat` with `O_NOFOLLOW | O_DIRECTORY`),
     /// returning it as its own capability-scoped root. A symlink or a
