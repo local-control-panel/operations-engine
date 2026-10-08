@@ -1302,6 +1302,24 @@ pub enum IngressCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Replaces the brute-force guard's ban list, `bans/bans.caddy`, that
+    /// every route imports: validated, swapped in, reloaded, and put back if
+    /// the reload refuses it. The request file is `{"bans":["<ip>",...]}`.
+    ApplyBans {
+        /// Root-owned JSON request file.
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of applying twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Sweeps the whole configured ingress root for `.tmp`/`.tmp-*`
     /// staging siblings and `.rollback-*` backup siblings left behind by
     /// an interrupted activate/park/unpark attempt, removing or restoring
@@ -1334,6 +1352,7 @@ impl IngressCommand {
             Self::Unpark { .. } => "ingress.unpark",
             Self::RemoveRoute { .. } => "ingress.removeRoute",
             Self::SetEnabled { .. } => "ingress.setEnabled",
+            Self::ApplyBans { .. } => "ingress.applyBans",
             Self::Reconcile { .. } => "ingress.reconcile",
         }
     }

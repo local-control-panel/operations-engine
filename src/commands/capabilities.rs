@@ -58,6 +58,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "ingress.unpark",
                 "ingress.removeRoute",
                 "ingress.setEnabled",
+                "ingress.applyBans",
                 "ingress.reconcile",
                 "runtime.activateConfig",
                 "runtime.removeConfig",
