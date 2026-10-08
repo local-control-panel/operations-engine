@@ -8,7 +8,7 @@
 //! match the manifest's size and SHA-256 (brief decision 1) and the
 //! manifest is within the confirmed limits (decision 4).
 //!
-//! Then, under the destination root's resource lock and a `pending.json`
+//! Then, under the destination root's resource lock and a per-root `pending/<hash>.json`
 //! recovery marker, the same recovery shape as `wordpress.clone` (brief
 //! decision 2): snapshot the target database (`--add-drop-database`) and
 //! move any existing site directory aside; extract the archive with the
@@ -264,7 +264,7 @@ impl Error {
             Self::RecoveryRequired => (
                 ErrorCode::Conflict,
                 "the migration failed and restoring the destination also failed; \
-                 pending.json and the recovery files identify what to repair"
+                 the root's pending marker and the recovery files identify what to repair"
                     .into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
@@ -369,8 +369,8 @@ pub fn execute(
         drop(lock);
         return Err(Error::PostCommit(result));
     }
-    // A crash before this point leaves pending.json and prevents a blind retry.
-    let _ = scope.remove_file(&rel("pending.json"));
+    // A crash before this point leaves the root's marker and prevents a blind retry.
+    let _ = scope.remove_file(&pending_marker(&req.dest_root));
     let _ = audit::append(
         &scope,
         &audit_path,
@@ -450,7 +450,11 @@ fn import_with_recovery(
         Err(error) => return Err(Error::Io(error)),
     };
 
-    let pending = rel("pending.json");
+    let pending = pending_marker(&req.dest_root);
+    if legacy_marker_blocks(&scope, &req.dest_root) {
+        return Err(Error::RecoveryRequired);
+    }
+    scope.create_dir_all(&rel("pending")).map_err(Error::Io)?;
     let recovery_dir = rel(&format!("{RECOVERY_DIR}/{}", req.request_id));
     let recovery_sql = rel(&format!("{RECOVERY_DIR}/{}/target.sql", req.request_id));
     let saved_dir = rel(&format!(".wcp-migrate-{}", req.request_id));
@@ -667,6 +671,31 @@ fn step_limits() -> ProcessLimits {
         max_stdout_bytes: MAX_STEP_OUTPUT_BYTES,
         max_stderr_bytes: MAX_STEP_OUTPUT_BYTES,
     }
+}
+
+/// The recovery marker of one destination root: `pending/<hash of the root>.json`,
+/// so a failed restore blocks only imports into that root.
+fn pending_marker(dest_root: &Path) -> SiteRelativePath {
+    rel(&format!(
+        "pending/{}.json",
+        resource_lock::canonical_hash(dest_root)
+    ))
+}
+
+/// Before markers were per root, one `pending.json` guarded the whole scope. A
+/// leftover one still blocks the root it names, and every root if it cannot be
+/// read; it is never removed here (it is the operator's recovery pointer).
+fn legacy_marker_blocks(scope: &ManagedRoot, dest_root: &Path) -> bool {
+    let legacy = rel("pending.json");
+    if !scope.exists(&legacy) {
+        return false;
+    }
+    scope
+        .read_to_string(&legacy)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("destRoot")?.as_str().map(PathBuf::from))
+        .is_none_or(|named| named == dest_root)
 }
 
 fn open_scope(engine_state: &ManagedRoot) -> io::Result<ManagedRoot> {
@@ -892,8 +921,17 @@ mod tests {
             self.base
                 .join("state")
                 .join(SCOPE)
-                .join("pending.json")
+                .join(format!(
+                    "{}",
+                    pending_marker(&self.site()).as_path().display()
+                ))
                 .exists()
+        }
+
+        fn scope_file(&self, name: &str, contents: &str) {
+            let dir = self.base.join("state").join(SCOPE);
+            fs::create_dir_all(dir.join(name).parent().unwrap()).unwrap();
+            fs::write(dir.join(name), contents).unwrap();
         }
 
         fn artifacts_left(&self) -> usize {
@@ -1082,6 +1120,60 @@ mod tests {
                 .join(format!("recovery/wordpress-migrate/{ID}/target.sql"))
                 .exists()
         );
+    }
+
+    #[test]
+    fn a_failed_restore_of_one_site_does_not_block_another_site() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new();
+        fixture.existing_site();
+        let other = fixture.content.as_path().join("other.test");
+        fixture.scope_file(
+            &format!("pending/{}.json", resource_lock::canonical_hash(&other)),
+            "{}",
+        );
+        let manifest = fixture.stage(ID, |_| {});
+        run(&fixture, &fixture.request(&manifest, ID, None)).unwrap();
+        assert!(!fixture.pending());
+    }
+
+    #[test]
+    fn a_legacy_scope_marker_blocks_only_the_root_it_names() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new();
+        fixture.existing_site();
+        let other = fixture.content.as_path().join("other.test");
+        fixture.scope_file(
+            "pending.json",
+            &serde_json::json!({ "destRoot": other }).to_string(),
+        );
+        let manifest = fixture.stage(ID, |_| {});
+        run(&fixture, &fixture.request(&manifest, ID, None)).unwrap();
+
+        let fixture = Fixture::new();
+        fixture.existing_site();
+        fixture.scope_file(
+            "pending.json",
+            &serde_json::json!({ "destRoot": fixture.site() }).to_string(),
+        );
+        let manifest = fixture.stage(ID, |_| {});
+        let error = run(&fixture, &fixture.request(&manifest, ID, None)).unwrap_err();
+        assert!(matches!(error, Error::RecoveryRequired));
+        assert_eq!(
+            fs::read_to_string(fixture.site().join("index.php")).unwrap(),
+            "<?php echo 'old';"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_legacy_scope_marker_blocks_every_root() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new();
+        fixture.existing_site();
+        fixture.scope_file("pending.json", "not json");
+        let manifest = fixture.stage(ID, |_| {});
+        let error = run(&fixture, &fixture.request(&manifest, ID, None)).unwrap_err();
+        assert!(matches!(error, Error::RecoveryRequired));
     }
 
     #[test]
