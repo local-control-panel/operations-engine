@@ -451,7 +451,7 @@ fn import_with_recovery(
     };
 
     let pending = pending_marker(&req.dest_root);
-    if legacy_marker_blocks(&scope, &req.dest_root) {
+    if legacy_marker_blocks(scope, &req.dest_root) {
         return Err(Error::RecoveryRequired);
     }
     scope.create_dir_all(&rel("pending")).map_err(Error::Io)?;
