@@ -8,8 +8,10 @@
 //! and SHA-256, the manifest is within the confirmed limits, and the
 //! filesystem has room for a second copy of the tree.
 //!
-//! Then, under the destination root's resource lock and a `pending.json`
-//! marker (the recovery shape of `wordpress.migrateImport`): the existing root
+//! Then, under the destination root's resource lock and a `pending/<root>.json`
+//! marker, one per root so that a failed restore of one site blocks only that
+//! site (the recovery shape of `wordpress.migrateImport`, whose marker is one
+//! per scope): the existing root
 //! moves to `<content root>/.wcp-sync-<request id>/site` (a rename, so no
 //! second copy of the old tree), the archive is extracted with the bounded
 //! `tar_extract` reader into a fresh directory that takes the old root's mode,
@@ -242,7 +244,8 @@ fn import_with_recovery(
     let old_mode = existing.mode() & 0o7777;
     ensure_space(&canonical_root, req.manifest.content_bytes)?;
 
-    let pending = rel("pending.json");
+    scope.create_dir_all(&rel("pending")).map_err(Error::Io)?;
+    let pending = rel(&format!("pending/{}.json", root_hash(&req.dest_root)));
     let snapshot_dir = SiteRelativePath::parse(snapshot_dir_name(req.request_id))
         .expect("a canonical UUID forms a valid path");
     let saved = child(&snapshot_dir, "site");
@@ -323,14 +326,22 @@ struct SnapshotRecord {
     root: String,
 }
 
-fn record_rel(root: &Path) -> SiteRelativePath {
+/// SHA-256 of the root path, hex: names the root's marker and snapshot record.
+fn root_hash(root: &Path) -> String {
     let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
     let mut hex = String::with_capacity(64);
     for byte in digest {
         use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
-    rel(&format!("{EXPORTS_DIR}/{SNAPSHOT_RECORDS}/{hex}.json"))
+    hex
+}
+
+fn record_rel(root: &Path) -> SiteRelativePath {
+    rel(&format!(
+        "{EXPORTS_DIR}/{SNAPSHOT_RECORDS}/{}.json",
+        root_hash(root)
+    ))
 }
 
 /// Keeps one snapshot per root: removes the one an earlier import recorded and
@@ -495,11 +506,9 @@ mod tests {
         }
 
         fn pending(&self) -> bool {
-            self.base
-                .join("state")
-                .join(SCOPE)
-                .join("pending.json")
-                .exists()
+            fs::read_dir(self.base.join("state").join(SCOPE).join("pending"))
+                .map(|mut dir| dir.next().is_some())
+                .unwrap_or(false)
         }
 
         fn snapshot(&self, id: &str) -> PathBuf {
@@ -721,12 +730,39 @@ mod tests {
         let fx = Fixture::new();
         fx.existing_site();
         let scope = open_scope_for_test(&fx);
-        scope.create_new(&rel("pending.json"), b"{}").unwrap();
+        scope.create_dir_all(&rel("pending")).unwrap();
+        scope
+            .create_new(
+                &rel(&format!("pending/{}.json", root_hash(&fx.site()))),
+                b"{}",
+            )
+            .unwrap();
         let manifest = fx.stage(ID, |_| {});
         let error = execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err();
         assert!(matches!(error, Error::RecoveryRequired));
         assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'old';"));
         assert!(fx.pending(), "the marker is not ours to remove");
+    }
+
+    #[test]
+    fn a_leftover_marker_of_one_site_does_not_block_another() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let other = fx.content.as_path().join("other.test");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("index.php"), "other").unwrap();
+        let scope = open_scope_for_test(&fx);
+        scope.create_dir_all(&rel("pending")).unwrap();
+        scope
+            .create_new(&rel(&format!("pending/{}.json", root_hash(&other))), b"{}")
+            .unwrap();
+        let manifest = fx.stage(ID, |_| {});
+        execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap();
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'new';"));
+        assert_eq!(
+            fs::read_to_string(other.join("index.php")).unwrap(),
+            "other"
+        );
     }
 
     #[test]

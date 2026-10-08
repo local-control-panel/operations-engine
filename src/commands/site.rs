@@ -69,7 +69,7 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             kind,
             archive_id,
             request_id,
-        } => discard_archive(&kind, &archive_id, &request_id),
+        } => discard_archive(&kind, archive_id.as_deref(), &request_id),
         SiteCommand::WriteEnvFile {
             request_file,
             request_id,
@@ -1086,7 +1086,7 @@ fn import_archive(
 
 fn discard_archive(
     kind: &str,
-    archive_id: &str,
+    archive_id: Option<&str>,
     request_id: &str,
 ) -> Result<Response, ResponseBuildError> {
     use crate::site_archive::{self as archive, DISCARD_OPERATION};
@@ -1096,7 +1096,7 @@ fn discard_archive(
         let Ok(request) = archive::DiscardRequest::parse(kind, archive_id, request_id) else {
             return fail(
                 ErrorCode::InvalidInput,
-                "kind must be export or snapshot; archive-id and request-id must be canonical UUIDs",
+                "kind must be export, snapshot or stale; archive-id (required except for stale) and request-id must be canonical UUIDs",
             );
         };
         let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
@@ -1110,7 +1110,7 @@ fn discard_archive(
         let Ok(state) = crate::filesystem::ManagedRoot::open(&config.state_root) else {
             return fail(ErrorCode::Internal, "engine state root is unavailable");
         };
-        match archive::discard(&state, &config.content_roots, &request) {
+        match archive::discard(&state, &config.state_root, &config.content_roots, &request) {
             Ok(result) => Response::success(DISCARD_OPERATION, result),
             Err(archive::Error::PostCommit(value)) => Response::success(DISCARD_OPERATION, value),
             Err(error) => {

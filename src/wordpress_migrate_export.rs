@@ -266,6 +266,7 @@ pub fn export(
     let source = resolve_source(ctx.content_root, &req.source_root)?;
     let _resource_lock = resource_lock::acquire(ctx.engine_state, &req.source_root, req.request_id)
         .map_err(|_| Error::ResourceBusy)?;
+    crate::site_archive::sweep_stale_exports(ctx.engine_state, ctx.state_root, SystemTime::now());
     run_admitted(
         ctx.engine_state,
         EXPORT_OPERATION,
