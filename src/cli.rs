@@ -1495,6 +1495,25 @@ pub enum StackCommand {
     /// Stop one site's s6-supervised process, remove its service directory
     /// under `siteServicesRoot` and drop it from the pool's s6-svscan, under
     /// the shared stack lock. A site with no service directory is a no-op.
+    /// Run one fixed probe (`applicationToken`, `opcacheStatus` or
+    /// `opcacheReset`) against a site through its runtime pool: a short-lived
+    /// PHP file in the site's webroot is fetched with `curl` and removed.
+    ProbeSite {
+        #[arg(long)]
+        kind: String,
+        /// `ingress` or `runtime-<runtime id>`.
+        #[arg(long)]
+        service: String,
+        #[arg(long)]
+        domain: String,
+        /// The site's document root, below a content root.
+        #[arg(long)]
+        root: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     RemoveSiteService {
         #[arg(long = "runtime-id")]
         runtime_id: String,
@@ -1519,6 +1538,7 @@ impl StackCommand {
             Self::WriteSiteService { .. } => "stack.writeSiteService",
             Self::ActivateSiteConfig { .. } => "stack.activateSiteConfig",
             Self::RemoveSiteService { .. } => "stack.removeSiteService",
+            Self::ProbeSite { .. } => "site.probe",
         }
     }
 }

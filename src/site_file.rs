@@ -532,24 +532,79 @@ fn remove_phpinfo_files(dir: &ManagedRoot) -> Result<u32, Error> {
     Ok(removed)
 }
 
-fn php_info(
+/// Opens `<content root>/<names...>` without following a symlink at any
+/// level.
+fn walk_directory(
     content_root: &TrustedRoot,
     names: &[SiteRelativePath],
-    req: &PhpInfoRequest,
-) -> Result<PhpInfoResult, Error> {
+    follow_current: bool,
+) -> Result<ManagedRoot, Error> {
     crate::site_root::refuse_system_dir(content_root)?;
     let mut dir = ManagedRoot::open(content_root).map_err(Error::Io)?;
-    for name in names {
-        match dir.symlink_metadata(name) {
+    let mut pending: std::collections::VecDeque<SiteRelativePath> = names.iter().cloned().collect();
+    // A release symlink is followed at most this many times.
+    let mut follows = 0;
+    while let Some(name) = pending.pop_front() {
+        match dir.symlink_metadata(&name) {
             Ok(metadata) if metadata.is_dir() => {}
+            Ok(metadata)
+                if follow_current
+                    && metadata.file_type().is_symlink()
+                    && follows == 0
+                    && name.as_path() == Path::new("current") =>
+            {
+                // The deploy layout's `<site>/current -> releases/<id>`: honoured
+                // only when the directory holding the link is root-owned (the
+                // engine's), and only for a relative target of plain components.
+                // Anything a tenant could have planted is still refused.
+                let owner = dir.own_metadata().map_err(Error::Io)?;
+                if owner.uid() != 0 {
+                    return Err(Error::UnsafePath);
+                }
+                let target = dir.read_link(&name).map_err(Error::Io)?;
+                let mut resolved = Vec::new();
+                for component in target.components() {
+                    let std::path::Component::Normal(part) = component else {
+                        return Err(Error::UnsafePath);
+                    };
+                    resolved.push(SiteRelativePath::parse(part).map_err(|_| Error::UnsafePath)?);
+                }
+                if resolved.is_empty() {
+                    return Err(Error::UnsafePath);
+                }
+                follows += 1;
+                for part in resolved.into_iter().rev() {
+                    pending.push_front(part);
+                }
+                continue;
+            }
             Ok(_) => return Err(Error::UnsafePath),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(Error::FileMissing);
             }
             Err(error) => return Err(Error::Io(error)),
         }
-        dir = dir.open_child_dir_nofollow(name).map_err(open_error)?;
+        dir = dir.open_child_dir_nofollow(&name).map_err(open_error)?;
     }
+    Ok(dir)
+}
+
+/// The site directory `path` below one of `content_roots`, opened without
+/// following a symlink, except the engine's own `current` release link.
+pub(crate) fn open_site_directory(
+    content_roots: &[TrustedRoot],
+    path: &Path,
+) -> Result<ManagedRoot, Error> {
+    let (content_root, names) = split_directory(content_roots, path)?;
+    walk_directory(content_root, &names, true)
+}
+
+fn php_info(
+    content_root: &TrustedRoot,
+    names: &[SiteRelativePath],
+    req: &PhpInfoRequest,
+) -> Result<PhpInfoResult, Error> {
+    let dir = walk_directory(content_root, names, false)?;
 
     let removed = remove_phpinfo_files(&dir)?;
     let now = unix_now_secs();

@@ -50,6 +50,8 @@ pub mod site_file;
 #[cfg(unix)]
 pub mod site_identity;
 pub mod site_manifest;
+#[cfg(unix)]
+pub mod site_probe;
 pub mod site_root;
 #[cfg(unix)]
 pub mod stack_deploy;
