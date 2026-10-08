@@ -600,6 +600,35 @@ mod tests {
     }
 
     #[test]
+    fn a_current_link_is_only_honoured_in_a_root_owned_directory() {
+        // Unprivileged, the fixture's directories belong to the test user, so
+        // a tenant-planted `current` link must be refused.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let f = Fixture::new("TOKEN", 0);
+        let site = f.dir.path().join("www/site-b");
+        fs::create_dir_all(site.join("releases/1")).unwrap();
+        std::os::unix::fs::symlink("releases/1", site.join("current")).unwrap();
+        let req = ProbeRequest::parse(
+            "applicationToken",
+            "runtime-fp1-php83",
+            "site-b.test",
+            site.join("current").to_str().unwrap(),
+            &f.roots,
+            ID1,
+            None,
+        )
+        .unwrap();
+        let err = run(&f, &req).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::SiteDirectory(crate::site_root::Error::UnsafePath)
+        ));
+        assert!(f.calls().is_empty());
+    }
+
+    #[test]
     fn a_busy_stack_is_a_conflict() {
         let f = Fixture::new("TOKEN", 0);
         let scope = crate::stack_deploy::open_scope(&f.state).unwrap();
