@@ -450,6 +450,15 @@ pub fn remove(
                     return Err(undo_tab(Error::Io(error)));
                 }
             }
+            // The shared library goes with the last agent; the scripts carry
+            // their own inlined copy, so nothing needs it once none is left.
+            if had_entry
+                && manifest_is_empty(&manifest_with(previous_manifest_text, agent.name, None))
+            {
+                let _ = ctx
+                    .root
+                    .remove_file(&rel(&format!("{AGENTS_DIR}/{LIBRARY_FILE}")));
+            }
             // The last-run record of a removed agent would keep showing in
             // the list; it is a log, so a failure here changes nothing.
             let _ = ctx
@@ -463,6 +472,14 @@ pub fn remove(
             })
         },
     )
+}
+
+/// Whether a manifest lists no agent.
+fn manifest_is_empty(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| value.as_object().map(serde_json::Map::is_empty))
+        .unwrap_or(false)
 }
 
 pub fn bruteforce_unban(
@@ -815,6 +832,23 @@ mod tests {
         assert!(host.tab().contains("MAILTO=x"));
         assert!(host.tab().contains("error-log-digest"));
         assert!(!host.tab().contains("cache-warmup"));
+        // Another agent is still installed, so the shared library stays.
+        assert!(host.file("agents/wcp_agent_lib.py").is_some());
+        remove(
+            &host.ctx(),
+            &RemoveRequest::parse(
+                r#"{"name":"error-log-digest"}"#,
+                "123e4567-e89b-12d3-a456-426614174004",
+                None,
+            )
+            .unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+        // The last one takes the library with it.
+        assert!(host.file("agents/wcp_agent_lib.py").is_none());
+        assert!(host.file("agents/error-log-digest.sh").is_none());
+        assert_eq!(host.file("manifest.json").unwrap().trim(), "{}");
     }
 
     #[test]

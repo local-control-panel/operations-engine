@@ -1058,12 +1058,14 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
-    /// Remove one site archive export or one destination snapshot.
+    /// Remove one site archive export, one destination snapshot, or all stale
+    /// exports.
     DiscardArchive {
+        /// `export`, `snapshot`, or `stale` (every export past 24 hours).
         #[arg(long)]
         kind: String,
         #[arg(long = "archive-id")]
-        archive_id: String,
+        archive_id: Option<String>,
         #[arg(long = "request-id")]
         request_id: String,
     },

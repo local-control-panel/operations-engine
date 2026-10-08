@@ -13,9 +13,12 @@
 //! site's configuration files, so the panel discards it as soon as it has
 //! been transferred, and also after a failed sync.
 //!
-//! `site.discardArchive` removes one export directory (`--kind export`) or the
+//! `site.discardArchive` removes one export directory (`--kind export`), the
 //! previous-state snapshot a destination keeps after an import
-//! (`--kind snapshot`).
+//! (`--kind snapshot`), or every export of either kind that has outlived
+//! `STALE_AFTER` (`--kind stale`). Both exports also sweep stale exports
+//! before they write a new one, so a panel that died mid-sync cannot leave a
+//! copy of a site (or a database dump) behind forever.
 
 use std::{
     io,
@@ -57,6 +60,10 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// Directory (directly under a content root) that holds the previous state of
 /// a destination root after an import: `.wcp-sync-<import id>/site`.
 pub const SNAPSHOT_PREFIX: &str = ".wcp-sync-";
+
+/// An export older than this is nobody's: the panel's longest step times out
+/// after an hour. Used by [`sweep_stale_exports`].
+pub const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 const EXPORT_SCOPE: &str = "site-archive-export";
 const DISCARD_SCOPE: &str = "site-archive-discard";
@@ -155,24 +162,37 @@ pub struct ExportResult {
 pub enum DiscardKind {
     Export,
     Snapshot,
+    /// Every export (site archives and WordPress migrations) past `STALE_AFTER`.
+    Stale,
 }
 
 pub struct DiscardRequest {
     pub kind: DiscardKind,
-    pub archive_id: RequestId,
+    /// Required for `export` and `snapshot`, forbidden for `stale`.
+    pub archive_id: Option<RequestId>,
     pub request_id: RequestId,
 }
 
 impl DiscardRequest {
-    pub fn parse(kind: &str, archive_id: &str, request_id: &str) -> Result<Self, RequestError> {
+    pub fn parse(
+        kind: &str,
+        archive_id: Option<&str>,
+        request_id: &str,
+    ) -> Result<Self, RequestError> {
         let kind = match kind {
             "export" => DiscardKind::Export,
             "snapshot" => DiscardKind::Snapshot,
+            "stale" => DiscardKind::Stale,
             _ => return Err(RequestError),
+        };
+        let archive_id = match (kind, archive_id) {
+            (DiscardKind::Stale, None) => None,
+            (DiscardKind::Stale, Some(_)) | (_, None) => return Err(RequestError),
+            (_, Some(id)) => Some(RequestId::parse(id).map_err(|_| RequestError)?),
         };
         Ok(Self {
             kind,
-            archive_id: RequestId::parse(archive_id).map_err(|_| RequestError)?,
+            archive_id,
             request_id: RequestId::parse(request_id).map_err(|_| RequestError)?,
         })
     }
@@ -181,9 +201,14 @@ impl DiscardRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscardResult {
-    pub archive_id: String,
+    /// Absent for `stale`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_id: Option<String>,
     /// `false` when there was nothing left to remove.
     pub removed: bool,
+    /// How many directories went (1 or 0, except for `stale`).
+    #[serde(default)]
+    pub removed_count: u32,
 }
 
 pub struct Context<'a> {
@@ -318,6 +343,7 @@ pub fn export(
         resolve_source(ctx.content_root, &req.source_root).map_err(|_| Error::SourceUnavailable)?;
     let _resource_lock = resource_lock::acquire(ctx.engine_state, &req.source_root, req.request_id)
         .map_err(|_| Error::ResourceBusy)?;
+    sweep_stale_exports(ctx.engine_state, ctx.state_root, SystemTime::now());
     run_admitted(
         ctx.engine_state,
         EXPORT_SCOPE,
@@ -415,6 +441,7 @@ fn export_into(
 /// Removes one export directory or one snapshot. Missing is a no-op.
 pub fn discard(
     engine_state: &ManagedRoot,
+    state_root: &TrustedRoot,
     content_roots: &[TrustedRoot],
     req: &DiscardRequest,
 ) -> Result<DiscardResult, Error> {
@@ -425,28 +452,77 @@ pub fn discard(
         req.request_id,
         None,
         |_| {
-            let removed = match req.kind {
-                DiscardKind::Export => {
-                    remove_if_present(engine_state, &export_rel(req.archive_id))?
+            let id = req.archive_id;
+            let count = match (req.kind, id) {
+                (DiscardKind::Export, Some(id)) => {
+                    u32::from(remove_if_present(engine_state, &export_rel(id))?)
                 }
-                DiscardKind::Snapshot => {
-                    let name = snapshot_dir_name(req.archive_id);
-                    let mut any = false;
+                (DiscardKind::Snapshot, Some(id)) => {
+                    let name = snapshot_dir_name(id);
+                    let mut count = 0;
                     for root in content_roots {
                         let managed = ManagedRoot::open(root).map_err(Error::Io)?;
                         let rel = SiteRelativePath::parse(&name)
                             .expect("a canonical UUID forms a valid path");
-                        any |= remove_if_present(&managed, &rel)?;
+                        count += u32::from(remove_if_present(&managed, &rel)?);
                     }
-                    any
+                    count
                 }
+                _ => sweep_stale_exports(engine_state, state_root, SystemTime::now()),
             };
             Ok(DiscardResult {
-                archive_id: req.archive_id.to_string(),
-                removed,
+                archive_id: id.map(|id| id.to_string()),
+                removed: count > 0,
+                removed_count: count,
             })
         },
     )
+}
+
+/// Directories whose children are export directories named by a request id.
+const EXPORT_PARENTS: [&str; 2] = [EXPORTS_DIR, "wordpress-migrate"];
+
+/// Removes every export directory (`site-sync/<uuid>` and
+/// `wordpress-migrate/<uuid>`) whose last change is older than
+/// [`STALE_AFTER`]. Best effort: an entry that cannot be inspected or removed
+/// is left for the next sweep. Returns how many went.
+pub fn sweep_stale_exports(
+    engine_state: &ManagedRoot,
+    state_root: &TrustedRoot,
+    now: SystemTime,
+) -> u32 {
+    let mut removed = 0;
+    for parent in EXPORT_PARENTS {
+        let Ok(entries) = std::fs::read_dir(state_root.as_path().join(parent)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| RequestId::parse(name).ok())
+            else {
+                continue; // `snapshots/` and anything that is not an export
+            };
+            let stale = entry
+                .metadata()
+                .ok()
+                .filter(|meta| meta.is_dir())
+                .and_then(|meta| meta.modified().ok())
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age >= STALE_AFTER);
+            if !stale {
+                continue;
+            }
+            let Ok(relative) = SiteRelativePath::parse(format!("{parent}/{id}")) else {
+                continue;
+            };
+            if engine_state.remove_dir_all(&relative).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    removed
 }
 
 fn remove_if_present(root: &ManagedRoot, rel: &SiteRelativePath) -> Result<bool, Error> {
@@ -887,16 +963,28 @@ mod tests {
     fn discard_removes_an_export_and_is_a_no_op_the_second_time() {
         let fx = Fixture::new();
         export(&fx.ctx(), &fx.request("site.test", ID, None), &cancel()).unwrap();
-        let first = DiscardRequest::parse("export", ID, OTHER_ID).unwrap();
-        let removed = discard(&fx.state, std::slice::from_ref(&fx.content), &first).unwrap();
+        let first = DiscardRequest::parse("export", Some(ID), OTHER_ID).unwrap();
+        let removed = discard(
+            &fx.state,
+            &fx.state_root,
+            std::slice::from_ref(&fx.content),
+            &first,
+        )
+        .unwrap();
         assert!(removed.removed);
         assert!(!fx.export_dir(ID).exists());
         let again =
-            DiscardRequest::parse("export", ID, "123e4567-e89b-12d3-a456-426614174002").unwrap();
+            DiscardRequest::parse("export", Some(ID), "123e4567-e89b-12d3-a456-426614174002")
+                .unwrap();
         assert!(
-            !discard(&fx.state, std::slice::from_ref(&fx.content), &again)
-                .unwrap()
-                .removed
+            !discard(
+                &fx.state,
+                &fx.state_root,
+                std::slice::from_ref(&fx.content),
+                &again
+            )
+            .unwrap()
+            .removed
         );
     }
 
@@ -916,8 +1004,15 @@ mod tests {
             fs::write(dir.join("site/index.php"), "old").unwrap();
         }
         let request =
-            DiscardRequest::parse("snapshot", ID, "123e4567-e89b-12d3-a456-426614174003").unwrap();
-        let result = discard(&fx.state, std::slice::from_ref(&fx.content), &request).unwrap();
+            DiscardRequest::parse("snapshot", Some(ID), "123e4567-e89b-12d3-a456-426614174003")
+                .unwrap();
+        let result = discard(
+            &fx.state,
+            &fx.state_root,
+            std::slice::from_ref(&fx.content),
+            &request,
+        )
+        .unwrap();
         assert!(result.removed);
         assert!(!drop_dir.exists());
         assert!(keep.join("site/index.php").exists());
@@ -926,8 +1021,113 @@ mod tests {
 
     #[test]
     fn discard_rejects_an_unknown_kind_and_non_uuid_ids() {
-        assert!(DiscardRequest::parse("everything", ID, OTHER_ID).is_err());
-        assert!(DiscardRequest::parse("export", "../etc", OTHER_ID).is_err());
-        assert!(DiscardRequest::parse("export", ID, "x").is_err());
+        assert!(DiscardRequest::parse("everything", Some(ID), OTHER_ID).is_err());
+        assert!(DiscardRequest::parse("export", Some("../etc"), OTHER_ID).is_err());
+        assert!(DiscardRequest::parse("export", Some(ID), "x").is_err());
+        // An id is required except for `stale`, which takes none.
+        assert!(DiscardRequest::parse("export", None, OTHER_ID).is_err());
+        assert!(DiscardRequest::parse("snapshot", None, OTHER_ID).is_err());
+        assert!(DiscardRequest::parse("stale", Some(ID), OTHER_ID).is_err());
+        assert!(DiscardRequest::parse("stale", None, OTHER_ID).is_ok());
+    }
+
+    fn age(path: &Path, hours: u64) {
+        let when = SystemTime::now() - Duration::from_secs(hours * 60 * 60);
+        fs::File::open(path).unwrap().set_modified(when).unwrap();
+    }
+
+    fn fake_export(fx: &Fixture, parent: &str, id: &str, hours_old: u64) -> PathBuf {
+        let dir = fx.base.join("state").join(parent).join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("db.sql.gz"), "dump").unwrap();
+        age(&dir, hours_old);
+        dir
+    }
+
+    #[test]
+    fn the_sweep_removes_only_exports_past_the_cutoff_in_both_directories() {
+        let fx = Fixture::new();
+        let old_wp = fake_export(&fx, "wordpress-migrate", ID, 30);
+        let old_site = fake_export(&fx, EXPORTS_DIR, OTHER_ID, 25);
+        let fresh_wp = fake_export(
+            &fx,
+            "wordpress-migrate",
+            "123e4567-e89b-12d3-a456-426614174002",
+            1,
+        );
+        let fresh_site = fake_export(&fx, EXPORTS_DIR, "123e4567-e89b-12d3-a456-426614174003", 23);
+        // Things that are not exports are left alone however old they are.
+        let records = fx.base.join("state").join(EXPORTS_DIR).join("snapshots");
+        fs::create_dir_all(&records).unwrap();
+        age(&records, 100);
+        let stray = fx.base.join("state/wordpress-migrate/not-an-export");
+        fs::create_dir_all(&stray).unwrap();
+        age(&stray, 100);
+        let file = fx
+            .base
+            .join("state/wordpress-migrate/123e4567-e89b-12d3-a456-426614174004");
+        fs::write(&file, "a file, not a directory").unwrap();
+        age(&file, 100);
+
+        assert_eq!(
+            sweep_stale_exports(&fx.state, &fx.state_root, SystemTime::now()),
+            2
+        );
+        assert!(!old_wp.exists() && !old_site.exists());
+        assert!(fresh_wp.exists() && fresh_site.exists());
+        assert!(records.exists() && stray.exists() && file.exists());
+        assert_eq!(
+            sweep_stale_exports(&fx.state, &fx.state_root, SystemTime::now()),
+            0
+        );
+    }
+
+    #[test]
+    fn a_new_export_sweeps_stale_ones_first_and_leaves_fresh_ones() {
+        let fx = Fixture::new();
+        let old = fake_export(&fx, "wordpress-migrate", ID, 48);
+        let fresh = fake_export(&fx, EXPORTS_DIR, "123e4567-e89b-12d3-a456-426614174005", 2);
+        export(
+            &fx.ctx(),
+            &fx.request("site.test", OTHER_ID, None),
+            &cancel(),
+        )
+        .unwrap();
+        assert!(
+            !old.exists(),
+            "the old WordPress export holds a database dump"
+        );
+        assert!(fresh.exists());
+        assert!(fx.export_dir(OTHER_ID).exists());
+    }
+
+    #[test]
+    fn discard_stale_reports_how_many_it_removed() {
+        let fx = Fixture::new();
+        fake_export(&fx, "wordpress-migrate", ID, 72);
+        fake_export(&fx, EXPORTS_DIR, OTHER_ID, 72);
+        let request =
+            DiscardRequest::parse("stale", None, "123e4567-e89b-12d3-a456-426614174006").unwrap();
+        let result = discard(
+            &fx.state,
+            &fx.state_root,
+            std::slice::from_ref(&fx.content),
+            &request,
+        )
+        .unwrap();
+        assert!(result.removed);
+        assert_eq!(result.removed_count, 2);
+        assert!(result.archive_id.is_none());
+        let again =
+            DiscardRequest::parse("stale", None, "123e4567-e89b-12d3-a456-426614174007").unwrap();
+        let result = discard(
+            &fx.state,
+            &fx.state_root,
+            std::slice::from_ref(&fx.content),
+            &again,
+        )
+        .unwrap();
+        assert!(!result.removed);
+        assert_eq!(result.removed_count, 0);
     }
 }
