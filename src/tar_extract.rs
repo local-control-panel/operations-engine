@@ -27,6 +27,9 @@ use crate::{
     filesystem::ManagedRoot, site::SiteRelativePath, wordpress_migrate_export::symlink_stays_inside,
 };
 
+/// Seconds and nanoseconds since the epoch.
+type Mtime = (i64, u32);
+
 const BLOCK: usize = 512;
 /// Longest GNU long-name / long-link / PAX record this reader accepts.
 const MAX_META_BYTES: u64 = 64 * 1024;
@@ -70,9 +73,9 @@ pub fn extract(
     let mut long_name: Option<Vec<u8>> = None;
     let mut long_link: Option<Vec<u8>> = None;
     let mut pax_size: Option<u64> = None;
-    let mut pax_mtime: Option<(i64, u32)> = None;
-    let mut dir_times: Vec<(SiteRelativePath, (i64, u32))> = Vec::new();
-    let mut symlinks: Vec<(SiteRelativePath, PathBuf, Option<(i64, u32)>)> = Vec::new();
+    let mut pax_mtime: Option<Mtime> = None;
+    let mut dir_times: Vec<(SiteRelativePath, Mtime)> = Vec::new();
+    let mut symlinks: Vec<(SiteRelativePath, PathBuf, Option<Mtime>)> = Vec::new();
     let mut header = [0u8; BLOCK];
 
     loop {
@@ -314,11 +317,11 @@ struct PaxRecords {
     path: Option<Vec<u8>>,
     linkpath: Option<Vec<u8>>,
     size: Option<u64>,
-    mtime: Option<(i64, u32)>,
+    mtime: Option<Mtime>,
 }
 
 /// `"<seconds>[.<fraction>]"` as PAX writes it; a bad value is ignored.
-fn parse_pax_time(value: &[u8]) -> Option<(i64, u32)> {
+fn parse_pax_time(value: &[u8]) -> Option<Mtime> {
     let text = std::str::from_utf8(value).ok()?;
     let (secs, fraction) = text.split_once('.').unwrap_or((text, ""));
     let secs: i64 = secs.parse().ok()?;
