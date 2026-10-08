@@ -55,6 +55,16 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SiteCommand::WriteEnvFile {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => write_env_file(&request_file, &request_id, idempotency_key.as_deref()),
+        SiteCommand::QuarantineFile {
+            path,
+            request_id,
+            idempotency_key,
+        } => quarantine_file(&path, &request_id, idempotency_key.as_deref()),
         SiteCommand::RemoveRoot {
             domain,
             relative_root,
@@ -812,6 +822,84 @@ fn remove_root(
             REMOVE_OPERATION,
             ErrorCode::UnsupportedPlatform,
             "site.removeRoot requires a Unix host",
+        ))
+    }
+}
+
+fn write_env_file(
+    request_file: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::site_file::{ENV_OPERATION, EnvRequest};
+
+        let json = match crate::commands::read_root_owned_content_file(request_file) {
+            Ok(json) => json,
+            Err(_) => {
+                return Ok(Response::failure(
+                    ENV_OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match EnvRequest::parse(&json, request_id, idempotency_key) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    ENV_OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        run_site_root(ENV_OPERATION, |engine_state, config| {
+            crate::site_file::write_env_file(engine_state, &config.content_roots, &request)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request_file, request_id, idempotency_key);
+        Ok(Response::failure(
+            "site.writeEnvFile",
+            ErrorCode::UnsupportedPlatform,
+            "site.writeEnvFile requires a Unix host",
+        ))
+    }
+}
+
+fn quarantine_file(
+    path: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::site_file::{QUARANTINE_OPERATION, QuarantineRequest};
+
+        let request = match QuarantineRequest::parse(path, request_id, idempotency_key) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    QUARANTINE_OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        run_site_root(QUARANTINE_OPERATION, |engine_state, config| {
+            crate::site_file::quarantine_file(engine_state, &config.content_roots, &request)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            "site.quarantineFile",
+            ErrorCode::UnsupportedPlatform,
+            "site.quarantineFile requires a Unix host",
         ))
     }
 }

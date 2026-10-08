@@ -138,6 +138,8 @@ fn capabilities_describe_only_implemented_operations() {
             "docker.imagePull",
             "docker.imageRemove",
             "docker.volumeRemove",
+            "site.writeEnvFile",
+            "site.quarantineFile",
             "system.service",
             "compose.action",
             "compose.remove"

@@ -270,6 +270,31 @@ impl ManagedRoot {
             .map(cap_std::fs::File::into_std)
     }
 
+    /// Like `create_new_file`, but the file is created with `mode` from the
+    /// start (subject to the umask, which only ever removes bits), so
+    /// secret-bearing content is never briefly readable by another user.
+    #[cfg(unix)]
+    pub fn create_new_file_with_mode(
+        &self,
+        path: &SiteRelativePath,
+        mode: u32,
+    ) -> io::Result<std::fs::File> {
+        use cap_std::fs::OpenOptionsExt;
+        self.directory
+            .open_with(
+                path.as_path(),
+                OpenOptions::new().write(true).create_new(true).mode(mode),
+            )
+            .map(cap_std::fs::File::into_std)
+    }
+
+    /// Opens an existing file beneath this capability root for reading.
+    pub fn open_read(&self, path: &SiteRelativePath) -> io::Result<std::fs::File> {
+        self.directory
+            .open(path.as_path())
+            .map(cap_std::fs::File::into_std)
+    }
+
     /// Opens `path` for reading and writing, creating it if absent but
     /// never truncating or replacing an existing file - the counterpart to
     /// `create_new_file` for callers that need one persistent file reused

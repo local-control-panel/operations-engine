@@ -46,6 +46,8 @@ pub mod runtime_config;
 pub mod site;
 pub mod site_enroll;
 #[cfg(unix)]
+pub mod site_file;
+#[cfg(unix)]
 pub mod site_identity;
 pub mod site_manifest;
 pub mod site_root;
