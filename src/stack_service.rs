@@ -401,6 +401,14 @@ pub enum Error {
     /// `site.probe`: the page answered, but not with what the probe expects
     /// (wrong document root, a PHP error page, OPcache not available).
     ProbeUnexpected(&'static str),
+    /// `site.setErrorPages`: the site has no process `Caddyfile` to edit.
+    SiteConfigMissing,
+    /// `site.setErrorPages`: the `Caddyfile` could not be edited (unbalanced
+    /// markers, no site block).
+    ConfigMalformed(&'static str),
+    /// `site.setErrorPages`: the config activation failed and the error page
+    /// files could not be put back as they were.
+    PagesRecoveryFailed,
     PostCommit(serde_json::Value),
     Replayed {
         code: ErrorCode,
@@ -456,6 +464,16 @@ impl Error {
             ),
             Self::SiteDirectory(error) => error.protocol(),
             Self::ProbeUnexpected(message) => (ErrorCode::SubprocessFailed, (*message).to_owned()),
+            Self::SiteConfigMissing => (
+                ErrorCode::NotFound,
+                "the site has no process config to edit".into(),
+            ),
+            Self::ConfigMalformed(message) => (ErrorCode::InvalidInput, (*message).to_owned()),
+            Self::PagesRecoveryFailed => (
+                ErrorCode::ConfigRecoveryFailed,
+                "the site config was not activated and the previous error page files could not be restored"
+                    .into(),
+            ),
             Self::Replayed { code, message } => (*code, message.clone()),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit(_) => {
                 (ErrorCode::Internal, "internal stack service error".into())
@@ -977,59 +995,102 @@ pub fn activate_site_config(
         req.request_id,
         req.idempotency_key.as_ref(),
         || {
-            let root = ManagedRoot::open(ctx.site_services_root).map_err(Error::Io)?;
-            let caddy_rel = service_rel(&req.runtime_id, &req.domain, "Caddyfile");
-            let basedir_rel = service_rel(&req.runtime_id, &req.domain, "open-basedir.ini");
-            let tmp_rel = service_rel(&req.runtime_id, &req.domain, "Caddyfile.tmp");
-
-            // Hash-guard the file currently on disk before touching anything.
-            let prior_caddy = read_optional(&root, &caddy_rel)?;
-            if !req.guard.is_satisfied_by(prior_caddy.as_deref()) {
-                return Err(Error::HashMismatch);
-            }
-            let prior_basedir = read_optional(&root, &basedir_rel)?;
-
-            // The Caddyfile is the caller's opaque, validated-in-container
-            // content; open-basedir is derived from the root.
-            let new_caddy = req.caddyfile.clone();
-            let new_basedir = site_open_basedir_ini(&req.root);
-
-            // Stage the new Caddyfile next to the live one and validate it
-            // inside the pool before it can take effect. A `.tmp` sibling is
-            // not loaded by the running process.
-            root.write_atomic(&tmp_rel, new_caddy.as_bytes())
-                .map_err(Error::Io)?;
-            let cdir = container_dir(&req.domain);
-            if let Err(error) = validate_site_config(ctx, &req.runtime_id, &cdir, cancel) {
-                let _ = root.remove_file(&tmp_rel);
-                return Err(error);
-            }
-
-            // Commit: swap the validated Caddyfile in and refresh the ini.
-            root.rename(&tmp_rel, &caddy_rel).map_err(Error::Io)?;
-            root.write_atomic(&basedir_rel, new_basedir.as_bytes())
-                .map_err(Error::Io)?;
-
-            // Restart the child and probe it. Any failure rolls both files
-            // back to what was on disk and restarts on the old config.
-            let outcome = restart_service(ctx, &req.runtime_id, &cdir, cancel)
-                .and_then(|()| site_probe(ctx, &req.runtime_id, req.port, cancel));
-            match outcome {
-                Ok(()) => Ok(site_result(&req.runtime_id, &req.domain)),
-                Err(_down) => Err(restore_site(
-                    &root,
-                    ctx,
-                    req,
-                    &caddy_rel,
-                    &basedir_rel,
-                    &cdir,
-                    prior_caddy.as_deref(),
-                    prior_basedir.as_deref(),
-                    cancel,
-                )),
-            }
+            activate_locked(
+                ctx,
+                &SiteActivation {
+                    runtime_id: &req.runtime_id,
+                    domain: &req.domain,
+                    port: req.port,
+                    root: &req.root,
+                    caddyfile: &req.caddyfile,
+                    guard: &req.guard,
+                },
+                cancel,
+            )
         },
     )
+}
+
+/// What `activate_locked` swaps in. Borrowed from either
+/// `stack.activateSiteConfig` or `site.setErrorPages`, which both run the
+/// same validate, swap, restart, probe and roll back sequence.
+pub(crate) struct SiteActivation<'a> {
+    pub runtime_id: &'a RuntimeId,
+    pub domain: &'a Domain,
+    pub port: u16,
+    pub root: &'a str,
+    pub caddyfile: &'a str,
+    pub guard: &'a HashGuard,
+}
+
+/// The activation itself, for a caller that already holds the `stacks/wcp`
+/// lock (`run_admitted` is not reentrant).
+pub(crate) fn activate_locked(
+    ctx: &Context<'_>,
+    activation: &SiteActivation<'_>,
+    cancel: &CancellationToken,
+) -> Result<SiteServiceResult, Error> {
+    let root = ManagedRoot::open(ctx.site_services_root).map_err(Error::Io)?;
+    let caddy_rel = service_rel(activation.runtime_id, activation.domain, "Caddyfile");
+    let basedir_rel = service_rel(activation.runtime_id, activation.domain, "open-basedir.ini");
+    let tmp_rel = service_rel(activation.runtime_id, activation.domain, "Caddyfile.tmp");
+
+    // Hash-guard the file currently on disk before touching anything.
+    let prior_caddy = read_optional(&root, &caddy_rel)?;
+    if !activation.guard.is_satisfied_by(prior_caddy.as_deref()) {
+        return Err(Error::HashMismatch);
+    }
+    let prior_basedir = read_optional(&root, &basedir_rel)?;
+
+    // The Caddyfile is the caller's opaque, validated-in-container
+    // content; open-basedir is derived from the root.
+    let new_caddy = activation.caddyfile;
+    let new_basedir = site_open_basedir_ini(activation.root);
+
+    // Stage the new Caddyfile next to the live one and validate it
+    // inside the pool before it can take effect. A `.tmp` sibling is
+    // not loaded by the running process.
+    root.write_atomic(&tmp_rel, new_caddy.as_bytes())
+        .map_err(Error::Io)?;
+    let cdir = container_dir(activation.domain);
+    if let Err(error) = validate_site_config(ctx, activation.runtime_id, &cdir, cancel) {
+        let _ = root.remove_file(&tmp_rel);
+        return Err(error);
+    }
+
+    // Commit: swap the validated Caddyfile in and refresh the ini.
+    root.rename(&tmp_rel, &caddy_rel).map_err(Error::Io)?;
+    root.write_atomic(&basedir_rel, new_basedir.as_bytes())
+        .map_err(Error::Io)?;
+
+    // Restart the child and probe it. Any failure rolls both files
+    // back to what was on disk and restarts on the old config.
+    let outcome = restart_service(ctx, activation.runtime_id, &cdir, cancel)
+        .and_then(|()| site_probe(ctx, activation.runtime_id, activation.port, cancel));
+    match outcome {
+        Ok(()) => Ok(site_result(activation.runtime_id, activation.domain)),
+        Err(_down) => Err(restore_site(
+            &root,
+            ctx,
+            activation.runtime_id,
+            &caddy_rel,
+            &basedir_rel,
+            &cdir,
+            prior_caddy.as_deref(),
+            prior_basedir.as_deref(),
+            cancel,
+        )),
+    }
+}
+
+/// The site process's current `Caddyfile`, if it has a service directory.
+pub(crate) fn read_site_caddyfile(
+    ctx: &Context<'_>,
+    runtime_id: &RuntimeId,
+    domain: &Domain,
+) -> Result<Option<Vec<u8>>, Error> {
+    let root = ManagedRoot::open(ctx.site_services_root).map_err(Error::Io)?;
+    read_optional(&root, &service_rel(runtime_id, domain, "Caddyfile"))
 }
 
 pub struct RemoveSiteServiceRequest {
@@ -1251,7 +1312,7 @@ fn site_probe(
 fn restore_site(
     root: &ManagedRoot,
     ctx: &Context<'_>,
-    req: &ActivateSiteConfigRequest,
+    runtime_id: &RuntimeId,
     caddy_rel: &SiteRelativePath,
     basedir_rel: &SiteRelativePath,
     container_dir: &str,
@@ -1275,9 +1336,7 @@ fn restore_site(
     // Only a prior config can be restarted into; a rolled-back first write
     // leaves nothing to run, so skip the restart there. No re-probe: the
     // restored config is the one that was serving before this request.
-    if prior_caddy.is_some()
-        && restart_service(ctx, &req.runtime_id, container_dir, cancel).is_err()
-    {
+    if prior_caddy.is_some() && restart_service(ctx, runtime_id, container_dir, cancel).is_err() {
         return Error::SiteRecoveryFailed;
     }
     Error::SiteRolledBack
