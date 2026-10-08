@@ -11,7 +11,10 @@
 //! other entry, so no file is ever written through one. Regular files get
 //! their archived permission bits without setuid/setgid/sticky; ownership is
 //! left to the caller. `Limits` caps the entry count and the total file
-//! bytes, checked before each entry is written.
+//! bytes, checked before each entry is written. Modification times are
+//! restored (second precision from the header, finer when a PAX `mtime`
+//! record carries it) on files, symlinks and directories; directories last,
+//! after everything created inside them. A time that cannot be set is skipped.
 
 use std::{
     ffi::OsStr,
@@ -67,7 +70,9 @@ pub fn extract(
     let mut long_name: Option<Vec<u8>> = None;
     let mut long_link: Option<Vec<u8>> = None;
     let mut pax_size: Option<u64> = None;
-    let mut symlinks: Vec<(SiteRelativePath, PathBuf)> = Vec::new();
+    let mut pax_mtime: Option<(i64, u32)> = None;
+    let mut dir_times: Vec<(SiteRelativePath, (i64, u32))> = Vec::new();
+    let mut symlinks: Vec<(SiteRelativePath, PathBuf, Option<(i64, u32)>)> = Vec::new();
     let mut header = [0u8; BLOCK];
 
     loop {
@@ -102,6 +107,9 @@ pub fn extract(
                             long_link = Some(link);
                         }
                         pax_size = records.size;
+                        if records.mtime.is_some() {
+                            pax_mtime = records.mtime;
+                        }
                     }
                     _ => {} // Global PAX defaults: nothing this reader uses.
                 }
@@ -115,6 +123,9 @@ pub fn extract(
             .take()
             .unwrap_or_else(|| field(&header[157..257]).to_vec());
         let display = String::from_utf8_lossy(&raw_name).into_owned();
+        let mtime = pax_mtime
+            .take()
+            .or_else(|| parse_numeric(&header[136..148]).ok().map(|s| (s as i64, 0)));
 
         summary.entries += 1;
         if summary.entries > limits.max_entries {
@@ -142,6 +153,9 @@ pub fn extract(
                 skip_padding(&mut reader, size)?;
                 let mode = parse_numeric(&header[100..108])? as u32 & 0o777;
                 dest.set_mode(&name, mode)?;
+                if let Some((secs, nanos)) = mtime {
+                    let _ = dest.set_modified_nofollow(&name, secs, nanos);
+                }
             }
             b'5' => {
                 if size != 0 {
@@ -149,6 +163,9 @@ pub fn extract(
                 }
                 if let Some(name) = name {
                     dest.create_dir_all(&name)?;
+                    if let Some(time) = mtime {
+                        dir_times.push((name, time));
+                    }
                 }
             }
             b'2' => {
@@ -161,17 +178,24 @@ pub fn extract(
                 }
                 skip_data(&mut reader, size)?;
                 summary.symlinks += 1;
-                symlinks.push((name, target));
+                symlinks.push((name, target, mtime));
             }
             _ => return Err(ExtractError::Unsafe(display)),
         }
     }
 
-    for (link, target) in symlinks {
+    for (link, target, mtime) in symlinks {
         if let Some(parent) = parent_of(&link) {
             dest.create_dir_all(&parent)?;
         }
         dest.symlink_relative(&link, &target)?;
+        if let Some((secs, nanos)) = mtime {
+            let _ = dest.set_modified_nofollow(&link, secs, nanos);
+        }
+    }
+    // Deepest first: setting a child's time must not disturb its parent's.
+    for (dir, (secs, nanos)) in dir_times.into_iter().rev() {
+        let _ = dest.set_modified_nofollow(&dir, secs, nanos);
     }
     Ok(summary)
 }
@@ -290,6 +314,23 @@ struct PaxRecords {
     path: Option<Vec<u8>>,
     linkpath: Option<Vec<u8>>,
     size: Option<u64>,
+    mtime: Option<(i64, u32)>,
+}
+
+/// `"<seconds>[.<fraction>]"` as PAX writes it; a bad value is ignored.
+fn parse_pax_time(value: &[u8]) -> Option<(i64, u32)> {
+    let text = std::str::from_utf8(value).ok()?;
+    let (secs, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let secs: i64 = secs.parse().ok()?;
+    if secs < 0 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits: String = fraction
+        .chars()
+        .chain("000000000".chars())
+        .take(9)
+        .collect();
+    Some((secs, digits.parse().ok()?))
 }
 
 /// `"<len> <key>=<value>\n"` records.
@@ -323,6 +364,7 @@ fn parse_pax(mut data: &[u8]) -> Result<PaxRecords, ExtractError> {
                         .ok_or(ExtractError::Corrupt("bad PAX size"))?,
                 );
             }
+            b"mtime" => records.mtime = parse_pax_time(value),
             _ => {}
         }
         data = &data[length..];
@@ -390,11 +432,20 @@ mod tests {
         max_file_bytes: 1024 * 1024,
     };
 
+    const ARCHIVED_MTIME: u64 = 1_700_000_000;
+
+    fn mtime(path: &Path) -> (i64, i64) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::symlink_metadata(path).unwrap();
+        (meta.mtime(), meta.mtime_nsec())
+    }
+
     fn header(name: &str, typeflag: u8, size: u64, mode: u32, link: &str) -> [u8; BLOCK] {
         let mut block = [0u8; BLOCK];
         block[..name.len()].copy_from_slice(name.as_bytes());
         block[100..107].copy_from_slice(format!("{mode:07o}").as_bytes());
         block[124..135].copy_from_slice(format!("{size:011o}").as_bytes());
+        block[136..147].copy_from_slice(format!("{ARCHIVED_MTIME:011o}").as_bytes());
         block[156] = typeflag;
         block[157..157 + link.len()].copy_from_slice(link.as_bytes());
         block[257..263].copy_from_slice(b"ustar\0");
@@ -469,6 +520,60 @@ mod tests {
             fs::read_link(path.join("wp-content/link.php")).unwrap(),
             Path::new("../index.php")
         );
+    }
+
+    #[test]
+    fn restores_modification_times_on_files_symlinks_and_directories() {
+        let archive = Archive::new()
+            .entry("./", b'5', b"", 0o755, "")
+            .entry("./sub/", b'5', b"", 0o755, "")
+            .file("./sub/index.php", b"<?php")
+            .entry("./sub/link.php", b'2', b"", 0o777, "index.php")
+            .end();
+        let (result, path, _dir) = run(&archive);
+        result.unwrap();
+        let expected = (ARCHIVED_MTIME as i64, 0);
+        assert_eq!(mtime(&path.join("sub/index.php")), expected);
+        assert_eq!(
+            mtime(&path.join("sub/link.php")),
+            expected,
+            "the link itself"
+        );
+        assert_eq!(
+            mtime(&path.join("sub")),
+            expected,
+            "set after the entries created inside it"
+        );
+        assert_eq!(
+            mtime(&path.join("sub/index.php")),
+            expected,
+            "a symlink's time does not change its target"
+        );
+    }
+
+    #[test]
+    fn a_pax_mtime_record_carries_the_fraction() {
+        let body = "30 mtime=1700000000.123456789\n";
+        assert_eq!(body.len(), 30);
+        let archive = Archive::new()
+            .entry("PaxHeaders/x", b'x', body.as_bytes(), 0o644, "")
+            .file("precise.php", b"x")
+            .file("plain.php", b"x")
+            .end();
+        let (result, path, _dir) = run(&archive);
+        result.unwrap();
+        assert_eq!(
+            mtime(&path.join("precise.php")),
+            (ARCHIVED_MTIME as i64, 123_456_789)
+        );
+        assert_eq!(
+            mtime(&path.join("plain.php")),
+            (ARCHIVED_MTIME as i64, 0),
+            "the record applies to one entry only"
+        );
+        assert_eq!(parse_pax_time(b"12.5"), Some((12, 500_000_000)));
+        assert_eq!(parse_pax_time(b"-1"), None);
+        assert_eq!(parse_pax_time(b"1.x"), None);
     }
 
     #[test]
