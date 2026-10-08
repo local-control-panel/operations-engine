@@ -1038,6 +1038,35 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Archive one site root (SHA-256 manifest) for a server-to-server sync.
+    /// Never changes the site.
+    ExportArchive {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Replace a site root with a verified archive, keeping the previous state
+    /// as a snapshot and restoring it on failure.
+    ImportArchive {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove one site archive export or one destination snapshot.
+    DiscardArchive {
+        #[arg(long)]
+        kind: String,
+        #[arg(long = "archive-id")]
+        archive_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
     /// Change the document root of a site's identity record.
     UpdateIdentity {
         #[arg(long = "runtime-id")]
@@ -1088,6 +1117,9 @@ impl SiteCommand {
             Self::ReleaseIdentity { .. } => "site.releaseIdentity",
             Self::UpdateIdentity { .. } => "site.updateIdentity",
             Self::RenameIdentity { .. } => "site.renameIdentity",
+            Self::ExportArchive { .. } => "site.exportArchive",
+            Self::ImportArchive { .. } => "site.importArchive",
+            Self::DiscardArchive { .. } => "site.discardArchive",
         }
     }
 }

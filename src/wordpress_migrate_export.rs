@@ -470,7 +470,10 @@ pub fn discard(engine_state: &ManagedRoot, req: &DiscardRequest) -> Result<Disca
 }
 
 /// The source root as a canonical, real directory inside the content root.
-fn resolve_source(content_root: &TrustedRoot, source_root: &Path) -> Result<PathBuf, Error> {
+pub(crate) fn resolve_source(
+    content_root: &TrustedRoot,
+    source_root: &Path,
+) -> Result<PathBuf, Error> {
     let relative = source_root
         .strip_prefix(content_root.as_path())
         .ok()
@@ -496,14 +499,14 @@ fn resolve_source(content_root: &TrustedRoot, source_root: &Path) -> Result<Path
     Ok(resolved)
 }
 
-enum ScanError {
+pub(crate) enum ScanError {
     Io(io::Error),
     Unsafe(UnsafeContent),
 }
 
 /// Walks `root` without following symlinks and returns the number of
 /// entries and the total regular-file bytes, or the first rule it breaks.
-fn scan_tree(root: &Path) -> Result<(u64, u64), ScanError> {
+pub(crate) fn scan_tree(root: &Path) -> Result<(u64, u64), ScanError> {
     let mut entries = 0u64;
     let mut bytes = 0u64;
     let mut stack = vec![PathBuf::new()];
@@ -574,7 +577,7 @@ pub fn symlink_stays_inside(link: &Path, target: &Path) -> bool {
     true
 }
 
-fn artifact_info(export_dir: &Path, file: &str) -> Result<ArtifactInfo, Error> {
+pub(crate) fn artifact_info(export_dir: &Path, file: &str) -> Result<ArtifactInfo, Error> {
     let (bytes, sha256) = sha256_file(&export_dir.join(file)).map_err(Error::Io)?;
     Ok(ArtifactInfo {
         file: file.to_owned(),
