@@ -724,6 +724,12 @@ mod tests {
     fn the_block_is_added_once_replaced_and_removed() {
         let base = "{\n    admin off\n}\n\nhttp://127.0.0.1:9000 {\n    root * /var/www/a\n    php_server\n}\n";
         let enabled = replace_error_pages_block(base, true).unwrap();
+        // The control panel pins this exact text too (its raw fallback for
+        // sites outside the content roots writes the same block).
+        assert_eq!(
+            enabled,
+            "{\n    admin off\n}\n\nhttp://127.0.0.1:9000 {\n    # wcp-error-pages-begin\n    intercept {\n        @wcp_not_found status 404\n        handle_response @wcp_not_found {\n            rewrite * /.wcp-errors/404.html\n            file_server\n        }\n        @wcp_server_error status 5xx\n        handle_response @wcp_server_error {\n            rewrite * /.wcp-errors/5xx.html\n            file_server\n        }\n    }\n    # wcp-error-pages-end\n    root * /var/www/a\n    php_server\n}\n"
+        );
         assert!(enabled.contains(ERROR_PAGES_BEGIN) && enabled.contains(ERROR_PAGES_END));
         assert!(enabled.contains("rewrite * /.wcp-errors/404.html"));
         assert!(enabled.contains("rewrite * /.wcp-errors/5xx.html"));
