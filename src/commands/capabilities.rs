@@ -131,6 +131,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "site.writeEnvFile",
                 "site.quarantineFile",
                 "site.phpInfoSession",
+                "site.probe",
                 "system.service",
                 "compose.action",
                 "compose.remove",

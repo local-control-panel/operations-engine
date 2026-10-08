@@ -532,11 +532,12 @@ fn remove_phpinfo_files(dir: &ManagedRoot) -> Result<u32, Error> {
     Ok(removed)
 }
 
-fn php_info(
+/// Opens `<content root>/<names...>` without following a symlink at any
+/// level.
+fn walk_directory(
     content_root: &TrustedRoot,
     names: &[SiteRelativePath],
-    req: &PhpInfoRequest,
-) -> Result<PhpInfoResult, Error> {
+) -> Result<ManagedRoot, Error> {
     crate::site_root::refuse_system_dir(content_root)?;
     let mut dir = ManagedRoot::open(content_root).map_err(Error::Io)?;
     for name in names {
@@ -550,6 +551,25 @@ fn php_info(
         }
         dir = dir.open_child_dir_nofollow(name).map_err(open_error)?;
     }
+    Ok(dir)
+}
+
+/// The site directory `path` below one of `content_roots`, opened without
+/// following a symlink.
+pub(crate) fn open_site_directory(
+    content_roots: &[TrustedRoot],
+    path: &Path,
+) -> Result<ManagedRoot, Error> {
+    let (content_root, names) = split_directory(content_roots, path)?;
+    walk_directory(content_root, &names)
+}
+
+fn php_info(
+    content_root: &TrustedRoot,
+    names: &[SiteRelativePath],
+    req: &PhpInfoRequest,
+) -> Result<PhpInfoResult, Error> {
+    let dir = walk_directory(content_root, names)?;
 
     let removed = remove_phpinfo_files(&dir)?;
     let now = unix_now_secs();

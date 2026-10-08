@@ -350,6 +350,8 @@ pub enum Stage {
     RestartService,
     SiteProbe,
     StopService,
+    /// The request `site.probe` makes through the pool.
+    ApplicationProbe,
 }
 
 impl Stage {
@@ -366,6 +368,7 @@ impl Stage {
             Self::RestartService => "the site process could not be restarted",
             Self::SiteProbe => "the site process did not become ready",
             Self::StopService => "the site process could not be stopped",
+            Self::ApplicationProbe => "the probe request to the site failed",
         }
     }
 }
@@ -393,6 +396,11 @@ pub enum Error {
     /// previous config also failed. The site is left down and needs manual
     /// recovery.
     SiteRecoveryFailed,
+    /// `site.probe`: the site directory could not be opened safely.
+    SiteDirectory(crate::site_root::Error),
+    /// `site.probe`: the page answered, but not with what the probe expects
+    /// (wrong document root, a PHP error page, OPcache not available).
+    ProbeUnexpected(&'static str),
     PostCommit(serde_json::Value),
     Replayed {
         code: ErrorCode,
@@ -446,6 +454,8 @@ impl Error {
                 ErrorCode::ConfigRecoveryFailed,
                 "the site process failed and restoring the previous config also failed".into(),
             ),
+            Self::SiteDirectory(error) => error.protocol(),
+            Self::ProbeUnexpected(message) => (ErrorCode::SubprocessFailed, (*message).to_owned()),
             Self::Replayed { code, message } => (*code, message.clone()),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit(_) => {
                 (ErrorCode::Internal, "internal stack service error".into())
@@ -1337,7 +1347,7 @@ fn count_site_configs(runtime_root: &TrustedRoot, runtime_id: &RuntimeId) -> Res
         .count())
 }
 
-fn compose(
+pub(crate) fn compose(
     ctx: &Context<'_>,
     stage: Stage,
     tail: &[&str],
@@ -1391,7 +1401,7 @@ fn docker(
 
 /// Stack lock, then this scope's preflight (lock + idempotency), then
 /// `body`, then the transaction record and audit entry.
-fn run_admitted<T, F>(
+pub(crate) fn run_admitted<T, F>(
     ctx: &Context<'_>,
     operation: &'static str,
     request_id: RequestId,

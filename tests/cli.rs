@@ -141,6 +141,7 @@ fn capabilities_describe_only_implemented_operations() {
             "site.writeEnvFile",
             "site.quarantineFile",
             "site.phpInfoSession",
+            "site.probe",
             "system.service",
             "compose.action",
             "compose.remove"

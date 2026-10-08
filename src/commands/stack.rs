@@ -104,6 +104,21 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        StackCommand::ProbeSite {
+            kind,
+            service,
+            domain,
+            root,
+            request_id,
+            idempotency_key,
+        } => probe_site(
+            &kind,
+            &service,
+            &domain,
+            &root,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         StackCommand::RemoveSiteService {
             runtime_id,
             domain,
@@ -116,6 +131,41 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
             idempotency_key.as_deref(),
         ),
     }
+}
+
+fn probe_site(
+    kind: &str,
+    service: &str,
+    domain: &str,
+    root: &str,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_probe::{OPERATION, ProbeRequest, probe_site};
+
+    let content_roots = match load_content_roots(OPERATION) {
+        Ok(roots) => roots,
+        Err(response) => return Ok(response),
+    };
+    let request = match ProbeRequest::parse(
+        kind,
+        service,
+        domain,
+        root,
+        &content_roots,
+        request_id,
+        idempotency_key,
+    ) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                OPERATION,
+                ErrorCode::InvalidInput,
+                error.message(),
+            ));
+        }
+    };
+    run_service_operation(OPERATION, |ctx, cancel| probe_site(ctx, &request, cancel))
 }
 
 fn remove_site_service(
