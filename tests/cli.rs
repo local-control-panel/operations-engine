@@ -140,6 +140,7 @@ fn capabilities_describe_only_implemented_operations() {
             "docker.volumeRemove",
             "site.writeEnvFile",
             "site.quarantineFile",
+            "site.phpInfoSession",
             "system.service",
             "compose.action",
             "compose.remove"

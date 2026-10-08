@@ -238,7 +238,7 @@ impl Error {
             Self::FileMissing => (ErrorCode::NotFound, "no such file".into()),
             Self::OutsideContentRoot => (
                 ErrorCode::InvalidInput,
-                "the path is not a file inside a site directory of a content root".into(),
+                "the path is not inside a site directory of a content root".into(),
             ),
             Self::FileTooLarge => (
                 ErrorCode::InvalidInput,
