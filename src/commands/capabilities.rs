@@ -130,6 +130,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "docker.volumeRemove",
                 "site.writeEnvFile",
                 "site.quarantineFile",
+                "site.phpInfoSession",
                 "system.service",
                 "compose.action",
                 "compose.remove",

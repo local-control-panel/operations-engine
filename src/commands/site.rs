@@ -60,6 +60,19 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => write_env_file(&request_file, &request_id, idempotency_key.as_deref()),
+        SiteCommand::PhpInfoSession {
+            action,
+            directory,
+            ttl_minutes,
+            request_id,
+            idempotency_key,
+        } => php_info_session(
+            &action,
+            &directory,
+            ttl_minutes,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SiteCommand::QuarantineFile {
             path,
             request_id,
@@ -866,6 +879,48 @@ fn write_env_file(
             "site.writeEnvFile",
             ErrorCode::UnsupportedPlatform,
             "site.writeEnvFile requires a Unix host",
+        ))
+    }
+}
+
+fn php_info_session(
+    action: &str,
+    directory: &str,
+    ttl_minutes: Option<u32>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::site_file::{PHPINFO_OPERATION, PhpInfoRequest};
+
+        let request = match PhpInfoRequest::parse(
+            directory,
+            action,
+            ttl_minutes,
+            request_id,
+            idempotency_key,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    PHPINFO_OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        run_site_root(PHPINFO_OPERATION, |engine_state, config| {
+            crate::site_file::php_info_session(engine_state, &config.content_roots, &request)
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (action, directory, ttl_minutes, request_id, idempotency_key);
+        Ok(Response::failure(
+            "site.phpInfoSession",
+            ErrorCode::UnsupportedPlatform,
+            "site.phpInfoSession requires a Unix host",
         ))
     }
 }

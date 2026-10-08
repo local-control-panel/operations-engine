@@ -866,6 +866,23 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Start or end a phpinfo session in a site directory: a
+    /// `_phpinfo_<token>.php` page that expires and deletes itself.
+    PhpInfoSession {
+        /// `enable` or `disable`.
+        #[arg(long)]
+        action: String,
+        /// Absolute path of a site directory below a content root.
+        #[arg(long)]
+        directory: String,
+        /// Lifetime for `enable`, 1 to 240 minutes.
+        #[arg(long = "ttl-minutes")]
+        ttl_minutes: Option<u32>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Move a file below a site directory of a content root into the
     /// engine's quarantine directory, with a manifest.
     QuarantineFile {
@@ -1032,6 +1049,7 @@ impl SiteCommand {
             Self::RemoveRoot { .. } => "site.removeRoot",
             Self::WriteEnvFile { .. } => "site.writeEnvFile",
             Self::QuarantineFile { .. } => "site.quarantineFile",
+            Self::PhpInfoSession { .. } => "site.phpInfoSession",
             Self::ReleaseRoot { .. } => "site.releaseRoot",
             Self::RenameManifest { .. } => "site.renameManifest",
             Self::Enroll { .. } => "site.enroll",

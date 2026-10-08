@@ -27,6 +27,18 @@
 //!
 //! The content arrives in a staged, root-owned request file, never in argv.
 //!
+//! # `site.phpInfoSession` (milestone 074)
+//!
+//! `phpinfo()` prints the process environment, i.e. a site's secrets, so the
+//! page the panel offers for a few minutes must not outlive the panel. The
+//! engine writes `_phpinfo_<token>.php` into a site directory with its
+//! expiry compiled into the file: after the deadline it answers 404 and
+//! deletes itself on the first request, with no daemon or cron entry needed,
+//! and `disable` (and the next `enable`) remove every such file. One session
+//! per directory. The file is a regular file owned by the directory's owner,
+//! `0644`, found by exact name pattern; symlinks are never followed or
+//! removed.
+//!
 //! # `site.quarantineFile`
 //!
 //! The file is streamed into `<state root>/site-file/quarantine` as
@@ -59,6 +71,7 @@ use crate::{
 
 pub const ENV_OPERATION: &str = "site.writeEnvFile";
 pub const QUARANTINE_OPERATION: &str = "site.quarantineFile";
+pub const PHPINFO_OPERATION: &str = "site.phpInfoSession";
 
 const SCOPE: &str = "site-file";
 const QUARANTINE_DIR: &str = "site-file/quarantine";
@@ -67,6 +80,10 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_COMPONENTS: usize = 16;
 const MAX_QUARANTINE_BYTES: u64 = 512 * 1024 * 1024;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+const PHPINFO_PREFIX: &str = "_phpinfo_";
+const PHPINFO_SUFFIX: &str = ".php";
+const PHPINFO_MIN_TTL_MINUTES: u32 = 1;
+const PHPINFO_MAX_TTL_MINUTES: u32 = 240;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestError {
@@ -75,6 +92,8 @@ pub enum RequestError {
     InvalidFileName,
     InvalidContent,
     InvalidHash,
+    InvalidAction,
+    InvalidTtl,
     InvalidRequestId,
     InvalidIdempotencyKey,
 }
@@ -87,6 +106,8 @@ impl RequestError {
             Self::InvalidFileName => "the file name must be .env, *.env or .env.*",
             Self::InvalidContent => "content must be at most 256 KiB and contain no NUL",
             Self::InvalidHash => "expectedHash must be 64 hexadecimal digits",
+            Self::InvalidAction => "action must be enable (with ttl-minutes) or disable",
+            Self::InvalidTtl => "ttl-minutes must be between 1 and 240",
             Self::InvalidRequestId => "request-id must be a canonical UUID",
             Self::InvalidIdempotencyKey => "idempotency-key is invalid",
         }
@@ -200,6 +221,62 @@ impl QuarantineRequest {
             idempotency_key,
         })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhpInfoAction {
+    Enable { ttl_minutes: u32 },
+    Disable,
+}
+
+#[derive(Debug)]
+pub struct PhpInfoRequest {
+    pub directory: PathBuf,
+    pub action: PhpInfoAction,
+    pub request_id: RequestId,
+    pub idempotency_key: Option<IdempotencyKey>,
+}
+
+impl PhpInfoRequest {
+    pub fn parse(
+        directory: &str,
+        action: &str,
+        ttl_minutes: Option<u32>,
+        request_id: &str,
+        key: Option<&str>,
+    ) -> Result<Self, RequestError> {
+        let directory = parse_path(directory)?;
+        let action = match (action, ttl_minutes) {
+            ("enable", Some(ttl))
+                if (PHPINFO_MIN_TTL_MINUTES..=PHPINFO_MAX_TTL_MINUTES).contains(&ttl) =>
+            {
+                PhpInfoAction::Enable { ttl_minutes: ttl }
+            }
+            ("enable", _) => return Err(RequestError::InvalidTtl),
+            ("disable", None) => PhpInfoAction::Disable,
+            _ => return Err(RequestError::InvalidAction),
+        };
+        let (request_id, idempotency_key) = parse_ids(request_id, key)?;
+        Ok(Self {
+            directory: directory.to_owned(),
+            action,
+            request_id,
+            idempotency_key,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhpInfoResult {
+    /// `enable` or `disable`.
+    pub action: String,
+    pub token: Option<String>,
+    pub file_name: Option<String>,
+    pub expires_at_unix_secs: Option<u64>,
+    /// Session files removed (older sessions on `enable`, all on `disable`).
+    pub removed: u32,
+    pub completed_at_unix_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +458,143 @@ fn write_env(
         previous_sha256: previous.map(|hash| hash.to_string()),
         mode,
         completed_at_unix_secs: unix_now_secs(),
+    })
+}
+
+/// Starts (`enable`) or ends (`disable`) the phpinfo session of a site
+/// directory.
+pub fn php_info_session(
+    engine_state: &ManagedRoot,
+    content_roots: &[TrustedRoot],
+    req: &PhpInfoRequest,
+) -> Result<PhpInfoResult, Error> {
+    let (content_root, names) = split_directory(content_roots, &req.directory)?;
+    let lock = content_root.as_path().join(names[0].as_path());
+    transact_in(
+        SCOPE,
+        engine_state,
+        PHPINFO_OPERATION,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        &[lock.as_path()],
+        || php_info(content_root, &names, req),
+    )
+}
+
+/// The content root a directory is in and its components below it (at least
+/// the site directory itself).
+fn split_directory<'a>(
+    content_roots: &'a [TrustedRoot],
+    path: &Path,
+) -> Result<(&'a TrustedRoot, Vec<SiteRelativePath>), Error> {
+    for root in content_roots {
+        let Ok(rest) = path.strip_prefix(root.as_path()) else {
+            continue;
+        };
+        let mut names = Vec::new();
+        for component in rest.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(Error::OutsideContentRoot);
+            };
+            names.push(SiteRelativePath::parse(name).map_err(|_| Error::OutsideContentRoot)?);
+        }
+        if names.is_empty() || names.len() > MAX_COMPONENTS {
+            return Err(Error::OutsideContentRoot);
+        }
+        return Ok((root, names));
+    }
+    Err(Error::OutsideContentRoot)
+}
+
+/// `_phpinfo_<32 hex>.php` and nothing else.
+fn is_phpinfo_file_name(name: &str) -> bool {
+    name.strip_prefix(PHPINFO_PREFIX)
+        .and_then(|rest| rest.strip_suffix(PHPINFO_SUFFIX))
+        .is_some_and(|token| {
+            token.len() == 32
+                && token
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
+fn remove_phpinfo_files(dir: &ManagedRoot) -> Result<u32, Error> {
+    let mut removed = 0;
+    for name in dir.file_names().map_err(Error::Io)? {
+        if is_phpinfo_file_name(&name) {
+            let name = SiteRelativePath::parse(&name).expect("a token name is one component");
+            // `file_names` lists regular files only, so a symlink with a
+            // matching name is neither followed nor removed.
+            dir.remove_file(&name).map_err(Error::Io)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn php_info(
+    content_root: &TrustedRoot,
+    names: &[SiteRelativePath],
+    req: &PhpInfoRequest,
+) -> Result<PhpInfoResult, Error> {
+    crate::site_root::refuse_system_dir(content_root)?;
+    let mut dir = ManagedRoot::open(content_root).map_err(Error::Io)?;
+    for name in names {
+        match dir.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(Error::UnsafePath),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(Error::FileMissing);
+            }
+            Err(error) => return Err(Error::Io(error)),
+        }
+        dir = dir.open_child_dir_nofollow(name).map_err(open_error)?;
+    }
+
+    let removed = remove_phpinfo_files(&dir)?;
+    let now = unix_now_secs();
+    let PhpInfoAction::Enable { ttl_minutes } = req.action else {
+        return Ok(PhpInfoResult {
+            action: "disable".into(),
+            token: None,
+            file_name: None,
+            expires_at_unix_secs: None,
+            removed,
+            completed_at_unix_secs: now,
+        });
+    };
+
+    let expires = now + u64::from(ttl_minutes) * 60;
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let file_name = format!("{PHPINFO_PREFIX}{token}{PHPINFO_SUFFIX}");
+    // Past the deadline the page answers 404 and removes itself.
+    let body = format!(
+        "<?php if (time() > {expires}) {{ @unlink(__FILE__); http_response_code(404); exit; }} phpinfo();\n"
+    );
+    let owner = dir.own_metadata().map_err(Error::Io)?;
+    let name = SiteRelativePath::parse(&file_name).expect("a generated name is one component");
+    let temp = SiteRelativePath::parse(format!(".{file_name}.wcp-{}.tmp", req.request_id))
+        .map_err(|_| Error::Io(io::Error::other("invalid temporary file name")))?;
+    let staged = (|| -> io::Result<()> {
+        let mut file = dir.create_new_file_with_mode(&temp, 0o600)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        dir.chown(&temp, owner.uid(), owner.gid())?;
+        dir.set_mode(&temp, 0o644)?;
+        dir.rename(&temp, &name)
+    })();
+    if let Err(error) = staged {
+        let _ = dir.remove_file(&temp);
+        return Err(Error::Io(error));
+    }
+    Ok(PhpInfoResult {
+        action: "enable".into(),
+        token: Some(token),
+        file_name: Some(file_name),
+        expires_at_unix_secs: Some(expires),
+        removed,
+        completed_at_unix_secs: now,
     })
 }
 
@@ -996,5 +1210,174 @@ mod tests {
         let first = quarantine_file(&f.state(), &f.roots, &req).unwrap();
         let again = quarantine_file(&f.state(), &f.roots, &req).unwrap();
         assert_eq!(first.quarantine_file, again.quarantine_file);
+    }
+
+    fn phpinfo(
+        f: &Fixture,
+        dir: &Path,
+        action: &str,
+        ttl: Option<u32>,
+        id: &str,
+    ) -> Result<PhpInfoResult, Error> {
+        php_info_session(
+            &f.state(),
+            &f.roots,
+            &PhpInfoRequest::parse(dir.to_str().unwrap(), action, ttl, id, None).unwrap(),
+        )
+    }
+
+    fn phpinfo_files(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("_phpinfo_"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn phpinfo_request_validation() {
+        let p = |action: &str, ttl: Option<u32>| {
+            PhpInfoRequest::parse("/var/www/a", action, ttl, ID1, None).map(|_| ())
+        };
+        assert_eq!(p("enable", Some(15)), Ok(()));
+        assert_eq!(p("enable", Some(1)), Ok(()));
+        assert_eq!(p("enable", Some(240)), Ok(()));
+        assert_eq!(p("disable", None), Ok(()));
+        assert_eq!(p("enable", None), Err(RequestError::InvalidTtl));
+        assert_eq!(p("enable", Some(0)), Err(RequestError::InvalidTtl));
+        assert_eq!(p("enable", Some(241)), Err(RequestError::InvalidTtl));
+        assert_eq!(p("disable", Some(5)), Err(RequestError::InvalidAction));
+        assert_eq!(p("show", None), Err(RequestError::InvalidAction));
+        assert!(is_phpinfo_file_name(&format!(
+            "_phpinfo_{}.php",
+            "a".repeat(32)
+        )));
+        for bad in [
+            "_phpinfo_.php",
+            "_phpinfo_abc.php",
+            "x_phpinfo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.php",
+            "_phpinfo_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.php",
+            "_phpinfo_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.php.bak",
+        ] {
+            assert!(!is_phpinfo_file_name(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn enable_writes_a_self_expiring_page_owned_by_the_directory() {
+        let f = Fixture::new();
+        let dir = f.www("site-a");
+        let done = phpinfo(&f, &dir, "enable", Some(15), ID1).unwrap();
+        let name = done.file_name.clone().unwrap();
+        assert_eq!(
+            name,
+            format!("_phpinfo_{}.php", done.token.clone().unwrap())
+        );
+        assert_eq!(
+            done.expires_at_unix_secs,
+            Some(done.completed_at_unix_secs + 900)
+        );
+        assert_eq!(phpinfo_files(&dir), [name.clone()]);
+        let body = fs::read_to_string(dir.join(&name)).unwrap();
+        assert!(body.starts_with(&format!(
+            "<?php if (time() > {}) {{ @unlink(__FILE__);",
+            done.expires_at_unix_secs.unwrap()
+        )));
+        assert!(
+            body.contains("http_response_code(404)") && body.trim_end().ends_with("phpinfo();")
+        );
+        let meta = fs::metadata(dir.join(&name)).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        let owner = fs::metadata(&dir).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (owner.uid(), owner.gid()));
+        assert!(
+            !fs::read_dir(&dir).unwrap().any(|e| e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp"))
+        );
+    }
+
+    #[test]
+    fn a_second_enable_replaces_the_first_session() {
+        let f = Fixture::new();
+        let dir = f.www("site-a/sub");
+        let first = phpinfo(&f, &dir, "enable", Some(5), ID1).unwrap();
+        let second = phpinfo(&f, &dir, "enable", Some(5), ID2).unwrap();
+        assert_eq!(second.removed, 1);
+        assert_ne!(first.token, second.token);
+        assert_eq!(phpinfo_files(&dir), [second.file_name.unwrap()]);
+    }
+
+    #[test]
+    fn disable_removes_only_session_files() {
+        let f = Fixture::new();
+        let dir = f.www("site-a");
+        phpinfo(&f, &dir, "enable", Some(5), ID1).unwrap();
+        let stray = format!("_phpinfo_{}.php", "b".repeat(32));
+        fs::write(dir.join(&stray), "<?php phpinfo();").unwrap();
+        fs::write(dir.join("index.php"), "keep").unwrap();
+        fs::write(dir.join("_phpinfo_notes.php"), "keep").unwrap();
+        fs::write(f.dir.path().join("elsewhere/outside"), "keep").unwrap();
+        symlink(
+            f.dir.path().join("elsewhere/outside"),
+            dir.join(format!("_phpinfo_{}.php", "c".repeat(32))),
+        )
+        .unwrap();
+        let done = phpinfo(&f, &dir, "disable", None, ID2).unwrap();
+        assert_eq!(done.removed, 2, "the engine's file and an orphan");
+        assert_eq!(done.token, None);
+        let left = phpinfo_files(&dir);
+        assert!(left.contains(&"_phpinfo_notes.php".to_owned()), "{left:?}");
+        assert!(
+            left.contains(&format!("_phpinfo_{}.php", "c".repeat(32))),
+            "a symlink is never removed"
+        );
+        assert!(!left.contains(&stray));
+        assert!(dir.join("index.php").exists());
+        assert_eq!(
+            fs::read_to_string(f.dir.path().join("elsewhere/outside")).unwrap(),
+            "keep"
+        );
+        // Disabling again is a no-op.
+        assert_eq!(phpinfo(&f, &dir, "disable", None, ID3).unwrap().removed, 0);
+    }
+
+    #[test]
+    fn phpinfo_refuses_unsafe_directories() {
+        let f = Fixture::new();
+        symlink(f.dir.path().join("elsewhere"), f.www("site-c")).unwrap();
+        let err = phpinfo(&f, &f.www("site-c"), "enable", Some(5), ID1).unwrap_err();
+        assert!(matches!(err, Error::UnsafePath));
+        assert!(phpinfo_files(&f.dir.path().join("elsewhere")).is_empty());
+        for (i, path) in [
+            PathBuf::from("/etc"),
+            f.dir.path().join("www"),
+            f.www("site-a/../../elsewhere"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("123e4567-e89b-12d3-a456-4266141740{:02}", 40 + i);
+            let err = phpinfo(&f, &path, "enable", Some(5), &id).unwrap_err();
+            assert!(matches!(err, Error::OutsideContentRoot), "{path:?}");
+        }
+        let err = phpinfo(&f, &f.www("site-a/nope"), "enable", Some(5), ID2).unwrap_err();
+        assert!(matches!(err, Error::FileMissing));
+    }
+
+    #[test]
+    fn phpinfo_enable_replays_with_the_same_token() {
+        let f = Fixture::new();
+        let dir = f.www("site-a");
+        let req = PhpInfoRequest::parse(dir.to_str().unwrap(), "enable", Some(5), ID1, Some("k"))
+            .unwrap();
+        let first = php_info_session(&f.state(), &f.roots, &req).unwrap();
+        let again = php_info_session(&f.state(), &f.roots, &req).unwrap();
+        assert_eq!(first.token, again.token);
+        assert_eq!(phpinfo_files(&dir).len(), 1);
     }
 }
