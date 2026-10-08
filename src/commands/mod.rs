@@ -96,6 +96,16 @@ pub(crate) fn read_content_file(path: &std::path::Path) -> Result<String, Conten
 pub(crate) fn read_root_owned_content_file(
     path: &std::path::Path,
 ) -> Result<String, ContentFileError> {
+    read_root_owned_content_file_bounded(path, MAX_CONTENT_BYTES)
+}
+
+/// `read_root_owned_content_file` with a caller-chosen bound, for the request
+/// documents that legitimately carry more than a config fragment.
+#[cfg(unix)]
+pub(crate) fn read_root_owned_content_file_bounded(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> Result<String, ContentFileError> {
     use std::io::Read as _;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -110,10 +120,10 @@ pub(crate) fn read_root_owned_content_file(
     }
     let mut content = String::new();
     let read = file
-        .take(MAX_CONTENT_BYTES as u64 + 1)
+        .take(max_bytes as u64 + 1)
         .read_to_string(&mut content)
         .map_err(|_| ContentFileError::Unreadable)?;
-    if read > MAX_CONTENT_BYTES {
+    if read > max_bytes {
         return Err(ContentFileError::TooLarge);
     }
     Ok(content)

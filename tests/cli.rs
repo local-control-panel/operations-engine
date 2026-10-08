@@ -142,6 +142,7 @@ fn capabilities_describe_only_implemented_operations() {
             "site.quarantineFile",
             "site.phpInfoSession",
             "site.probe",
+            "site.setErrorPages",
             "system.service",
             "compose.action",
             "compose.remove"

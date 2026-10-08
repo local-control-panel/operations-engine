@@ -119,6 +119,11 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        StackCommand::SetErrorPages {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => set_error_pages(&request_file, &request_id, idempotency_key.as_deref()),
         StackCommand::RemoveSiteService {
             runtime_id,
             domain,
@@ -132,6 +137,58 @@ pub fn run(command: StackCommand) -> Result<Response, ResponseBuildError> {
         ),
     }
 }
+
+fn set_error_pages(
+    request_file: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::{
+        commands::{ContentFileError, read_root_owned_content_file_bounded},
+        site_error_pages::{OPERATION, SetErrorPagesRequest, set_error_pages},
+    };
+
+    // Two pages of 128 KiB each, plus JSON escaping, do not fit the 256 KiB
+    // that config fragments are limited to.
+    let json = match read_root_owned_content_file_bounded(request_file, REQUEST_FILE_MAX_BYTES) {
+        Ok(json) => json,
+        Err(ContentFileError::TooLarge) => {
+            return Ok(Response::failure(
+                OPERATION,
+                ErrorCode::InvalidInput,
+                "request-file exceeds the maximum allowed size",
+            ));
+        }
+        Err(ContentFileError::Unreadable) => {
+            return Ok(Response::failure(
+                OPERATION,
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            ));
+        }
+    };
+    let content_roots = match load_content_roots(OPERATION) {
+        Ok(roots) => roots,
+        Err(response) => return Ok(response),
+    };
+    let request =
+        match SetErrorPagesRequest::parse(&json, &content_roots, request_id, idempotency_key) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+    run_service_operation(OPERATION, |ctx, cancel| {
+        set_error_pages(ctx, &request, cancel)
+    })
+}
+
+/// `site.setErrorPages` carries two HTML pages of up to 128 KiB each.
+const REQUEST_FILE_MAX_BYTES: usize = 1024 * 1024;
 
 fn probe_site(
     kind: &str,

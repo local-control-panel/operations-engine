@@ -1492,9 +1492,6 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
-    /// Stop one site's s6-supervised process, remove its service directory
-    /// under `siteServicesRoot` and drop it from the pool's s6-svscan, under
-    /// the shared stack lock. A site with no service directory is a no-op.
     /// Run one fixed probe (`applicationToken`, `opcacheStatus` or
     /// `opcacheReset`) against a site through its runtime pool: a short-lived
     /// PHP file in the site's webroot is fetched with `curl` and removed.
@@ -1514,11 +1511,27 @@ pub enum StackCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Stop one site's s6-supervised process, remove its service directory
+    /// under `siteServicesRoot` and drop it from the pool's s6-svscan, under
+    /// the shared stack lock. A site with no service directory is a no-op.
     RemoveSiteService {
         #[arg(long = "runtime-id")]
         runtime_id: String,
         #[arg(long = "domain")]
         domain: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Install (`enabled`) or take out a site's custom 404 and 5xx pages: the
+    /// two HTML files in `<root>/.wcp-errors` and the marked block in the
+    /// site's process Caddyfile, as one operation that puts the files back if
+    /// the config does not activate. The request (including the HTML) comes
+    /// from a root-owned request file.
+    SetErrorPages {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
         #[arg(long = "request-id")]
         request_id: String,
         #[arg(long = "idempotency-key")]
@@ -1539,6 +1552,7 @@ impl StackCommand {
             Self::ActivateSiteConfig { .. } => "stack.activateSiteConfig",
             Self::RemoveSiteService { .. } => "stack.removeSiteService",
             Self::ProbeSite { .. } => "site.probe",
+            Self::SetErrorPages { .. } => "site.setErrorPages",
         }
     }
 }
