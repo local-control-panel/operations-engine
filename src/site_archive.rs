@@ -314,8 +314,8 @@ pub fn export(
     req: &ExportRequest,
     cancel: &CancellationToken,
 ) -> Result<ExportResult, Error> {
-    let source = resolve_source(ctx.content_root, &req.source_root)
-        .map_err(|_| Error::SourceUnavailable)?;
+    let source =
+        resolve_source(ctx.content_root, &req.source_root).map_err(|_| Error::SourceUnavailable)?;
     let _resource_lock = resource_lock::acquire(ctx.engine_state, &req.source_root, req.request_id)
         .map_err(|_| Error::ResourceBusy)?;
     run_admitted(
@@ -468,6 +468,8 @@ pub fn export_rel(export_id: RequestId) -> SiteRelativePath {
 
 /// Refuses before anything is written when the filesystem holding `path` has
 /// less free space than `content_bytes` plus headroom.
+// The statvfs field widths differ between platforms (u32 on macOS, u64 on Linux).
+#[allow(clippy::unnecessary_cast)]
 pub(crate) fn ensure_space(path: &Path, content_bytes: u64) -> Result<(), Error> {
     use std::os::unix::ffi::OsStrExt;
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
@@ -490,7 +492,9 @@ pub(crate) fn ensure_space(path: &Path, content_bytes: u64) -> Result<(), Error>
     Ok(())
 }
 
-pub(crate) fn critical(output: Result<process::ProcessOutput, ProcessRunError>) -> Result<(), Error> {
+pub(crate) fn critical(
+    output: Result<process::ProcessOutput, ProcessRunError>,
+) -> Result<(), Error> {
     let output = output.map_err(Error::Run)?;
     match process::error_code(&output.termination) {
         Some(code) => Err(Error::Rejected(code)),
@@ -595,7 +599,9 @@ where
     let loaded = state::load(scope, &rel(&format!("transactions/{original}.json")))
         .map_err(|error| Error::Io(io::Error::other(format!("{error:?}"))))?;
     if loaded.operation != operation {
-        return Err(Error::Io(io::Error::other("transaction operation mismatch")));
+        return Err(Error::Io(io::Error::other(
+            "transaction operation mismatch",
+        )));
     }
     match loaded.status {
         TransactionStatus::InProgress => Err(Error::ReplayInProgress),
@@ -720,7 +726,10 @@ mod tests {
         let result = export(&fx.ctx(), &fx.request("site.test", ID, None), &cancel()).unwrap();
 
         let dir = fx.export_dir(ID);
-        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         for file in [ARCHIVE_FILE, MANIFEST_FILE] {
             let mode = fs::metadata(dir.join(file)).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{file}");
@@ -733,7 +742,10 @@ mod tests {
         assert_eq!(result.manifest.export_id, ID);
         assert_eq!(result.manifest.entries, 1);
         assert_eq!(result.manifest.content_bytes, 13);
-        assert_eq!(result.archive_path, dir.join(ARCHIVE_FILE).to_string_lossy());
+        assert_eq!(
+            result.archive_path,
+            dir.join(ARCHIVE_FILE).to_string_lossy()
+        );
         let on_disk: Manifest =
             serde_json::from_slice(&fs::read(dir.join(MANIFEST_FILE)).unwrap()).unwrap();
         assert_eq!(on_disk, result.manifest);
@@ -749,9 +761,18 @@ mod tests {
     #[test]
     fn a_retry_with_the_same_key_replays_without_a_second_archive() {
         let fx = Fixture::new();
-        let first = export(&fx.ctx(), &fx.request("site.test", ID, Some("key-1")), &cancel()).unwrap();
-        let second =
-            export(&fx.ctx(), &fx.request("site.test", OTHER_ID, Some("key-1")), &cancel()).unwrap();
+        let first = export(
+            &fx.ctx(),
+            &fx.request("site.test", ID, Some("key-1")),
+            &cancel(),
+        )
+        .unwrap();
+        let second = export(
+            &fx.ctx(),
+            &fx.request("site.test", OTHER_ID, Some("key-1")),
+            &cancel(),
+        )
+        .unwrap();
         assert_eq!(first.manifest, second.manifest);
         assert_eq!(fx.tar_calls(), 1);
         assert!(!fx.export_dir(OTHER_ID).exists());
@@ -791,7 +812,10 @@ mod tests {
         .unwrap();
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         let error = export(&fx.ctx(), &fx.request("site.test", ID, None), &cancel()).unwrap_err();
-        assert!(matches!(error, Error::UnsafeContent(UnsafeContent::SpecialFile(_))));
+        assert!(matches!(
+            error,
+            Error::UnsafeContent(UnsafeContent::SpecialFile(_))
+        ));
         assert!(!fx.export_dir(ID).exists());
     }
 
@@ -828,12 +852,8 @@ mod tests {
     fn a_busy_root_stops_the_export() {
         let fx = Fixture::new();
         let root = fx.content.as_path().join("site.test");
-        let _held = resource_lock::acquire(
-            &fx.state,
-            &root,
-            RequestId::parse(OTHER_ID).unwrap(),
-        )
-        .unwrap();
+        let _held =
+            resource_lock::acquire(&fx.state, &root, RequestId::parse(OTHER_ID).unwrap()).unwrap();
         let error = export(&fx.ctx(), &fx.request("site.test", ID, None), &cancel()).unwrap_err();
         assert!(matches!(error, Error::ResourceBusy));
         assert_eq!(fx.tar_calls(), 0);
@@ -871,20 +891,26 @@ mod tests {
         let removed = discard(&fx.state, std::slice::from_ref(&fx.content), &first).unwrap();
         assert!(removed.removed);
         assert!(!fx.export_dir(ID).exists());
-        let again = DiscardRequest::parse(
-            "export",
-            ID,
-            "123e4567-e89b-12d3-a456-426614174002",
-        )
-        .unwrap();
-        assert!(!discard(&fx.state, std::slice::from_ref(&fx.content), &again).unwrap().removed);
+        let again =
+            DiscardRequest::parse("export", ID, "123e4567-e89b-12d3-a456-426614174002").unwrap();
+        assert!(
+            !discard(&fx.state, std::slice::from_ref(&fx.content), &again)
+                .unwrap()
+                .removed
+        );
     }
 
     #[test]
     fn discard_of_a_snapshot_removes_only_the_named_snapshot_directory() {
         let fx = Fixture::new();
-        let keep = fx.content.as_path().join(snapshot_dir_name(RequestId::parse(OTHER_ID).unwrap()));
-        let drop_dir = fx.content.as_path().join(snapshot_dir_name(RequestId::parse(ID).unwrap()));
+        let keep = fx
+            .content
+            .as_path()
+            .join(snapshot_dir_name(RequestId::parse(OTHER_ID).unwrap()));
+        let drop_dir = fx
+            .content
+            .as_path()
+            .join(snapshot_dir_name(RequestId::parse(ID).unwrap()));
         for dir in [&keep, &drop_dir] {
             fs::create_dir_all(dir.join("site")).unwrap();
             fs::write(dir.join("site/index.php"), "old").unwrap();

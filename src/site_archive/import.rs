@@ -34,8 +34,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    EXPORTS_DIR, Error, Manifest, MANIFEST_SCHEMA_VERSION, absolute_root, child, ensure_space,
-    ids, limits, rel, run_admitted, snapshot_dir_name, unix_now_secs,
+    EXPORTS_DIR, Error, MANIFEST_SCHEMA_VERSION, Manifest, absolute_root, child, ensure_space, ids,
+    limits, rel, run_admitted, snapshot_dir_name, unix_now_secs,
 };
 use crate::{
     filesystem::ManagedRoot,
@@ -152,7 +152,12 @@ pub fn execute(ctx: &Context<'_>, req: &Request) -> Result<ImportResult, Error> 
         req.request_id,
         req.idempotency_key.as_ref(),
         |scope| {
-            let file = verify_artifact(ctx, &artifact, &manifest.archive.sha256, manifest.archive.bytes)?;
+            let file = verify_artifact(
+                ctx,
+                &artifact,
+                &manifest.archive.sha256,
+                manifest.archive.bytes,
+            )?;
             import_with_recovery(ctx, req, scope, &relative, file)
         },
     );
@@ -362,5 +367,423 @@ impl Context<'_> {
     /// Absolute path of a file under the engine state, for plain reads.
     fn engine_state_path(&self, relative: &SiteRelativePath) -> PathBuf {
         self.state_root.join(relative)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::Write,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+
+    use flate2::{Compression, write::GzEncoder};
+
+    use super::*;
+    use crate::{
+        site_archive::{ARCHIVE_FILE, Manifest},
+        tar_extract::ExtractError,
+        wordpress_migrate_export::ArtifactInfo,
+    };
+
+    const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const SECOND_ID: &str = "123e4567-e89b-12d3-a456-426614174001";
+    const EXPORT_ID: &str = "123e4567-e89b-12d3-a456-426614174099";
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        base: PathBuf,
+        state: ManagedRoot,
+        state_root: TrustedRoot,
+        content: TrustedRoot,
+        artifacts: PathBuf,
+        uid: u32,
+        gid: u32,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            for sub in ["state", "www", "staging", "src"] {
+                fs::create_dir(base.join(sub)).unwrap();
+            }
+            Self {
+                state: ManagedRoot::open(&TrustedRoot::parse(base.join("state")).unwrap()).unwrap(),
+                state_root: TrustedRoot::parse(base.join("state")).unwrap(),
+                content: TrustedRoot::parse(base.join("www")).unwrap(),
+                artifacts: base.join("staging"),
+                uid: unsafe { libc::geteuid() },
+                gid: unsafe { libc::getegid() },
+                base,
+                _dir: dir,
+            }
+        }
+
+        fn ctx(&self) -> Context<'_> {
+            Context {
+                engine_state: &self.state,
+                state_root: &self.state_root,
+                content_root: &self.content,
+                artifact_dir: &self.artifacts,
+                artifact_owner_uid: self.uid,
+            }
+        }
+
+        fn site(&self) -> PathBuf {
+            self.content.as_path().join("dest.test")
+        }
+
+        fn existing_site(&self) {
+            fs::create_dir(self.site()).unwrap();
+            fs::set_permissions(self.site(), fs::Permissions::from_mode(0o750)).unwrap();
+            fs::write(self.site().join("index.php"), "<?php echo 'old';").unwrap();
+            fs::write(self.site().join("only-here.txt"), "dest only").unwrap();
+        }
+
+        /// Stages the archive of a small tree for request `id` and returns the
+        /// manifest that matches it; `tree` adds entries to the archived site.
+        fn stage(&self, id: &str, tree: impl Fn(&Path)) -> Manifest {
+            let src = self.base.join("src").join(id);
+            fs::create_dir_all(&src).unwrap();
+            fs::write(src.join("index.php"), "<?php echo 'new';").unwrap();
+            fs::create_dir_all(src.join("wp-content")).unwrap();
+            fs::write(src.join("wp-content/a.txt"), "a").unwrap();
+            tree(&src);
+            let tar = self.base.join(format!("{id}.tar"));
+            assert!(
+                std::process::Command::new("tar")
+                    .arg("--create")
+                    .arg("--file")
+                    .arg(&tar)
+                    .arg("--directory")
+                    .arg(&src)
+                    .arg(".")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&fs::read(&tar).unwrap()).unwrap();
+            let bytes = encoder.finish().unwrap();
+            let path = artifact_path(&self.artifacts, RequestId::parse(id).unwrap());
+            fs::write(&path, &bytes).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            let (len, sha256) = sha256_file(&path).unwrap();
+            Manifest {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                export_id: EXPORT_ID.into(),
+                archive: ArtifactInfo {
+                    file: ARCHIVE_FILE.into(),
+                    bytes: len,
+                    sha256,
+                },
+                entries: 3,
+                content_bytes: 18,
+                created_at_unix_secs: 0,
+            }
+        }
+
+        fn request(&self, manifest: &Manifest, id: &str, key: Option<&str>) -> Request {
+            let plan = serde_json::json!({
+                "manifest": manifest,
+                "destRoot": self.site(),
+                "destUid": self.uid,
+                "destGid": self.gid,
+            });
+            Request::parse(&plan.to_string(), id, key).unwrap()
+        }
+
+        fn pending(&self) -> bool {
+            self.base
+                .join("state")
+                .join(SCOPE)
+                .join("pending.json")
+                .exists()
+        }
+
+        fn snapshot(&self, id: &str) -> PathBuf {
+            self.content
+                .as_path()
+                .join(snapshot_dir_name(RequestId::parse(id).unwrap()))
+        }
+
+        fn staged_left(&self) -> usize {
+            fs::read_dir(&self.artifacts).unwrap().count()
+        }
+
+        fn read(&self, relative: &str) -> Option<String> {
+            fs::read_to_string(self.site().join(relative)).ok()
+        }
+    }
+
+    #[test]
+    fn import_replaces_the_root_keeps_its_mode_and_snapshots_the_old_state() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let manifest = fx.stage(ID, |_| {});
+        let result = execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap();
+
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'new';"));
+        assert_eq!(fx.read("wp-content/a.txt").as_deref(), Some("a"));
+        // An exact mirror: a file that exists only on the destination is gone...
+        assert!(fx.read("only-here.txt").is_none());
+        // ...but it is in the snapshot, together with the old index.
+        let saved = fx.snapshot(ID).join("site");
+        assert_eq!(
+            fs::read_to_string(saved.join("only-here.txt")).unwrap(),
+            "dest only"
+        );
+        assert_eq!(
+            fs::read_to_string(saved.join("index.php")).unwrap(),
+            "<?php echo 'old';"
+        );
+        assert_eq!(
+            fs::metadata(fx.site()).unwrap().permissions().mode() & 0o7777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(fx.snapshot(ID)).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(result.snapshot_id, ID);
+        // bsdtar on macOS adds AppleDouble entries, so only a lower bound holds.
+        assert!(result.entries >= 4, "{}", result.entries);
+        assert!(!result.previous_snapshot_removed);
+        assert_eq!(fx.staged_left(), 0, "the staged archive is removed");
+        assert!(!fx.pending());
+    }
+
+    #[test]
+    fn a_second_import_keeps_only_one_snapshot_per_root() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let first = fx.stage(ID, |_| {});
+        execute(&fx.ctx(), &fx.request(&first, ID, None)).unwrap();
+        let second = fx.stage(SECOND_ID, |src| {
+            fs::write(src.join("index.php"), "<?php echo 'third';").unwrap();
+        });
+        let result = execute(&fx.ctx(), &fx.request(&second, SECOND_ID, None)).unwrap();
+
+        assert!(result.previous_snapshot_removed);
+        assert!(!fx.snapshot(ID).exists());
+        assert_eq!(
+            fs::read_to_string(fx.snapshot(SECOND_ID).join("site/index.php")).unwrap(),
+            "<?php echo 'new';"
+        );
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'third';"));
+    }
+
+    #[test]
+    fn a_corrupt_or_mismatched_archive_changes_nothing_and_is_removed() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let mut manifest = fx.stage(ID, |_| {});
+        manifest.archive.sha256 = "0".repeat(64);
+        let error = execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err();
+        assert!(matches!(error, Error::ArtifactMismatch));
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'old';"));
+        assert!(!fx.snapshot(ID).exists());
+        assert_eq!(fx.staged_left(), 0);
+        assert!(!fx.pending());
+    }
+
+    #[test]
+    fn an_archive_with_the_wrong_size_or_mode_or_a_symlink_is_refused() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let mut manifest = fx.stage(ID, |_| {});
+        let path = artifact_path(&fx.artifacts, RequestId::parse(ID).unwrap());
+        manifest.archive.bytes += 1;
+        assert!(matches!(
+            execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err(),
+            Error::ArtifactMismatch
+        ));
+
+        let manifest = fx.stage(SECOND_ID, |_| {});
+        let second = artifact_path(&fx.artifacts, RequestId::parse(SECOND_ID).unwrap());
+        fs::set_permissions(&second, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            execute(&fx.ctx(), &fx.request(&manifest, SECOND_ID, None)).unwrap_err(),
+            Error::ArtifactMismatch
+        ));
+
+        let third = "123e4567-e89b-12d3-a456-426614174002";
+        let manifest = fx.stage(third, |_| {});
+        let staged = artifact_path(&fx.artifacts, RequestId::parse(third).unwrap());
+        let real = fx.base.join("real.tar.gz");
+        fs::rename(&staged, &real).unwrap();
+        symlink(&real, &staged).unwrap();
+        assert!(matches!(
+            execute(&fx.ctx(), &fx.request(&manifest, third, None)).unwrap_err(),
+            Error::ArtifactMismatch
+        ));
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'old';"));
+        let _ = path;
+    }
+
+    #[test]
+    fn an_archive_symlink_that_leaves_the_root_restores_the_old_site_exactly() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let manifest = fx.stage(ID, |src| symlink("/etc/passwd", src.join("evil")).unwrap());
+        let error = execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err();
+        assert!(
+            matches!(error, Error::Extract(ExtractError::Unsafe(_))),
+            "{error:?}"
+        );
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'old';"));
+        assert_eq!(fx.read("only-here.txt").as_deref(), Some("dest only"));
+        assert!(fx.read("evil").is_none() && !fx.site().join("evil").exists());
+        assert_eq!(
+            fs::metadata(fx.site()).unwrap().permissions().mode() & 0o7777,
+            0o750
+        );
+        assert!(
+            !fx.snapshot(ID).exists(),
+            "a failed import keeps no snapshot"
+        );
+        assert!(!fx.pending());
+        assert_eq!(fx.staged_left(), 0);
+    }
+
+    #[test]
+    fn a_missing_destination_a_file_and_the_content_root_itself_are_refused() {
+        let fx = Fixture::new();
+        let manifest = fx.stage(ID, |_| {});
+        assert!(matches!(
+            execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err(),
+            Error::UnsafeTarget
+        ));
+        assert!(!fx.site().exists(), "a sync never creates the site");
+
+        fs::write(fx.site(), "not a directory").unwrap();
+        let manifest = fx.stage(SECOND_ID, |_| {});
+        assert!(matches!(
+            execute(&fx.ctx(), &fx.request(&manifest, SECOND_ID, None)).unwrap_err(),
+            Error::UnsafeTarget
+        ));
+
+        let third = "123e4567-e89b-12d3-a456-426614174002";
+        let manifest = fx.stage(third, |_| {});
+        let plan = serde_json::json!({
+            "manifest": manifest,
+            "destRoot": fx.content.as_path(),
+            "destUid": fx.uid, "destGid": fx.gid,
+        });
+        let request = Request::parse(&plan.to_string(), third, None).unwrap();
+        assert!(matches!(
+            execute(&fx.ctx(), &request).unwrap_err(),
+            Error::UnsafeTarget
+        ));
+    }
+
+    #[test]
+    fn a_destination_behind_a_symlinked_parent_is_refused() {
+        let fx = Fixture::new();
+        let outside = fx.base.join("outside");
+        fs::create_dir_all(outside.join("site")).unwrap();
+        symlink(&outside, fx.content.as_path().join("linked")).unwrap();
+        let manifest = fx.stage(ID, |_| {});
+        let plan = serde_json::json!({
+            "manifest": manifest,
+            "destRoot": fx.content.as_path().join("linked/site"),
+            "destUid": fx.uid, "destGid": fx.gid,
+        });
+        let request = Request::parse(&plan.to_string(), ID, None).unwrap();
+        assert!(matches!(
+            execute(&fx.ctx(), &request).unwrap_err(),
+            Error::UnsafeTarget
+        ));
+        assert!(fs::read_dir(outside.join("site")).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn a_manifest_over_the_limits_is_refused_before_the_archive_is_opened() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        for tweak in [
+            |m: &mut Manifest| m.content_bytes = 21 * 1024 * 1024 * 1024,
+            |m: &mut Manifest| m.entries = 1_000_001,
+        ] {
+            let mut manifest = fx.stage(ID, |_| {});
+            tweak(&mut manifest);
+            assert!(matches!(
+                execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err(),
+                Error::ManifestOverLimit
+            ));
+            assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'old';"));
+        }
+    }
+
+    #[test]
+    fn a_leftover_pending_marker_blocks_the_next_import() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let scope = open_scope_for_test(&fx);
+        scope.create_new(&rel("pending.json"), b"{}").unwrap();
+        let manifest = fx.stage(ID, |_| {});
+        let error = execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err();
+        assert!(matches!(error, Error::RecoveryRequired));
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'old';"));
+        assert!(fx.pending(), "the marker is not ours to remove");
+    }
+
+    #[test]
+    fn a_retry_with_the_same_key_replays_without_a_second_swap() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let manifest = fx.stage(ID, |_| {});
+        let first = execute(&fx.ctx(), &fx.request(&manifest, ID, Some("key-1"))).unwrap();
+        fs::write(fx.site().join("index.php"), "<?php echo 'edited after';").unwrap();
+        let again = execute(&fx.ctx(), &fx.request(&manifest, SECOND_ID, Some("key-1"))).unwrap();
+        assert_eq!(first.snapshot_id, again.snapshot_id);
+        assert_eq!(
+            fx.read("index.php").as_deref(),
+            Some("<?php echo 'edited after';")
+        );
+        assert!(!fx.snapshot(SECOND_ID).exists());
+    }
+
+    #[test]
+    fn a_busy_destination_stops_the_import() {
+        let fx = Fixture::new();
+        fx.existing_site();
+        let _held =
+            resource_lock::acquire(&fx.state, &fx.site(), RequestId::parse(SECOND_ID).unwrap())
+                .unwrap();
+        let manifest = fx.stage(ID, |_| {});
+        assert!(matches!(
+            execute(&fx.ctx(), &fx.request(&manifest, ID, None)).unwrap_err(),
+            Error::ResourceBusy
+        ));
+        assert_eq!(fx.read("index.php").as_deref(), Some("<?php echo 'old';"));
+    }
+
+    #[test]
+    fn requests_with_bad_manifests_roots_or_unknown_fields_are_refused() {
+        let fx = Fixture::new();
+        let manifest = fx.stage(ID, |_| {});
+        let good = serde_json::json!({
+            "manifest": manifest, "destRoot": "/var/www/x", "destUid": 1, "destGid": 1,
+        });
+        assert!(Request::parse(&good.to_string(), ID, None).is_ok());
+        let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = good.clone();
+            f(&mut value);
+            Request::parse(&value.to_string(), ID, None).is_err()
+        };
+        assert!(mutate(&|v| v["destRoot"] = "var/www/x".into()));
+        assert!(mutate(&|v| v["destRoot"] = "/var/www/x/".into()));
+        assert!(mutate(&|v| v["destRoot"] = "/var/www/../x".into()));
+        assert!(mutate(&|v| v["manifest"]["archive"]["sha256"] = "zz".into()));
+        assert!(mutate(&|v| v["manifest"]["schemaVersion"] = 2.into()));
+        assert!(mutate(&|v| v["manifest"]["exportId"] = "not-a-uuid".into()));
+        assert!(mutate(&|v| v["extra"] = 1.into()));
+    }
+
+    fn open_scope_for_test(fx: &Fixture) -> ManagedRoot {
+        fx.state.create_dir_all(&rel(SCOPE)).unwrap();
+        fx.state.open_managed_dir(&rel(SCOPE)).unwrap()
     }
 }

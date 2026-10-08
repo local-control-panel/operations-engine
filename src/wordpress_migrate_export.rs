@@ -470,7 +470,10 @@ pub fn discard(engine_state: &ManagedRoot, req: &DiscardRequest) -> Result<Disca
 }
 
 /// The source root as a canonical, real directory inside the content root.
-pub(crate) fn resolve_source(content_root: &TrustedRoot, source_root: &Path) -> Result<PathBuf, Error> {
+pub(crate) fn resolve_source(
+    content_root: &TrustedRoot,
+    source_root: &Path,
+) -> Result<PathBuf, Error> {
     let relative = source_root
         .strip_prefix(content_root.as_path())
         .ok()
