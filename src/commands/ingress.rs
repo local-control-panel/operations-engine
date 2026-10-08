@@ -85,6 +85,11 @@ pub fn run(command: IngressCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        IngressCommand::ApplyBans {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => apply_bans(&request_file, &request_id, idempotency_key.as_deref()),
         IngressCommand::Reconcile {
             request_id,
             idempotency_key,
@@ -155,6 +160,77 @@ fn remove_route(
             REMOVE_ROUTE_OPERATION,
             ErrorCode::UnsupportedPlatform,
             "ingress.removeRoute requires a Unix host",
+        ))
+    }
+}
+
+fn apply_bans(
+    request_file: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::ingress::apply_bans::{
+        APPLY_BANS_OPERATION, ApplyBansRequest, ApplyBansRequestError, execute as execute_apply,
+    };
+
+    let json = match crate::commands::read_root_owned_content_file(request_file) {
+        Ok(json) => json,
+        Err(_) => {
+            return Ok(Response::failure(
+                APPLY_BANS_OPERATION,
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            ));
+        }
+    };
+    let request = match ApplyBansRequest::parse(&json, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                APPLY_BANS_OPERATION,
+                ErrorCode::InvalidInput,
+                match error {
+                    ApplyBansRequestError::InvalidJson => {
+                        "request-file is not a valid {\"bans\":[...]} document"
+                    }
+                    ApplyBansRequestError::InvalidIp => "a ban is not an IPv4 or IPv6 address",
+                    ApplyBansRequestError::TooManyBans => "too many bans in one request",
+                    ApplyBansRequestError::InvalidRequestId => "request-id is not a canonical UUID",
+                    ApplyBansRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+                },
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        with_context(APPLY_BANS_OPERATION, |context| {
+            match execute_apply(context, &request, &CancellationToken::default()) {
+                Ok(result) => Response::success(APPLY_BANS_OPERATION, result),
+                Err(LifecycleError::PostCommitRecordFailed { result, .. }) => {
+                    Response::success(APPLY_BANS_OPERATION, result).map(|response| {
+                        response.with_warnings(vec![Warning {
+                            code: WarningCode::TransactionRecordIncomplete,
+                            message: "the bans were applied but the transaction record could \
+                                      not be saved"
+                                .to_owned(),
+                        }])
+                    })
+                }
+                Err(error) => {
+                    let (code, message) = error.protocol();
+                    Ok(Response::failure(APPLY_BANS_OPERATION, code, &message))
+                }
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            APPLY_BANS_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "ingress.applyBans requires a Unix host",
         ))
     }
 }

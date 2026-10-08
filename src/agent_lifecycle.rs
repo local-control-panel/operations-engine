@@ -476,7 +476,7 @@ mod tests {
         ),
         (
             "bruteforce-guard",
-            "ddd19873ca2109cd2114378ce33f3dac10a5f3cd51c49c166b243aaef15c9697",
+            "57ef84978e6a5c9e37d319f1a35fb20256b615572061135ecb164f88eec0e962",
         ),
         (
             "backup-restore-drill",
@@ -523,6 +523,24 @@ mod tests {
                 digest(&installed),
                 pin,
                 "{name} drifted from the pinned digest"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_applies_bans_through_the_engine_and_never_edits_routes() {
+        let script = find(GUARD_NAME).unwrap().installed_script();
+        assert!(script.contains("\"ingress\", \"apply-bans\""));
+        for forbidden in [
+            "docker",
+            "frankenphp",
+            "Caddyfile.d",
+            "caddy reload",
+            ".caddyfile",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "the guard must not reference {forbidden:?}"
             );
         }
     }

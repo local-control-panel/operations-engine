@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # wcp-agent: bruteforce-guard
-# wcp-agent-version: 1.0.0
-# wcp-agent-description: Fail2Ban-style brute-force protection for wp-login and general Caddy abuse. Bans by splicing a `remote_ip` block into every site's Caddyfile instead of iptables, since containerized (Docker bridge + published-port) traffic is NAT'd through DOCKER-USER/FORWARD, not INPUT, so classic fail2ban bans never actually apply.
+# wcp-agent-version: 2.0.0
+# wcp-agent-description: Fail2Ban-style brute-force protection for wp-login and general Caddy abuse. Bans in the ingress Caddy (a `remote_ip` block every route imports) instead of iptables, since containerized (Docker bridge + published-port) traffic is NAT'd through DOCKER-USER/FORWARD, not INPUT, so classic fail2ban bans never actually apply. The ban list is applied by the Operations Engine (`ingress.applyBans`), never by editing route files.
 #
 # Run modes:
 #   bash bruteforce-guard.sh              - scan logs, ban offenders, expire old bans, apply
 #   bash bruteforce-guard.sh --apply-only - skip detection, just re-apply current ban list
 #                                            (used by the app for immediate manual unban)
+#
+# Exit status: 0 when the ban list is live (or the engine was busy and the next
+# run will retry), 2 when the engine could not apply it (unreachable, validation
+# or reload refused). The ban list file is never changed because of that.
 
 set -euo pipefail
 
@@ -14,18 +18,19 @@ WCP_DIR="${WCP_DIR:-/root/.wcp}"
 export WCP_DIR
 trap 'ec=$?; mkdir -p "$WCP_DIR/agents"; echo "{\"ts\":$(date +%s),\"exit_code\":$ec}" > "$WCP_DIR/agents/bruteforce-guard.heartbeat"' EXIT
 
-CADDYFILE_GLOB="${CADDYFILE_GLOB:-/etc/frankenphp*/Caddyfile.d/*.caddyfile}"
-export CADDYFILE_GLOB
+LOG_GLOB="${LOG_GLOB:-/var/log/caddy/ingress-*.log}"
+export LOG_GLOB
 
 APPLY_ONLY=0
 [[ "${1:-}" == "--apply-only" ]] && APPLY_ONLY=1
 export APPLY_ONLY
 
 python3 - << 'PYEOF'
-import glob, json, os, re, sys, time
+import glob, json, os, re, sys, time, uuid
 
 WCP_DIR        = os.environ.get("WCP_DIR", "/root/.wcp")
-CADDYFILE_GLOB = os.environ["CADDYFILE_GLOB"]
+LOG_GLOB       = os.environ["LOG_GLOB"]
+ENGINE         = os.environ.get("OPS_ENGINE", "ops-engine")
 APPLY_ONLY     = os.environ.get("APPLY_ONLY", "0") == "1"
 
 # bruteforce-active-bans.txt and bruteforce-config.env are NOT owned by this
@@ -39,13 +44,13 @@ OFFSETS_FILE = os.path.join(WCP_DIR, "bruteforce-offsets.json")
 HITS_FILE    = os.path.join(WCP_DIR, "bruteforce-hits.json")
 BANS_FILE    = os.path.join(WCP_DIR, "bruteforce-active-bans.txt")
 EVENTS_FILE  = os.path.join(WCP_DIR, "bruteforce-events.jsonl")
+# The ban list the engine last accepted (one IP per line); internal to this script.
+APPLIED_FILE = os.path.join(WCP_DIR, "bruteforce-applied.txt")
+REQUEST_FILE = os.path.join(WCP_DIR, "bruteforce-apply-request.json")
 NOTIFY_FILE  = os.path.join(WCP_DIR, "notify.conf")
 
-BAN_BEGIN = "# bruteforce-ban-begin"
-BAN_END = "# bruteforce-ban-end"
-
 sys.path.insert(0, os.path.join(WCP_DIR, "agents"))
-from wcp_agent_lib import log_entry as _log_entry, notify as _notify, read_json, run, run_argv, shell_quote, write_json
+from wcp_agent_lib import log_entry as _log_entry, notify as _notify, read_json, run_argv, write_json
 
 os.makedirs(WCP_DIR, exist_ok=True)
 open(BANS_FILE, "a").close()
@@ -104,9 +109,9 @@ def is_valid_ip(ip):
     # client_ip/remote_ip is normally the raw TCP peer address (never
     # attacker-controlled), but if trusted-proxies is ever misconfigured to
     # trust a header-spoofable upstream, it could reflect an arbitrary
-    # X-Forwarded-For value instead. Since this value gets spliced verbatim
-    # into every site's live Caddyfile, anything that isn't a real IP must be
-    # rejected before it reaches the hits/bans files.
+    # X-Forwarded-For value instead. The engine validates the list again, but
+    # anything that isn't a real IP is rejected before it reaches the
+    # hits/bans files.
     m = IPV4_RE.match(ip)
     if m:
         return all(int(o) <= 255 for o in m.groups())
@@ -157,55 +162,56 @@ def ban_ip(ip, jail, banmin, hits):
 
 
 if not APPLY_ONLY:
-    # ── 1. Tail new Caddy access-log lines from every FrankenPHP container ──
+    # ── 1. Tail new ingress access-log lines ─────────────────────────────────
+    # /var/log/caddy is a host bind mount of the ingress container, so the
+    # logs are read directly (one ingress-<domain>.log per site).
     offsets = read_json(OFFSETS_FILE, {}) or {}
     hits = read_json(HITS_FILE, []) or []
 
-    containers_out = run("docker ps --format '{{.Names}}'").stdout
-    containers = [c for c in containers_out.splitlines() if c.startswith("frankenphp")]
+    for logfile in sorted(glob.glob(LOG_GLOB)):
+        key = logfile
+        prev_offset = int(offsets.get(key, 0))
+        try:
+            cur_size = os.stat(logfile).st_size
+        except OSError:
+            continue
 
-    for container in containers:
-        logfiles_out = run(f"docker exec {shell_quote(container)} sh -c 'ls /var/log/caddy/*.log 2>/dev/null'").stdout
-        for logfile in [l for l in logfiles_out.splitlines() if l.strip()]:
-            key = f"{container}:{logfile}"
-            prev_offset = int(offsets.get(key, 0))
+        if cur_size < prev_offset:
+            prev_offset = 0
 
-            # Passed as a plain argv element (no shell, no nested `sh -c`
-            # string) so a filename can never break out of quoting.
-            size_out = run_argv(["docker", "exec", container, "wc", "-c", logfile]).stdout.strip()
+        if cur_size > prev_offset:
             try:
-                cur_size = int(size_out.split()[0]) if size_out else 0
-            except (ValueError, IndexError):
-                cur_size = 0
+                with open(logfile, "rb") as f:
+                    f.seek(prev_offset)
+                    new_lines = f.read(cur_size - prev_offset).decode("utf-8", "replace")
+            except OSError:
+                continue
+            # A partial last line is read again next time.
+            if not new_lines.endswith("\n"):
+                keep = new_lines.rfind("\n") + 1
+                cur_size = prev_offset + len(new_lines[:keep].encode("utf-8"))
+                new_lines = new_lines[:keep]
+            for line in new_lines.splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                req = entry.get("request", {}) if isinstance(entry, dict) else {}
+                ip = req.get("client_ip") or req.get("remote_ip")
+                if not ip or not is_valid_ip(ip):
+                    continue
+                method = req.get("method")
+                uri = req.get("uri") or ""
+                status = entry.get("status")
 
-            if cur_size < prev_offset:
-                prev_offset = 0
+                if WP_LOGIN_ENABLED and method == "POST" and "wp-login.php" in uri:
+                    hits.append({"ts": now, "jail": "wp_login", "ip": ip})
+                elif CADDY_ENABLED and status in (401, 403, 404):
+                    hits.append({"ts": now, "jail": "caddy", "ip": ip})
 
-            if cur_size > prev_offset:
-                new_lines = run_argv(
-                    ["docker", "exec", container, "tail", "-c", f"+{prev_offset + 1}", logfile]
-                ).stdout
-                for line in new_lines.splitlines():
-                    if not line.strip():
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except ValueError:
-                        continue
-                    req = entry.get("request", {}) if isinstance(entry, dict) else {}
-                    ip = req.get("client_ip") or req.get("remote_ip")
-                    if not ip or not is_valid_ip(ip):
-                        continue
-                    method = req.get("method")
-                    uri = req.get("uri") or ""
-                    status = entry.get("status")
-
-                    if WP_LOGIN_ENABLED and method == "POST" and "wp-login.php" in uri:
-                        hits.append({"ts": now, "jail": "wp_login", "ip": ip})
-                    elif CADDY_ENABLED and status in (401, 403, 404):
-                        hits.append({"ts": now, "jail": "caddy", "ip": ip})
-
-            offsets[key] = cur_size
+        offsets[key] = cur_size
 
     write_json(OFFSETS_FILE, offsets)
 
@@ -243,63 +249,53 @@ for b in expired:
     log_event({"ts": now, "action": "expire", "ip": b["ip"], "jail": b["jail"]})
 write_bans(active)
 
-# ── 5. Rebuild the shared ban block and splice into every site Caddyfile ────
-banned_ips = " ".join(sorted({b["ip"] for b in active}))
+# ── 5. Hand the ban list to the Operations Engine ──────────────────────────
+# The engine owns every route file and the ingress reload: it takes the stack
+# lock, validates the new list, swaps it in, reloads Caddy and puts the old list
+# back if the reload refuses it. This script never touches a Caddyfile.
+banned_ips = sorted({b["ip"] for b in active})
 
 
-def strip_old_block(lines):
-    out = []
-    skip = False
-    for line in lines:
-        if BAN_BEGIN in line:
-            skip = True
-            continue
-        if BAN_END in line:
-            skip = False
-            continue
-        if skip:
-            continue
-        out.append(line)
-    return out
+def read_applied():
+    try:
+        with open(APPLIED_FILE) as f:
+            return sorted({l.strip() for l in f if l.strip()})
+    except FileNotFoundError:
+        return None
 
 
-def insert_block(lines, ips):
-    out = []
-    inserted = False
-    comment_re = re.compile(r"^[ \t]*#")
-    for line in lines:
-        out.append(line)
-        if not inserted and "{" in line and not comment_re.match(line):
-            out.append(f"    {BAN_BEGIN}")
-            out.append(f"    @bf_banned remote_ip {ips}")
-            out.append("    respond @bf_banned 403")
-            out.append(f"    {BAN_END}")
-            inserted = True
-    return out
+def apply_failed(code, message):
+    log_event({"ts": now, "action": "apply_failed", "code": code, "message": message[:200]})
+    print(f"bruteforce-guard: ingress.applyBans failed: {code}: {message}", file=sys.stderr)
+    sys.exit(2)
 
 
-def apply_block(path):
-    with open(path) as f:
-        original = f.read()
-    lines = strip_old_block(original.splitlines())
-    if banned_ips:
-        lines = insert_block(lines, banned_ips)
-    new_content = "\n".join(lines) + ("\n" if lines else "")
-    if new_content == original:
-        return False
-    with open(path, "w") as f:
-        f.write(new_content)
-    return True
-
-
-changed = False
-for path in glob.glob(CADDYFILE_GLOB):
-    if os.path.isfile(path) and apply_block(path):
-        changed = True
-
-# ── 6. Reload Caddy only if something actually changed ──────────────────────
-if changed:
-    containers_out = run("docker ps --format '{{.Names}}'").stdout
-    for container in [c for c in containers_out.splitlines() if c.startswith("frankenphp")]:
-        run(f"docker exec {shell_quote(container)} caddy reload --config /etc/caddy/Caddyfile >/dev/null 2>&1")
+# Cron runs only call the engine when the list differs from the last accepted
+# one; --apply-only (a manual unban) always does.
+if APPLY_ONLY or read_applied() != banned_ips:
+    with open(os.open(REQUEST_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        json.dump({"bans": banned_ips}, f)
+    try:
+        proc = run_argv([ENGINE, "ingress", "apply-bans",
+                         "--request-file", REQUEST_FILE,
+                         "--request-id", str(uuid.uuid4())], timeout=180)
+    except (OSError, ValueError) as exc:
+        apply_failed("ENGINE_UNAVAILABLE", str(exc))
+    except Exception as exc:
+        apply_failed("ENGINE_TIMEOUT", str(exc))
+    try:
+        response = json.loads(proc.stdout)
+    except ValueError:
+        apply_failed("ENGINE_BAD_RESPONSE", (proc.stderr or proc.stdout or "no output").strip())
+    if response.get("ok"):
+        with open(APPLIED_FILE, "w") as f:
+            f.write("".join(f"{ip}\n" for ip in banned_ips))
+    else:
+        error = response.get("error") or {}
+        if error.get("code") == "CONFLICT":
+            # Another configuration change holds the lock: not a failure of
+            # the ban list. The next run applies it.
+            print("bruteforce-guard: ingress busy, will retry", file=sys.stderr)
+        else:
+            apply_failed(error.get("code") or "UNKNOWN", error.get("message") or "")
 PYEOF
