@@ -47,6 +47,7 @@ pub mod runtime_config;
 pub mod site;
 pub mod site_enroll;
 #[cfg(unix)]
+pub mod site_archive;
 pub mod site_error_pages;
 #[cfg(unix)]
 pub mod site_file;

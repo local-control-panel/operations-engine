@@ -55,6 +55,21 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SiteCommand::ExportArchive {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => export_archive(&request_file, &request_id, idempotency_key.as_deref()),
+        SiteCommand::ImportArchive {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => import_archive(&request_file, &request_id, idempotency_key.as_deref()),
+        SiteCommand::DiscardArchive {
+            kind,
+            archive_id,
+            request_id,
+        } => discard_archive(&kind, &archive_id, &request_id),
         SiteCommand::WriteEnvFile {
             request_file,
             request_id,
@@ -921,6 +936,196 @@ fn php_info_session(
             "site.phpInfoSession",
             ErrorCode::UnsupportedPlatform,
             "site.phpInfoSession requires a Unix host",
+        ))
+    }
+}
+
+fn export_archive(
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_archive::{self as archive, EXPORT_OPERATION};
+    #[cfg(unix)]
+    {
+        use crate::{commands::read_root_owned_content_file, filesystem::ManagedRoot};
+        let fail = |code, message: &str| Ok(Response::failure(EXPORT_OPERATION, code, message));
+        let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return fail(
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            );
+        };
+        let Ok(json) = read_root_owned_content_file(path) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            );
+        };
+        let Ok(request) = archive::ExportRequest::parse(&json, request_id, idempotency_key) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file is not a valid site archive export plan",
+            );
+        };
+        let Some(content_root) = config
+            .content_roots
+            .iter()
+            .find(|root| request.source_root().starts_with(root.as_path()))
+        else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "site root is outside configured content roots",
+            );
+        };
+        let Ok(state) = ManagedRoot::open(&config.state_root) else {
+            return fail(ErrorCode::Internal, "engine state root is unavailable");
+        };
+        let context = archive::Context {
+            engine_state: &state,
+            state_root: &config.state_root,
+            content_root,
+            tar_program: "tar",
+        };
+        match archive::export(
+            &context,
+            &request,
+            &crate::process::CancellationToken::default(),
+        ) {
+            Ok(result) => Response::success(EXPORT_OPERATION, result),
+            Err(archive::Error::PostCommit(value)) => Response::success(EXPORT_OPERATION, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(EXPORT_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            EXPORT_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.exportArchive requires a Unix host",
+        ))
+    }
+}
+
+fn import_archive(
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_archive::{self as archive, import::OPERATION};
+    #[cfg(unix)]
+    {
+        use crate::{commands::read_root_owned_content_file, filesystem::ManagedRoot};
+        let fail = |code, message: &str| Ok(Response::failure(OPERATION, code, message));
+        let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return fail(
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            );
+        };
+        let Ok(json) = read_root_owned_content_file(path) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            );
+        };
+        let Ok(request) = archive::import::Request::parse(&json, request_id, idempotency_key)
+        else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-file is not a valid site archive import plan",
+            );
+        };
+        let Some(content_root) = config
+            .content_roots
+            .iter()
+            .find(|root| request.dest_root().starts_with(root.as_path()))
+        else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "destination root is outside configured content roots",
+            );
+        };
+        let Ok(state) = ManagedRoot::open(&config.state_root) else {
+            return fail(ErrorCode::Internal, "engine state root is unavailable");
+        };
+        let context = archive::import::Context {
+            engine_state: &state,
+            state_root: &config.state_root,
+            content_root,
+            artifact_dir: std::path::Path::new("/etc/operations-engine/staging"),
+            artifact_owner_uid: 0,
+        };
+        match archive::import::execute(&context, &request) {
+            Ok(result) => Response::success(OPERATION, result),
+            Err(archive::Error::PostCommit(value)) => Response::success(OPERATION, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.importArchive requires a Unix host",
+        ))
+    }
+}
+
+fn discard_archive(
+    kind: &str,
+    archive_id: &str,
+    request_id: &str,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_archive::{self as archive, DISCARD_OPERATION};
+    #[cfg(unix)]
+    {
+        let fail = |code, message: &str| Ok(Response::failure(DISCARD_OPERATION, code, message));
+        let Ok(request) = archive::DiscardRequest::parse(kind, archive_id, request_id) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "kind must be export or snapshot; archive-id and request-id must be canonical UUIDs",
+            );
+        };
+        let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return fail(
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            );
+        };
+        let Ok(state) = crate::filesystem::ManagedRoot::open(&config.state_root) else {
+            return fail(ErrorCode::Internal, "engine state root is unavailable");
+        };
+        match archive::discard(&state, &config.content_roots, &request) {
+            Ok(result) => Response::success(DISCARD_OPERATION, result),
+            Err(archive::Error::PostCommit(value)) => Response::success(DISCARD_OPERATION, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(DISCARD_OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (kind, archive_id, request_id);
+        Ok(Response::failure(
+            DISCARD_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.discardArchive requires a Unix host",
         ))
     }
 }

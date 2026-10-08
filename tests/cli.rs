@@ -146,6 +146,9 @@ fn capabilities_describe_only_implemented_operations() {
             "site.phpInfoSession",
             "site.probe",
             "site.setErrorPages",
+            "site.exportArchive",
+            "site.importArchive",
+            "site.discardArchive",
             "system.service",
             "compose.action",
             "compose.remove"
