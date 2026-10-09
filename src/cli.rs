@@ -1069,6 +1069,11 @@ pub enum SiteCommand {
         #[arg(long = "request-id")]
         request_id: String,
     },
+    /// Roll back `site.importArchive` runs that a killed engine left half done.
+    Reconcile {
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
     /// Change the document root of a site's identity record.
     UpdateIdentity {
         #[arg(long = "runtime-id")]
@@ -1122,6 +1127,7 @@ impl SiteCommand {
             Self::ExportArchive { .. } => "site.exportArchive",
             Self::ImportArchive { .. } => "site.importArchive",
             Self::DiscardArchive { .. } => "site.discardArchive",
+            Self::Reconcile { .. } => "site.reconcile",
         }
     }
 }

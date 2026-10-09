@@ -150,6 +150,7 @@ fn capabilities_describe_only_implemented_operations() {
             "site.exportArchive",
             "site.importArchive",
             "site.discardArchive",
+            "site.reconcile",
             "system.service",
             "compose.action",
             "compose.remove"

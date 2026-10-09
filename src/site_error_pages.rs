@@ -198,7 +198,44 @@ fn remove_marked_block(raw: &str) -> Result<String, Error> {
     })
 }
 
-fn replace_error_pages_block(raw: &str, enabled: bool) -> Result<String, Error> {
+/// In a deploy layout the document root is `<site dir>/current`, a link to a
+/// release that the next deploy replaces. The pages then live beside
+/// `releases/` and `current`, in `<site dir>/.wcp-errors`, and the block's
+/// `file_server` is pointed there. Any other root keeps them inside it.
+fn pages_base(root: &str) -> Option<&str> {
+    let path = std::path::Path::new(root);
+    if path.file_name()? != "current" {
+        return None;
+    }
+    path.parent()?
+        .to_str()
+        .filter(|base| !base.is_empty() && *base != "/")
+}
+
+fn file_server_lines(file_root: Option<&str>) -> Result<Vec<String>, Error> {
+    let Some(base) = file_root else {
+        return Ok(vec!["            file_server".to_owned()]);
+    };
+    if !base
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return Err(Error::ConfigMalformed(
+            "the site directory has characters that cannot go in a Caddyfile",
+        ));
+    }
+    Ok(vec![
+        "            file_server {".to_owned(),
+        format!("                root {base}"),
+        "            }".to_owned(),
+    ])
+}
+
+fn replace_error_pages_block(
+    raw: &str,
+    enabled: bool,
+    file_root: Option<&str>,
+) -> Result<String, Error> {
     let stripped = remove_marked_block(raw)?;
     if !enabled {
         return Ok(stripped);
@@ -213,25 +250,27 @@ fn replace_error_pages_block(raw: &str, enabled: bool) -> Result<String, Error> 
         .ok_or(Error::ConfigMalformed(
             "the site's Caddyfile has no site block",
         ))?;
-    lines.splice(
-        site_block + 1..site_block + 1,
-        [
-            format!("    {ERROR_PAGES_BEGIN}"),
-            "    intercept {".to_owned(),
-            "        @wcp_not_found status 404".to_owned(),
-            "        handle_response @wcp_not_found {".to_owned(),
-            format!("            rewrite * /{PAGES_DIR}/{NOT_FOUND_FILE}"),
-            "            file_server".to_owned(),
-            "        }".to_owned(),
-            "        @wcp_server_error status 5xx".to_owned(),
-            "        handle_response @wcp_server_error {".to_owned(),
-            format!("            rewrite * /{PAGES_DIR}/{SERVER_ERROR_FILE}"),
-            "            file_server".to_owned(),
-            "        }".to_owned(),
-            "    }".to_owned(),
-            format!("    {ERROR_PAGES_END}"),
-        ],
-    );
+    let mut block = vec![
+        format!("    {ERROR_PAGES_BEGIN}"),
+        "    intercept {".to_owned(),
+        "        @wcp_not_found status 404".to_owned(),
+        "        handle_response @wcp_not_found {".to_owned(),
+        format!("            rewrite * /{PAGES_DIR}/{NOT_FOUND_FILE}"),
+    ];
+    block.extend(file_server_lines(file_root)?);
+    block.extend([
+        "        }".to_owned(),
+        "        @wcp_server_error status 5xx".to_owned(),
+        "        handle_response @wcp_server_error {".to_owned(),
+        format!("            rewrite * /{PAGES_DIR}/{SERVER_ERROR_FILE}"),
+    ]);
+    block.extend(file_server_lines(file_root)?);
+    block.extend([
+        "        }".to_owned(),
+        "    }".to_owned(),
+        format!("    {ERROR_PAGES_END}"),
+    ]);
+    lines.splice(site_block + 1..site_block + 1, block);
     let joined = lines.join("\n");
     Ok(if stripped.ends_with('\n') {
         format!("{joined}\n")
@@ -461,12 +500,13 @@ pub fn set_error_pages(
                 .ok_or(Error::SiteConfigMissing)?;
             let text = std::str::from_utf8(&prior)
                 .map_err(|_| Error::ConfigMalformed("the site's Caddyfile is not UTF-8"))?;
-            let updated = replace_error_pages_block(text, req.enabled)?;
+            let base = pages_base(&req.root);
+            let updated = replace_error_pages_block(text, req.enabled, base)?;
 
             let installed = if req.enabled {
                 let dir = crate::site_file::open_site_directory(
                     &req.content_roots,
-                    std::path::Path::new(&req.root),
+                    std::path::Path::new(base.unwrap_or(&req.root)),
                 )
                 .map_err(Error::SiteDirectory)?;
                 Some(Installed::install(dir, req)?)
@@ -723,7 +763,7 @@ mod tests {
     #[test]
     fn the_block_is_added_once_replaced_and_removed() {
         let base = "{\n    admin off\n}\n\nhttp://127.0.0.1:9000 {\n    root * /var/www/a\n    php_server\n}\n";
-        let enabled = replace_error_pages_block(base, true).unwrap();
+        let enabled = replace_error_pages_block(base, true, None).unwrap();
         // The control panel pins this exact text too (its raw fallback for
         // sites outside the content roots writes the same block).
         assert_eq!(
@@ -738,10 +778,87 @@ mod tests {
             enabled.find("http://127.0.0.1:9000 {").unwrap()
                 < enabled.find(ERROR_PAGES_BEGIN).unwrap()
         );
-        assert_eq!(replace_error_pages_block(&enabled, true).unwrap(), enabled);
+        assert_eq!(
+            replace_error_pages_block(&enabled, true, None).unwrap(),
+            enabled
+        );
         assert_eq!(enabled.matches(ERROR_PAGES_BEGIN).count(), 1);
-        assert_eq!(replace_error_pages_block(&enabled, false).unwrap(), base);
-        assert_eq!(replace_error_pages_block(base, false).unwrap(), base);
+        assert_eq!(
+            replace_error_pages_block(&enabled, false, None).unwrap(),
+            base
+        );
+        assert_eq!(replace_error_pages_block(base, false, None).unwrap(), base);
+    }
+
+    #[test]
+    fn a_deploy_layout_keeps_the_pages_beside_current_and_points_file_server_there() {
+        assert_eq!(
+            pages_base("/var/www/sites/abc/current"),
+            Some("/var/www/sites/abc")
+        );
+        assert_eq!(pages_base("/var/www/site/public"), None);
+        assert_eq!(pages_base("/current"), None);
+        let base =
+            "http://127.0.0.1:9000 {\n    root * /var/www/sites/abc/current\n    php_server\n}\n";
+        let enabled = replace_error_pages_block(base, true, Some("/var/www/sites/abc")).unwrap();
+        assert_eq!(
+            enabled.matches("root /var/www/sites/abc\n").count(),
+            2,
+            "{enabled}"
+        );
+        assert!(enabled.contains("rewrite * /.wcp-errors/404.html"));
+        assert_eq!(
+            replace_error_pages_block(&enabled, true, Some("/var/www/sites/abc")).unwrap(),
+            enabled
+        );
+        assert_eq!(
+            replace_error_pages_block(&enabled, false, None).unwrap(),
+            base
+        );
+        assert!(matches!(
+            replace_error_pages_block(base, true, Some("/var/www/a b")),
+            Err(Error::ConfigMalformed(_))
+        ));
+    }
+
+    #[test]
+    fn deploy_layout_pages_survive_a_new_release() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = Fixture::new();
+        let site = f.dir.path().join("www/site-a");
+        let release = site.join("releases/r1");
+        fs::create_dir_all(&release).unwrap();
+        std::os::unix::fs::symlink("releases/r1", site.join("current")).unwrap();
+        let json = serde_json::json!({
+            "runtimeId": "fp1-php83",
+            "domain": "site-a.test",
+            "port": 9000,
+            "root": site.join("current").to_str().unwrap(),
+            "enabled": true,
+            "notFoundHtml": NOT_FOUND,
+            "serverErrorHtml": SERVER_ERROR,
+        })
+        .to_string();
+        let req = SetErrorPagesRequest::parse(&json, &f.roots, ID1, None).unwrap();
+        f.run(&req).unwrap();
+        assert_eq!(
+            fs::read_to_string(site.join(".wcp-errors/404.html")).unwrap(),
+            NOT_FOUND
+        );
+        assert!(
+            !release.join(".wcp-errors").exists(),
+            "nothing goes into the release"
+        );
+        assert!(
+            f.caddyfile()
+                .contains(&format!("root {}\n", site.display()))
+        );
+        // A new release replaces the one `current` points at.
+        fs::remove_dir_all(&release).unwrap();
+        assert_eq!(
+            fs::read_to_string(site.join(".wcp-errors/5xx.html")).unwrap(),
+            SERVER_ERROR
+        );
     }
 
     #[test]
@@ -755,12 +872,12 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                replace_error_pages_block(&broken, true),
+                replace_error_pages_block(&broken, true, None),
                 Err(Error::ConfigMalformed(_))
             ));
         }
         assert!(matches!(
-            replace_error_pages_block("admin off\n", true),
+            replace_error_pages_block("admin off\n", true, None),
             Err(Error::ConfigMalformed(_))
         ));
     }

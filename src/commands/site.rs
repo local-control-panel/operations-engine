@@ -70,6 +70,7 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             archive_id,
             request_id,
         } => discard_archive(&kind, archive_id.as_deref(), &request_id),
+        SiteCommand::Reconcile { request_id } => reconcile(&request_id),
         SiteCommand::WriteEnvFile {
             request_file,
             request_id,
@@ -1080,6 +1081,50 @@ fn import_archive(
             OPERATION,
             ErrorCode::UnsupportedPlatform,
             "site.importArchive requires a Unix host",
+        ))
+    }
+}
+
+fn reconcile(request_id: &str) -> Result<Response, ResponseBuildError> {
+    use crate::site_reconcile::{self as rec, OPERATION};
+    #[cfg(unix)]
+    {
+        let fail = |code, message: &str| Ok(Response::failure(OPERATION, code, message));
+        let Ok(request) = rec::Request::parse(request_id) else {
+            return fail(
+                ErrorCode::InvalidInput,
+                "request-id must be a canonical UUID",
+            );
+        };
+        let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return fail(
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            );
+        };
+        let Ok(state) = crate::filesystem::ManagedRoot::open(&config.state_root) else {
+            return fail(ErrorCode::Internal, "engine state root is unavailable");
+        };
+        match rec::reconcile(&state, &config.content_roots, &request) {
+            Ok(result) => Response::success(OPERATION, result),
+            Err(crate::site_archive::Error::PostCommit(value)) => {
+                Response::success(OPERATION, value)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request_id;
+        Ok(Response::failure(
+            OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.reconcile requires a Unix host",
         ))
     }
 }
