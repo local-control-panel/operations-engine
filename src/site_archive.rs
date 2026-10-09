@@ -16,7 +16,8 @@
 //! `site.discardArchive` removes one export directory (`--kind export`), the
 //! previous-state snapshot a destination keeps after an import
 //! (`--kind snapshot`), or every export of either kind that has outlived
-//! `STALE_AFTER` (`--kind stale`). Both exports also sweep stale exports
+//! `STALE_AFTER` (`--kind stale`); that also removes the snapshots of imports
+//! older than `SNAPSHOT_TTL`. Both exports also sweep stale exports
 //! before they write a new one, so a panel that died mid-sync cannot leave a
 //! copy of a site (or a database dump) behind forever.
 
@@ -64,6 +65,21 @@ pub const SNAPSHOT_PREFIX: &str = ".wcp-sync-";
 /// An export older than this is nobody's: the panel's longest step times out
 /// after an hour. Used by [`sweep_stale_exports`].
 pub const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A destination keeps the state an import replaced for this long, then the
+/// sweep removes it. Long enough to notice a bad sync and restore by hand.
+pub const SNAPSHOT_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Directory under `site-sync` that holds one record per synced root, naming
+/// the snapshot that root's last import left behind.
+pub const SNAPSHOT_RECORDS: &str = "snapshots";
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotRecord {
+    pub snapshot_id: String,
+    pub root: String,
+}
 
 const EXPORT_SCOPE: &str = "site-archive-export";
 const DISCARD_SCOPE: &str = "site-archive-discard";
@@ -487,7 +503,11 @@ pub fn discard(
                     }
                     count
                 }
-                _ => sweep_stale_exports(engine_state, state_root, SystemTime::now()),
+                _ => {
+                    let now = SystemTime::now();
+                    sweep_stale_exports(engine_state, state_root, now)
+                        + sweep_expired_snapshots(engine_state, state_root, content_roots, now)
+                }
             };
             Ok(DiscardResult {
                 archive_id: id.map(|id| id.to_string()),
@@ -538,6 +558,65 @@ pub fn sweep_stale_exports(
             };
             if engine_state.remove_dir_all(&relative).is_ok() {
                 removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Removes the snapshot (and its record) of every import that is older than
+/// [`SNAPSHOT_TTL`]. The record is rewritten by each import of its root, so its
+/// age is the age of the snapshot. Best effort, like [`sweep_stale_exports`];
+/// returns how many snapshot directories went.
+pub fn sweep_expired_snapshots(
+    engine_state: &ManagedRoot,
+    state_root: &TrustedRoot,
+    content_roots: &[TrustedRoot],
+    now: SystemTime,
+) -> u32 {
+    let dir = state_root
+        .as_path()
+        .join(EXPORTS_DIR)
+        .join(SNAPSHOT_RECORDS);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let expired = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= SNAPSHOT_TTL);
+        let id = std::fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<SnapshotRecord>(&bytes).ok())
+            .and_then(|record| RequestId::parse(&record.snapshot_id).ok());
+        let Some(id) = id.filter(|_| expired) else {
+            continue;
+        };
+        let Ok(snapshot) = SiteRelativePath::parse(snapshot_dir_name(id)) else {
+            continue;
+        };
+        let mut gone = true;
+        for root in content_roots {
+            let Ok(managed) = ManagedRoot::open(root) else {
+                continue;
+            };
+            match remove_if_present(&managed, &snapshot) {
+                Ok(true) => removed += 1,
+                Ok(false) => {}
+                Err(_) => gone = false,
+            }
+        }
+        // A record whose snapshot could not be removed stays for the next sweep.
+        if gone {
+            if let Ok(record) = SiteRelativePath::parse(format!(
+                "{EXPORTS_DIR}/{SNAPSHOT_RECORDS}/{}",
+                entry.file_name().to_string_lossy()
+            )) {
+                let _ = engine_state.remove_file(&record);
             }
         }
     }
@@ -1018,6 +1097,50 @@ mod tests {
             .unwrap()
             .removed
         );
+    }
+
+    #[test]
+    fn a_snapshot_older_than_the_ttl_is_swept_and_a_fresh_one_is_kept() {
+        let fx = Fixture::new();
+        let records = fx
+            .state_root
+            .as_path()
+            .join(EXPORTS_DIR)
+            .join(SNAPSHOT_RECORDS);
+        fs::create_dir_all(&records).unwrap();
+        let mut dirs = Vec::new();
+        for (name, id) in [("old.json", ID), ("new.json", OTHER_ID)] {
+            let dir = fx
+                .content
+                .as_path()
+                .join(snapshot_dir_name(RequestId::parse(id).unwrap()));
+            fs::create_dir_all(dir.join("site")).unwrap();
+            fs::write(
+                records.join(name),
+                format!(r#"{{"snapshotId":"{id}","root":"/x"}}"#),
+            )
+            .unwrap();
+            dirs.push(dir);
+        }
+        let later = SystemTime::now() + SNAPSHOT_TTL + Duration::from_secs(1);
+        // Only `old.json` is aged: touch `new.json` to the swept time.
+        fs::File::options()
+            .write(true)
+            .open(records.join("new.json"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let removed = sweep_expired_snapshots(
+            &fx.state,
+            &fx.state_root,
+            std::slice::from_ref(&fx.content),
+            later,
+        );
+        assert_eq!(removed, 1);
+        assert!(!dirs[0].exists());
+        assert!(!records.join("old.json").exists());
+        assert!(dirs[1].exists());
+        assert!(records.join("new.json").exists());
     }
 
     #[test]

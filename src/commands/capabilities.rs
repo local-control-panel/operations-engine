@@ -109,6 +109,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "agent.install",
                 "agent.installFromRegistry",
                 "agent.approve",
+                "agent.unapprove",
                 "agent.remove",
                 "agent.bruteforceUnban",
                 "system.activateAutoupdatesConfig",

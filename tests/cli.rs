@@ -119,6 +119,7 @@ fn capabilities_describe_only_implemented_operations() {
             "agent.install",
             "agent.installFromRegistry",
             "agent.approve",
+            "agent.unapprove",
             "agent.remove",
             "agent.bruteforceUnban",
             "system.activateAutoupdatesConfig",

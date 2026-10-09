@@ -459,6 +459,16 @@ pub enum AgentCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Withdraw the approval of a community agent's script hash (all hashes
+    /// of the agent when none is given).
+    Unapprove {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Remove a bundled agent: cron line, manifest entry and script.
     Remove {
         #[arg(long = "request-file")]
@@ -486,6 +496,7 @@ impl AgentCommand {
             Self::Install { .. } => "agent.install",
             Self::InstallFromRegistry { .. } => "agent.installFromRegistry",
             Self::Approve { .. } => "agent.approve",
+            Self::Unapprove { .. } => "agent.unapprove",
             Self::Remove { .. } => "agent.remove",
             Self::BruteforceUnban { .. } => "agent.bruteforceUnban",
         }

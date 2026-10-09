@@ -41,6 +41,16 @@ pub fn run(command: AgentCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        AgentCommand::Unapprove {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => lifecycle(
+            agent_registry::UNAPPROVE_OPERATION,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         AgentCommand::Remove {
             request_file,
             request_id,
@@ -166,6 +176,7 @@ fn lifecycle(
                 &cancel,
             )),
             agent_registry::APPROVE_OPERATION => Ok(approve(&engine_state, &json, request_id)),
+            agent_registry::UNAPPROVE_OPERATION => Ok(unapprove(&engine_state, &json, request_id)),
             agent_lifecycle::INSTALL_OPERATION => {
                 run!(agent_lifecycle::InstallRequest, execute::install)
             }
@@ -372,6 +383,53 @@ fn approve(engine_state: &ManagedRoot, json: &str, request_id: &str) -> Response
             "sha256": request.sha256,
             "approvedAtUnixSecs": approved_at,
         }),
+    )
+    .unwrap_or_else(|_| {
+        failure(
+            ErrorCode::InternalSerializationError,
+            "could not build the response",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn unapprove(engine_state: &ManagedRoot, json: &str, request_id: &str) -> Response {
+    use crate::{site::SiteRelativePath, transaction::RequestId};
+    let operation = agent_registry::UNAPPROVE_OPERATION;
+    let failure = |code: ErrorCode, message: &str| Response::failure(operation, code, message);
+    let request = match agent_registry::UnapproveRequest::parse(json) {
+        Ok(v) => v,
+        Err(error) => return failure(ErrorCode::InvalidInput, registry_request_message(error)),
+    };
+    if RequestId::parse(request_id).is_err() {
+        return failure(
+            ErrorCode::InvalidInput,
+            "request-id is not a canonical UUID",
+        );
+    }
+    let dir = SiteRelativePath::parse(agent_registry::APPROVALS_DIR).expect("literal path");
+    // No directory means nothing was ever approved: a successful no-op.
+    let names = match engine_state.open_managed_dir(&dir) {
+        Ok(approvals) => match approvals.file_names() {
+            Ok(names) => names,
+            Err(_) => return failure(ErrorCode::Internal, "could not read the approvals"),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(_) => return failure(ErrorCode::Internal, "could not read the approvals"),
+    };
+    let mut removed = 0u32;
+    for name in names.iter().filter(|name| request.matches(name)) {
+        let file = SiteRelativePath::parse(format!("{}/{name}", agent_registry::APPROVALS_DIR))
+            .expect("matched names are a valid agent name and hash");
+        match engine_state.remove_file(&file) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return failure(ErrorCode::Internal, "could not withdraw the approval"),
+        }
+    }
+    Response::success(
+        operation,
+        serde_json::json!({ "name": request.name, "removed": removed }),
     )
     .unwrap_or_else(|_| {
         failure(

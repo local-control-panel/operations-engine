@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    EXPORTS_DIR, Error, MANIFEST_SCHEMA_VERSION, Manifest, absolute_root, child, ensure_space, ids,
-    limits, rel, run_admitted, snapshot_dir_name, unix_now_secs,
+    EXPORTS_DIR, Error, MANIFEST_SCHEMA_VERSION, Manifest, SNAPSHOT_RECORDS, SnapshotRecord,
+    absolute_root, child, ensure_space, ids, limits, rel, run_admitted, snapshot_dir_name,
+    unix_now_secs,
 };
 use crate::{
     filesystem::ManagedRoot,
@@ -52,7 +53,6 @@ pub const OPERATION: &str = "site.importArchive";
 
 const SCOPE: &str = "site-archive-import";
 const ARTIFACT_KIND: &str = "site.tar.gz";
-const SNAPSHOT_RECORDS: &str = "snapshots";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -314,6 +314,12 @@ fn import_with_recovery(
 
     let previous_snapshot_removed =
         replace_snapshot_record(ctx, &content, &req.dest_root, req.request_id);
+    super::sweep_expired_snapshots(
+        ctx.engine_state,
+        ctx.state_root,
+        std::slice::from_ref(ctx.content_root),
+        std::time::SystemTime::now(),
+    );
     // A crash before this point leaves pending.json and prevents a blind retry.
     let _ = scope.remove_file(&pending);
     Ok(ImportResult {
@@ -324,13 +330,6 @@ fn import_with_recovery(
         previous_snapshot_removed,
         completed_at_unix_secs: unix_now_secs(),
     })
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SnapshotRecord {
-    snapshot_id: String,
-    root: String,
 }
 
 /// SHA-256 of the root path, hex: names the root's marker and snapshot record.
