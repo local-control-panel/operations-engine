@@ -1176,13 +1176,21 @@ pub fn remove_site_service(
             .is_empty();
             let cdir = container_dir(&req.domain);
             if running {
-                compose(
+                let stop = compose(
                     ctx,
                     Stage::StopService,
                     &["exec", "-T", &service, "s6-svc", "-d", &cdir],
                     SIGNAL_TIMEOUT,
                     cancel,
-                )?;
+                );
+                // A directory written but never picked up by the scanner (a
+                // rolled-back preparation) has no supervisor and nothing to
+                // stop; any other failure keeps the service in place.
+                if let Err(error) = stop {
+                    if !has_no_supervisor(ctx, &service, &cdir, cancel) {
+                        return Err(error);
+                    }
+                }
             }
             root.remove_dir_all(&dir_rel).map_err(Error::Io)?;
             if running {
@@ -1191,6 +1199,35 @@ pub fn remove_site_service(
             Ok(result(true, running))
         },
     )
+}
+
+/// Whether `s6-svstat` reports that no supervisor runs for the service
+/// directory, i.e. there is no process to stop.
+fn has_no_supervisor(
+    ctx: &Context<'_>,
+    service: &str,
+    container_dir: &str,
+    cancel: &CancellationToken,
+) -> bool {
+    compose(
+        ctx,
+        Stage::StopService,
+        &[
+            "exec",
+            "-T",
+            service,
+            "sh",
+            "-c",
+            "s6-svstat \"$1\" 2>&1 || true",
+            "sh",
+            container_dir,
+        ],
+        SIGNAL_TIMEOUT,
+        cancel,
+    )
+    .is_ok_and(|out| {
+        out.contains("s6-supervise not running") || out.contains("supervisor not listening")
+    })
 }
 
 /// Overwrites an existing file atomically and marks it executable, matching
@@ -2194,6 +2231,32 @@ mod tests {
         assert!(matches!(error, Error::Rejected(Stage::StopService, _)));
         assert!(service_dir_exists(&fixture));
         assert!(!fixture.calls().iter().any(|c| c.contains("s6-svscanctl")));
+    }
+
+    #[test]
+    fn a_service_without_a_supervisor_is_removed_without_a_stop() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        fixture.seed_dir("fp1-php83", "example.test");
+        fs::write(
+            &fixture.docker,
+            format!(
+                "#!/bin/sh\necho \"$(pwd) $*\" >> '{calls}'\n\
+                 case \"$*\" in *' ps -q '*) echo c0ffee ;; *'s6-svc -d'*) exit 1 ;; \
+                 *s6-svstat*) echo 's6-svstat: fatal: unable to read status: s6-supervise not running' ;; esac\nexit 0\n",
+                calls = fixture.calls.display(),
+            ),
+        )
+        .unwrap();
+
+        let result = remove_site_service(
+            &fixture.ctx(),
+            &remove_req(ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(result.removed);
+        assert!(!service_dir_exists(&fixture));
     }
 
     #[test]
