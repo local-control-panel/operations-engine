@@ -537,7 +537,7 @@ fn record_rel(runtime_id: &RuntimeId, domain: &Domain) -> SiteRelativePath {
     rel(&format!("{runtime_id}/{domain}.{IDENTITY_EXTENSION}"))
 }
 
-fn read_record(
+pub(crate) fn read_record(
     runtime: &ManagedRoot,
     runtime_id: &RuntimeId,
     domain: &Domain,

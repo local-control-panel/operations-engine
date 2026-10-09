@@ -26,6 +26,10 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[features]
+# Test-only crash points (src/failpoint.rs). Never enabled in a release.
+failpoints = []
+
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.20"
