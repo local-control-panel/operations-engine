@@ -9,7 +9,9 @@
 //!
 //! The sandbox restricts **writes** (and privilege gain), not reads and not
 //! the network. It does not protect a sibling agent's script when the agent is
-//! granted `/root/.wcp/agents` (heartbeat and lock files live there).
+//! granted `/root/.wcp/agents` (heartbeat and lock files live there). The
+//! shared Python library in that directory is mounted read-only for the
+//! service, because the unsandboxed agents import it as root.
 
 use crate::{agent_lifecycle::Agent, backup_schedule::Schedule};
 
@@ -164,6 +166,12 @@ pub fn on_calendar(schedule: &Schedule) -> Option<String> {
 /// The service unit. Fixed directives only; `writable` has been validated.
 pub fn service_unit(agent: &Agent, writable: &[&str]) -> String {
     let paths: Vec<String> = writable.iter().map(|path| format!("-{path}")).collect();
+    let library_path = format!(
+        "{}/{}/{}",
+        crate::agent_lifecycle::ROOT,
+        crate::agent_lifecycle::AGENTS_DIR,
+        crate::agent_lifecycle::LIBRARY_FILE
+    );
     format!(
         "# Managed by the operations engine ({TAG}). Do not edit.\n\
          [Unit]\n\
@@ -185,11 +193,13 @@ pub fn service_unit(agent: &Agent, writable: &[&str]) -> String {
          RestrictSUIDSGID=yes\n\
          RestrictRealtime=yes\n\
          LockPersonality=yes\n\
-         ReadWritePaths={paths}\n",
+         ReadWritePaths={paths}\n\
+         ReadOnlyPaths=-{library}\n",
         TAG = crate::agent_lifecycle::TAG,
         name = agent.name,
         script = agent.absolute_script_path(),
         paths = paths.join(" "),
+        library = library_path,
     )
 }
 
@@ -342,6 +352,9 @@ mod tests {
         assert!(unit.contains("NoNewPrivileges=yes\n"));
         assert!(unit.contains("ReadWritePaths=-/root/.wcp/agents -/root/.wcp/logs\n"));
         assert_eq!(unit.matches("ReadWritePaths").count(), 1);
+        // The shared library stays read-only even inside a writable agents
+        // directory: every unsandboxed agent imports it as root.
+        assert!(unit.contains("ReadOnlyPaths=-/root/.wcp/agents/wcp_agent_lib.py\n"));
     }
 
     #[test]

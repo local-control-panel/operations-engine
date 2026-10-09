@@ -2,6 +2,10 @@
 
 Uploaded alongside every agent script into /root/.wcp/agents/ so any of them
 can `sys.path.insert(0, WCP_DIR + "/agents"); import wcp_agent_lib`.
+
+The library is shared by all agents and installing any one agent rewrites the
+shared file, so every change must stay backward compatible with the agents
+already installed.
 """
 
 import json

@@ -59,7 +59,7 @@ pub struct ArtifactSpec {
     pub mode: u32,
 }
 
-pub const ARTIFACTS: [ArtifactSpec; 4] = [
+pub const ARTIFACTS: [ArtifactSpec; 5] = [
     ArtifactSpec {
         relative_path: "rclone.conf",
         mode: 0o600,
@@ -75,6 +75,10 @@ pub const ARTIFACTS: [ArtifactSpec; 4] = [
     ArtifactSpec {
         relative_path: "agents/backup-agent.sh",
         mode: 0o700,
+    },
+    ArtifactSpec {
+        relative_path: "agents/wcp_agent_lib.py",
+        mode: 0o600,
     },
 ];
 
@@ -108,7 +112,7 @@ impl Request {
         Ok(request)
     }
 
-    pub fn artifacts(&self) -> [Artifact<'_>; 4] {
+    pub fn artifacts(&self) -> [Artifact<'_>; 5] {
         [
             Artifact {
                 relative_path: ARTIFACTS[0].relative_path,
@@ -129,6 +133,11 @@ impl Request {
                 relative_path: ARTIFACTS[3].relative_path,
                 content: &self.agent_script,
                 mode: ARTIFACTS[3].mode,
+            },
+            Artifact {
+                relative_path: ARTIFACTS[4].relative_path,
+                content: crate::agent_lifecycle::library(),
+                mode: ARTIFACTS[4].mode,
             },
         ]
     }
@@ -169,6 +178,7 @@ mod tests {
                 ("backup.conf", 0o600),
                 ("notify.conf", 0o600),
                 ("agents/backup-agent.sh", 0o700),
+                ("agents/wcp_agent_lib.py", 0o600),
             ]
         );
         let empty = serde_json::json!({
