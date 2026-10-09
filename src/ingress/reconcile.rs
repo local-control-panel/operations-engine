@@ -101,6 +101,10 @@ pub struct ReconcileResult {
     /// interrupted park/unpark attempt safely.
     #[serde(default)]
     pub preserved_maintenance_backups: Vec<String>,
+    /// Routes (live and parked-backup files) that lacked the ban import and
+    /// got it. Not reloaded: the running server picks it up at its next reload.
+    #[serde(default)]
+    pub ban_import_added: Vec<String>,
     pub reconciled_at_unix_secs: u64,
 }
 
@@ -241,6 +245,24 @@ pub fn execute(
         }
     };
 
+    // `bans/` holds `ingress.applyBans`' staged and rollback files; a crash
+    // between its two renames leaves only those, i.e. no list (fail-open).
+    // The same sweep below restores the rollback copy or drops the leftovers.
+    let mut names = names;
+    if let Some(root) = ingress_root.as_ref() {
+        let bans =
+            SiteRelativePath::parse(super::apply_bans::BANS_DIR).expect("literal path is valid");
+        if let Ok(dir) = root.open_managed_dir(&bans) {
+            if let Ok(inner) = dir.file_names() {
+                names.extend(
+                    inner
+                        .into_iter()
+                        .map(|n| format!("{}/{n}", super::apply_bans::BANS_DIR)),
+                );
+            }
+        }
+    }
+
     // Commit point: every removal/restore below is independently atomic
     // (a single `remove_file`/`rename`), so there is no single "the sweep
     // committed" moment to gate cancellation on - once the scan above
@@ -315,7 +337,31 @@ pub fn execute(
         }
     }
 
+    // Every route imports the ban list (what the panel does when a site is
+    // enabled or leaves maintenance); re-listed because the sweep above may
+    // have restored routes.
+    let mut ban_import_added = Vec::new();
+    if let Some(root) = ingress_root.as_ref() {
+        for name in root.file_names().unwrap_or_default() {
+            if !(name.ends_with(".caddyfile") || name.ends_with(".maintenance-backup")) {
+                continue;
+            }
+            let Ok(path) = SiteRelativePath::parse(&name) else {
+                continue;
+            };
+            let Ok(raw) = root.read_to_string(&path) else {
+                continue;
+            };
+            if let Some(updated) = with_ban_import(&raw) {
+                if root.write_atomic(&path, updated.as_bytes()).is_ok() {
+                    ban_import_added.push(name);
+                }
+            }
+        }
+    }
+
     let result = ReconcileResult {
+        ban_import_added,
         removed_temp_files,
         removed_redundant_backups,
         restored_recoverable_backups,
@@ -342,6 +388,26 @@ pub fn execute(
     );
 
     Ok(result)
+}
+
+/// `Some(raw)` with the ban import as the first line of the site block, `None`
+/// when `raw` already has it or has no site block. Same rule as the panel's
+/// `runtime_pool::activation::with_ban_import`.
+fn with_ban_import(raw: &str) -> Option<String> {
+    if raw
+        .lines()
+        .any(|line| line.trim() == super::apply_bans::BANS_IMPORT)
+    {
+        return None;
+    }
+    let mut lines: Vec<&str> = raw.lines().collect();
+    let block = lines.iter().position(|line| {
+        let t = line.trim();
+        t != "{" && t.ends_with('{') && !t.starts_with('#')
+    })?;
+    let import = format!("    {}", super::apply_bans::BANS_IMPORT);
+    lines.insert(block + 1, &import);
+    Some(format!("{}\n", lines.join("\n")))
 }
 
 /// `*.tmp` or `*.tmp-*`, matching `website-control-panel`'s
@@ -716,6 +782,131 @@ mod tests {
         assert!(
             ingress_dir.path().join("e.test.caddyfile.tmp").exists(),
             "a replay must not touch anything created after the original sweep"
+        );
+    }
+
+    const ROUTE: &str = "a.test {\n    reverse_proxy runtime-x:80\n}\n";
+    const ROUTE_WITH_BANS: &str =
+        "a.test {\n    import /etc/wcp/ingress.d/bans/*.caddy\n    reverse_proxy runtime-x:80\n}\n";
+
+    fn sweep(
+        ingress_root: &TrustedRoot,
+        engine_state: &ManagedRoot,
+        id: &str,
+    ) -> super::ReconcileResult {
+        execute(
+            &ReconcileContext {
+                ingress_root,
+                engine_state,
+            },
+            &request(id),
+            &CancellationToken::default(),
+        )
+        .expect("reconcile should succeed")
+    }
+
+    #[test]
+    fn routes_get_the_ban_import_once_including_the_parked_backup() {
+        let (ingress_dir, ingress_root, _m) = managed_root();
+        let (_state_dir, _state_root, engine_state) = managed_root();
+        write(ingress_dir.path(), "a.test.caddyfile", ROUTE);
+        write(
+            ingress_dir.path(),
+            "p.test.caddyfile",
+            "p.test {\n    respond 503\n}\n",
+        );
+        write(ingress_dir.path(), "p.test.maintenance-backup", ROUTE);
+        write(ingress_dir.path(), "odd.test.caddyfile", "not a caddyfile");
+
+        let first = sweep(
+            &ingress_root,
+            &engine_state,
+            "11111111-1111-4111-8111-111111111111",
+        );
+        let mut added = first.ban_import_added.clone();
+        added.sort();
+        assert_eq!(
+            added,
+            vec![
+                "a.test.caddyfile",
+                "p.test.caddyfile",
+                "p.test.maintenance-backup"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(ingress_dir.path().join("a.test.caddyfile")).unwrap(),
+            ROUTE_WITH_BANS
+        );
+        assert_eq!(
+            std::fs::read_to_string(ingress_dir.path().join("odd.test.caddyfile")).unwrap(),
+            "not a caddyfile"
+        );
+        let second = sweep(
+            &ingress_root,
+            &engine_state,
+            "22222222-2222-4222-8222-222222222222",
+        );
+        assert!(second.ban_import_added.is_empty(), "idempotent");
+    }
+
+    #[test]
+    fn a_crash_between_the_ban_renames_is_recovered_from_the_rollback_copy() {
+        // State after SIGKILL between `live -> rollback` and `staged -> live`.
+        let (ingress_dir, ingress_root, _m) = managed_root();
+        let (_state_dir, _state_root, engine_state) = managed_root();
+        std::fs::create_dir(ingress_dir.path().join("bans")).unwrap();
+        write(
+            ingress_dir.path(),
+            "bans/bans.caddy.rollback-abc",
+            "old list",
+        );
+        write(ingress_dir.path(), "bans/bans.caddy.tmp", "half applied");
+
+        let result = sweep(
+            &ingress_root,
+            &engine_state,
+            "33333333-3333-4333-8333-333333333333",
+        );
+        assert_eq!(
+            result.restored_recoverable_backups[0].restored_to,
+            "bans/bans.caddy"
+        );
+        assert_eq!(result.removed_temp_files, vec!["bans/bans.caddy.tmp"]);
+        assert_eq!(
+            std::fs::read_to_string(ingress_dir.path().join("bans/bans.caddy")).unwrap(),
+            "old list"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(ingress_dir.path().join("bans"))
+            .unwrap()
+            .collect();
+        assert_eq!(leftovers.len(), 1);
+    }
+
+    #[test]
+    fn a_redundant_ban_rollback_is_removed_and_a_live_list_is_kept() {
+        let (ingress_dir, ingress_root, _m) = managed_root();
+        let (_state_dir, _state_root, engine_state) = managed_root();
+        std::fs::create_dir(ingress_dir.path().join("bans")).unwrap();
+        write(ingress_dir.path(), "bans/bans.caddy", "new list");
+        write(
+            ingress_dir.path(),
+            "bans/bans.caddy.rollback-abc",
+            "old list",
+        );
+        sweep(
+            &ingress_root,
+            &engine_state,
+            "44444444-4444-4444-8444-444444444444",
+        );
+        assert_eq!(
+            std::fs::read_to_string(ingress_dir.path().join("bans/bans.caddy")).unwrap(),
+            "new list"
+        );
+        assert!(
+            !ingress_dir
+                .path()
+                .join("bans/bans.caddy.rollback-abc")
+                .exists()
         );
     }
 }

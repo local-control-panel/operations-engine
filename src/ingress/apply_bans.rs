@@ -15,9 +15,9 @@
 //! live file is replaced by renames, with the previous list kept as
 //! `bans.caddy.rollback-<request id>` until the reload accepted the new one.
 //! Neither the staged nor the rollback file matches the `*.caddy` import glob.
-//! The `bans/` directory is outside `ingress.reconcile`'s sweep (which lists
-//! only the root's own files), so a crash between the renames leaves no list at
-//! all, which is the fail-open state: nothing is banned until the next apply.
+//! A crash between the two renames leaves no live list (fail-open until the
+//! next apply); `ingress.reconcile` sweeps `bans/` and puts the rollback copy
+//! back, so the previous list is enforced again.
 
 use std::{net::IpAddr, str::FromStr};
 
