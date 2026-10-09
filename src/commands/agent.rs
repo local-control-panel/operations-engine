@@ -1,5 +1,5 @@
 use crate::{
-    agent_config, agent_lifecycle, agent_registry,
+    agent_config, agent_lifecycle, agent_registry, agent_systemd,
     cli::AgentCommand,
     commands::read_root_owned_content_file,
     error::ErrorCode,
@@ -141,12 +141,25 @@ fn lifecycle(
             Ok(v) => v,
             Err(()) => return failure(ErrorCode::Internal, "agent root is unavailable"),
         };
+        // Sandboxed agents need systemd as the running init; without it they
+        // fall back to cron.
+        let unit_dir = std::path::Path::new(agent_systemd::RUN_DIR)
+            .is_dir()
+            .then(|| TrustedRoot::parse(std::path::Path::new(agent_systemd::UNIT_DIR)).ok())
+            .flatten()
+            .and_then(|r| ManagedRoot::open(&r).ok());
         let context = Context {
             engine_state: &engine_state,
             state_root: &config.state_root,
             root: &root,
             crontab_program: "crontab",
             shell_program: "bash",
+            systemd: unit_dir
+                .as_ref()
+                .map(|units| agent_lifecycle::execute::Systemd {
+                    units,
+                    systemctl_program: "systemctl",
+                }),
         };
         let cancel = CancellationToken::default();
         macro_rules! run {

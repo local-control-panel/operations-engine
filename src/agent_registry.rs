@@ -21,6 +21,7 @@
 
 use crate::{
     agent_lifecycle::{self, Agent, valid_agent_name},
+    agent_systemd,
     backup_schedule::Schedule,
     engine::fetch,
     error::ErrorCode,
@@ -39,6 +40,7 @@ pub const RELEASES_BASE: &str = "https://github.com/local-control-panel/agents/r
 pub const RAW_BASE: &str = "https://raw.githubusercontent.com/local-control-panel/agents";
 
 pub const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
+pub const MAX_WRITABLE_PATHS: usize = 16;
 pub const MAX_SCRIPT_BYTES: u64 = 256 * 1024;
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -229,6 +231,11 @@ struct RegistryAgent {
     schedule: String,
     default_schedule: String,
     min_engine: String,
+    /// `cron` (the default) or `systemd`.
+    #[serde(default)]
+    isolation: String,
+    #[serde(default)]
+    writable_paths: Vec<String>,
     script: String,
     files: BTreeMap<String, String>,
 }
@@ -393,6 +400,20 @@ pub fn fetch_verified(
         }
         _ => return Err(Error::BadRegistry("unknown schedule kind")),
     };
+    let systemd_writable = match entry.isolation.as_str() {
+        "" | "cron" if entry.writable_paths.is_empty() => None,
+        "systemd"
+            if default_schedule.is_some()
+                && entry.writable_paths.len() <= MAX_WRITABLE_PATHS
+                && entry
+                    .writable_paths
+                    .iter()
+                    .all(|path| agent_systemd::valid_writable_path(path)) =>
+        {
+            Some(entry.writable_paths.clone())
+        }
+        _ => return Err(Error::BadRegistry("isolation settings are not valid")),
+    };
     if request.schedule.is_some() && !configurable {
         return Err(Error::ScheduleNotConfigurable);
     }
@@ -434,6 +455,7 @@ pub fn fetch_verified(
         default_schedule,
         configurable,
         script,
+        systemd_writable,
     );
     Ok(Verified {
         agent,
@@ -533,6 +555,60 @@ mod tests {
         assert!(verified.agent.configurable_schedule);
         assert!(!verified.agent.bundled);
         assert_eq!(verified.agent.installed_script(), GOOD);
+    }
+
+    fn isolated(isolation: &str, paths: &str, schedule: &str) -> String {
+        registry("official", schedule, "[]", &hash()).replace(
+            r#""minEngine":"0.1.0""#,
+            &format!(r#""minEngine":"0.1.0","isolation":"{isolation}","writablePaths":{paths}"#),
+        )
+    }
+
+    #[test]
+    fn a_systemd_agent_carries_its_validated_writable_paths() {
+        let h = hash();
+        let json = isolated(
+            "systemd",
+            r#"["/root/.wcp/agents","/root/.wcp/logs"]"#,
+            "configurable",
+        );
+        let verified = run(json, GOOD, &request(&h, None), false).unwrap();
+        assert_eq!(
+            verified.agent.systemd_writable,
+            Some(&["/root/.wcp/agents", "/root/.wcp/logs"][..])
+        );
+        // Cron stays the default.
+        let plain = run(
+            registry("official", "configurable", "[]", &h),
+            GOOD,
+            &request(&h, None),
+            false,
+        )
+        .unwrap();
+        assert!(plain.agent.systemd_writable.is_none());
+    }
+
+    #[test]
+    fn unsafe_or_inconsistent_isolation_is_refused() {
+        let h = hash();
+        for json in [
+            isolated("systemd", r#"["/etc"]"#, "configurable"),
+            isolated("systemd", r#"["/root/.wcp/../.ssh"]"#, "configurable"),
+            isolated("systemd", r#"["/root/.wcp/a b"]"#, "configurable"),
+            // Nothing to schedule, so nothing for a timer to do.
+            isolated("systemd", r#"["/root/.wcp/logs"]"#, "none"),
+            isolated("docker", "[]", "configurable"),
+            // Paths that mean nothing under cron are a mistake, not a hint.
+            isolated("cron", r#"["/root/.wcp/logs"]"#, "configurable"),
+        ] {
+            assert!(
+                matches!(
+                    run(json.clone(), GOOD, &request(&h, None), false),
+                    Err(Error::BadRegistry(_))
+                ),
+                "{json}"
+            );
+        }
     }
 
     #[test]
