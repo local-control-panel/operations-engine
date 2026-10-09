@@ -465,9 +465,11 @@ pub fn remove(
             }
             // The last-run record of a removed agent would keep showing in
             // the list; it is a log, so a failure here changes nothing.
-            let _ = ctx
-                .root
-                .remove_file(&rel(&format!("{AGENTS_DIR}/{}.heartbeat", agent.name)));
+            for suffix in ["heartbeat", "lock"] {
+                let _ = ctx
+                    .root
+                    .remove_file(&rel(&format!("{AGENTS_DIR}/{}.{suffix}", agent.name)));
+            }
             Ok(RemoveResult {
                 name: agent.name.to_owned(),
                 removed,
@@ -868,6 +870,10 @@ mod tests {
             &cancel(),
         )
         .unwrap();
+        host.ctx()
+            .root
+            .write_atomic(&rel("agents/cache-warmup.lock"), b"")
+            .unwrap();
         let result = remove(
             &host.ctx(),
             &RemoveRequest::parse(r#"{"name":"cache-warmup"}"#, C, None).unwrap(),
@@ -876,6 +882,7 @@ mod tests {
         .unwrap();
         assert!(result.removed);
         assert_eq!(result.removed_cron_lines, 1);
+        assert!(host.file("agents/cache-warmup.lock").is_none());
         assert!(host.file("agents/cache-warmup.sh").is_none());
         assert!(host.file("agents/cache-warmup.heartbeat").is_none());
         assert!(host.file("agents/error-log-digest.sh").is_some());

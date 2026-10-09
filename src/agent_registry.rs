@@ -31,6 +31,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 pub const INSTALL_OPERATION: &str = "agent.installFromRegistry";
 pub const APPROVE_OPERATION: &str = "agent.approve";
+pub const UNAPPROVE_OPERATION: &str = "agent.unapprove";
 
 /// Where releases are published. These are the only addresses the engine
 /// fetches agents from; no request can change them.
@@ -105,6 +106,13 @@ struct ApprovePlan {
     sha256: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UnapprovePlan {
+    name: String,
+    sha256: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct InstallRequest {
     pub name: String,
@@ -159,6 +167,41 @@ impl ApproveRequest {
             name: plan.name,
             sha256: plan.sha256,
         })
+    }
+}
+
+/// Withdraws approvals: the one for `sha256`, or every approval of the agent
+/// when no hash is given.
+#[derive(Debug)]
+pub struct UnapproveRequest {
+    pub name: String,
+    pub sha256: Option<String>,
+}
+
+impl UnapproveRequest {
+    pub fn parse(json: &str) -> Result<Self, RequestError> {
+        let plan: UnapprovePlan =
+            serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
+        if !valid_agent_name(&plan.name) {
+            return Err(RequestError::InvalidName);
+        }
+        if plan.sha256.as_deref().is_some_and(|hash| !is_hash(hash)) {
+            return Err(RequestError::InvalidHash);
+        }
+        Ok(Self {
+            name: plan.name,
+            sha256: plan.sha256,
+        })
+    }
+
+    /// Whether the marker file `file` (a name in `APPROVALS_DIR`) is one this
+    /// request withdraws. Agent names may contain `-`, so the hash is split
+    /// off the end rather than the name off the front.
+    pub fn matches(&self, file: &str) -> bool {
+        let Some((name, hash)) = file.rsplit_once('-') else {
+            return false;
+        };
+        name == self.name && is_hash(hash) && self.sha256.as_deref().is_none_or(|h| h == hash)
     }
 }
 
@@ -401,6 +444,22 @@ pub fn fetch_verified(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unapprove_matches_only_the_named_agent_and_hash() {
+        let a = "a".repeat(64);
+        let b = "b".repeat(64);
+        let all = UnapproveRequest::parse(r#"{"name":"foo"}"#).unwrap();
+        assert!(all.matches(&format!("foo-{a}")));
+        assert!(all.matches(&format!("foo-{b}")));
+        // A longer name that merely starts with `foo-` is another agent.
+        assert!(!all.matches(&format!("foo-bar-{a}")));
+        assert!(!all.matches("foo-notahash"));
+        let one = UnapproveRequest::parse(&format!(r#"{{"name":"foo","sha256":"{a}"}}"#)).unwrap();
+        assert!(one.matches(&format!("foo-{a}")));
+        assert!(!one.matches(&format!("foo-{b}")));
+        assert!(UnapproveRequest::parse(r#"{"name":"foo","sha256":"x"}"#).is_err());
+    }
+
     use super::*;
 
     const GOOD: &str = "#!/usr/bin/env bash\necho hi\n";
