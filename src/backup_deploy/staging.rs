@@ -254,6 +254,11 @@ mod tests {
                 & 0o777,
             0o700
         );
+        // The agent imports the shared library from the file next to it.
+        assert_eq!(
+            fs::read_to_string(directory.path().join("agents/wcp_agent_lib.py")).unwrap(),
+            crate::agent_lifecycle::library()
+        );
         assert!(!directory.path().join(".backup-activate").join(ID).exists());
     }
 
