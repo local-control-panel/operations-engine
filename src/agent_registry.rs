@@ -553,7 +553,6 @@ mod tests {
         assert_eq!(verified.agent.version, "1.2.0");
         assert_eq!(verified.agent.default_schedule, Some("0 5 * * *"));
         assert!(verified.agent.configurable_schedule);
-        assert!(!verified.agent.bundled);
         assert_eq!(verified.agent.installed_script(), GOOD);
     }
 

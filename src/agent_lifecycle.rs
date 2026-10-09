@@ -59,9 +59,6 @@ pub struct Agent {
     /// monitoring loops, which keep their fixed cadence.
     pub configurable_schedule: bool,
     script: &'static str,
-    /// Built-in agents inline the shared library. An agent installed from the
-    /// registry is self-contained and is written exactly as it was verified.
-    pub bundled: bool,
     /// Set for an agent that runs from a sandboxed systemd timer instead of a
     /// cron line: the paths its service may write to (validated).
     pub systemd_writable: Option<&'static [&'static str]>,
@@ -95,7 +92,6 @@ impl Agent {
             default_schedule: default_schedule.map(|text| &*Box::leak(text.into_boxed_str())),
             configurable_schedule,
             script: Box::leak(script.into_boxed_str()),
-            bundled: false,
             systemd_writable: systemd_writable.map(|paths| {
                 &*Box::leak(
                     paths
@@ -114,15 +110,11 @@ impl Agent {
         Self::from_registry(name, String::new(), None, false, String::new(), None)
     }
 
-    /// The file that is written to disk: the script with the shared library
-    /// inlined, because the scripts run their Python from a heredoc, where
-    /// `import wcp_agent_lib` cannot find a file next to the script.
+    /// The file that is written to disk: the script exactly as it was
+    /// verified. A script that needs the shared Python library imports it from
+    /// the file the install writes next to it.
     pub fn installed_script(&self) -> String {
-        if self.bundled {
-            bundle(self.script)
-        } else {
-            self.script.to_owned()
-        }
+        self.script.to_owned()
     }
 
     pub fn relative_script_path(&self) -> String {
@@ -141,7 +133,6 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("* * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/metrics-agent.sh"),
-        bundled: true,
         systemd_writable: None,
     },
     Agent {
@@ -150,7 +141,6 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("*/5 * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/resource-alert.sh"),
-        bundled: true,
         systemd_writable: None,
     },
     Agent {
@@ -159,7 +149,6 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: None,
         configurable_schedule: false,
         script: include_str!("../resources/agents/backup-agent.sh"),
-        bundled: true,
         systemd_writable: None,
     },
     Agent {
@@ -168,7 +157,6 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("* * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/bruteforce-guard.sh"),
-        bundled: true,
         systemd_writable: None,
     },
     Agent {
@@ -177,7 +165,6 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("0 3 * * *"),
         configurable_schedule: true,
         script: include_str!("../resources/agents/backup-restore-drill.sh"),
-        bundled: true,
         systemd_writable: None,
     },
     Agent {
@@ -186,7 +173,6 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("0 8 * * *"),
         configurable_schedule: true,
         script: include_str!("../resources/agents/error-log-digest.sh"),
-        bundled: true,
         systemd_writable: None,
     },
     Agent {
@@ -195,7 +181,6 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("0 4 * * *"),
         configurable_schedule: true,
         script: include_str!("../resources/agents/cache-warmup.sh"),
-        bundled: true,
         systemd_writable: None,
     },
 ];
@@ -206,41 +191,6 @@ pub fn find(name: &str) -> Option<&'static Agent> {
 
 pub fn library() -> &'static str {
     LIBRARY
-}
-
-/// Byte-for-byte what the panel's `bundle_agent_script` produced, so an agent
-/// installed by the engine behaves exactly like one installed over SFTP.
-pub fn bundle(script: &str) -> String {
-    let library = base64(LIBRARY.as_bytes());
-    script.replace(
-        "from wcp_agent_lib import",
-        &format!(
-            "import base64, types\n_agent_lib = types.ModuleType('wcp_agent_lib')\nexec(base64.b64decode('{library}'), _agent_lib.__dict__)\nsys.modules['wcp_agent_lib'] = _agent_lib\nfrom wcp_agent_lib import"
-        ),
-    )
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let n = (u32::from(chunk[0]) << 16)
-            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
-            | u32::from(*chunk.get(2).unwrap_or(&0));
-        out.push(char::from(ALPHABET[(n >> 18) as usize & 63]));
-        out.push(char::from(ALPHABET[(n >> 12) as usize & 63]));
-        out.push(if chunk.len() > 1 {
-            char::from(ALPHABET[(n >> 6) as usize & 63])
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            char::from(ALPHABET[n as usize & 63])
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -540,37 +490,37 @@ mod tests {
 
     const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 
-    /// SHA-256 of every installed script (bundled with the library). The panel
+    /// SHA-256 of every installed script (the plain source). The panel
     /// pins the same values, so a script edited on one side only fails a test
     /// on that side.
     pub const PINNED: [(&str, &str); 7] = [
         (
             "metrics-agent",
-            "ffe4396a1a3a1de9289509ea43fdcbea6806524222d4acdd91cd5e3ae2baf883",
+            "65244a0376b2065dbb74f873adb438575ca4a87c02be549c13b3298a1adc3807",
         ),
         (
             "resource-alert",
-            "efb4916b100782f781922d44cbd0e12a94753579622c38bac2aa35674ecb3b9f",
+            "8e286f0c64465f2aa6dba83a347f4b2e69829c94469e933f7dd4ae9f197632c6",
         ),
         (
             "backup-agent",
-            "4e11c76d30c28e5e3139441d8ea7f2c2a0f9e7bc704465e682c395f39def259b",
+            "2547ade7402d6aaabefc67ef4bda69ffe31755d9e0e1cd2ded77570056b7898f",
         ),
         (
             "bruteforce-guard",
-            "57ef84978e6a5c9e37d319f1a35fb20256b615572061135ecb164f88eec0e962",
+            "58449f8898559582e46537053fa9260903eac30b65decff58307fbbf94349eb9",
         ),
         (
             "backup-restore-drill",
-            "6cd1563d4865a282fa06d0c00cba7cbbfa384154ecf0d3578509509de7d9c4e5",
+            "b4e342481f058677b1db441450447a674d9d4002d0cab0eb959817bc26d642b3",
         ),
         (
             "error-log-digest",
-            "a5d475708c2718b05f7dda7335d050e340a46fb06e701d1945b9bc173631c015",
+            "640a4067de5866ef14cb57c7051e5de6a0eb0e418dd9d500149fd00367fb68ba",
         ),
         (
             "cache-warmup",
-            "f85f9c8a5b23980e2e2f3dd11a8386991f74c9bd5e3b4d48c41bdf3f35e06eec",
+            "900cc47aac66b8b5829f2c739ba129e4ca9f2cd5dbb5e045e88dcbd27c59833f",
         ),
     ];
 
@@ -581,25 +531,15 @@ mod tests {
     }
 
     #[test]
-    fn base64_matches_the_standard_vectors() {
-        assert_eq!(base64(b""), "");
-        assert_eq!(base64(b"f"), "Zg==");
-        assert_eq!(base64(b"fo"), "Zm8=");
-        assert_eq!(base64(b"foo"), "Zm9v");
-        assert_eq!(base64(b"foob"), "Zm9vYg==");
-        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn every_script_inlines_the_library_once_and_is_pinned() {
+    fn every_script_is_the_plain_source_and_pinned() {
         for (agent, (name, pin)) in AGENTS.iter().zip(PINNED) {
             assert_eq!(agent.name, name);
             let installed = agent.installed_script();
-            assert_eq!(
-                installed.matches("_agent_lib.__dict__").count(),
-                1,
-                "{name}"
+            assert!(!installed.contains("b64decode"), "{name}");
+            assert!(
+                installed.contains("sys.path.insert(0,")
+                    && installed.contains("from wcp_agent_lib import"),
+                "{name} must import the library file installed next to it"
             );
             assert_eq!(
                 digest(&installed),

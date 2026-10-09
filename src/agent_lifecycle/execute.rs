@@ -566,7 +566,7 @@ pub fn install(
             let previous_entry = manifest_entry(previous_manifest_text, agent.name);
 
             let files_current = previous_script.as_deref() == Some(script.as_bytes())
-                && (!agent.bundled || previous_library.as_deref() == Some(library().as_bytes()))
+                && previous_library.as_deref() == Some(library().as_bytes())
                 && is_executable(ctx.root, &script_path)
                 && previous_entry
                     .as_ref()
@@ -592,9 +592,7 @@ pub fn install(
                 ctx.root.create_dir_all(&agents_dir).map_err(Error::Io)?;
                 ctx.root.set_mode(&agents_dir, 0o700).map_err(Error::Io)?;
                 let written = (|| -> std::io::Result<()> {
-                    if agent.bundled {
-                        write(ctx.root, &library_path, library().as_bytes(), Kind::Private)?;
-                    }
+                    write(ctx.root, &library_path, library().as_bytes(), Kind::Private)?;
                     write(ctx.root, &script_path, script.as_bytes(), Kind::Executable)?;
                     write(ctx.root, &manifest_path, manifest.as_bytes(), Kind::Private)
                 })();
@@ -605,9 +603,7 @@ pub fn install(
                     // The crontab line never became live; put the files back.
                     restore(ctx.root, &manifest_path, &previous_manifest, Kind::Private);
                     restore(ctx.root, &script_path, &previous_script, Kind::Executable);
-                    if agent.bundled {
-                        restore(ctx.root, &library_path, &previous_library, Kind::Private);
-                    }
+                    restore(ctx.root, &library_path, &previous_library, Kind::Private);
                     return Err(error);
                 }
             } else {
@@ -701,8 +697,8 @@ pub fn remove(
                     return Err(undo_tab(Error::Io(error)));
                 }
             }
-            // The shared library goes with the last agent; the scripts carry
-            // their own inlined copy, so nothing needs it once none is left.
+            // The shared library goes with the last agent: the scripts import
+            // it from that file, so nothing needs it once none is left.
             if had_entry
                 && manifest_is_empty(&manifest_with(previous_manifest_text, agent.name, None))
             {
@@ -944,7 +940,7 @@ mod tests {
     }
 
     #[test]
-    fn a_registry_agent_is_written_as_verified_without_the_library_and_removed_by_name() {
+    fn a_registry_agent_is_written_as_verified_with_the_library_and_removed_by_name() {
         let host = host(Some("MAILTO=x\n"));
         let script = "#!/usr/bin/env bash\necho from the registry\n".to_owned();
         let agent = crate::agent_lifecycle::Agent::from_registry(
@@ -966,7 +962,7 @@ mod tests {
         assert_eq!(result.script_sha256, sha256(script.as_bytes()));
         assert_eq!(host.file("agents/disk-report.sh").unwrap(), script);
         assert_eq!(host.mode("agents/disk-report.sh"), 0o755);
-        assert!(host.file("agents/wcp_agent_lib.py").is_none());
+        assert_eq!(host.file("agents/wcp_agent_lib.py").unwrap(), library());
         assert_eq!(
             host.tab(),
             "MAILTO=x\n0 5 * * * bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n"
