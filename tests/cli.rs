@@ -42,6 +42,7 @@ fn capabilities_describe_only_implemented_operations() {
             "doctor",
             "operation.status",
             "operation.list",
+            "operation.incomplete",
             "backup.delete",
             "backup.importRemote",
             "backup.installRclone",
