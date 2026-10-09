@@ -59,14 +59,57 @@ pub struct Agent {
     /// monitoring loops, which keep their fixed cadence.
     pub configurable_schedule: bool,
     script: &'static str,
+    /// Built-in agents inline the shared library. An agent installed from the
+    /// registry is self-contained and is written exactly as it was verified.
+    pub bundled: bool,
+}
+
+/// Lowercase letters, digits and `-`, starting with a letter or digit.
+pub fn valid_agent_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    name.len() <= 64
+        && bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 impl Agent {
+    /// An agent that was verified against the registry. The engine is a
+    /// one-shot process per request, so the few strings are leaked instead of
+    /// threading a lifetime through every pipeline.
+    pub fn from_registry(
+        name: String,
+        version: String,
+        default_schedule: Option<String>,
+        configurable_schedule: bool,
+        script: String,
+    ) -> &'static Agent {
+        Box::leak(Box::new(Agent {
+            name: Box::leak(name.into_boxed_str()),
+            version: Box::leak(version.into_boxed_str()),
+            default_schedule: default_schedule.map(|text| &*Box::leak(text.into_boxed_str())),
+            configurable_schedule,
+            script: Box::leak(script.into_boxed_str()),
+            bundled: false,
+        }))
+    }
+
+    /// Only a name, for removing an agent the registry installed: removal
+    /// needs the name and nothing else.
+    fn named(name: String) -> &'static Agent {
+        Self::from_registry(name, String::new(), None, false, String::new())
+    }
+
     /// The file that is written to disk: the script with the shared library
     /// inlined, because the scripts run their Python from a heredoc, where
     /// `import wcp_agent_lib` cannot find a file next to the script.
     pub fn installed_script(&self) -> String {
-        bundle(self.script)
+        if self.bundled {
+            bundle(self.script)
+        } else {
+            self.script.to_owned()
+        }
     }
 
     pub fn relative_script_path(&self) -> String {
@@ -85,6 +128,7 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("* * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/metrics-agent.sh"),
+        bundled: true,
     },
     Agent {
         name: "resource-alert",
@@ -92,6 +136,7 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("*/5 * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/resource-alert.sh"),
+        bundled: true,
     },
     Agent {
         name: "backup-agent",
@@ -99,6 +144,7 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: None,
         configurable_schedule: false,
         script: include_str!("../resources/agents/backup-agent.sh"),
+        bundled: true,
     },
     Agent {
         name: GUARD_NAME,
@@ -106,6 +152,7 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("* * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/bruteforce-guard.sh"),
+        bundled: true,
     },
     Agent {
         name: "backup-restore-drill",
@@ -113,6 +160,7 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("0 3 * * *"),
         configurable_schedule: true,
         script: include_str!("../resources/agents/backup-restore-drill.sh"),
+        bundled: true,
     },
     Agent {
         name: "error-log-digest",
@@ -120,6 +168,7 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("0 8 * * *"),
         configurable_schedule: true,
         script: include_str!("../resources/agents/error-log-digest.sh"),
+        bundled: true,
     },
     Agent {
         name: "cache-warmup",
@@ -127,6 +176,7 @@ pub static AGENTS: [Agent; 7] = [
         default_schedule: Some("0 4 * * *"),
         configurable_schedule: true,
         script: include_str!("../resources/agents/cache-warmup.sh"),
+        bundled: true,
     },
 ];
 
@@ -256,7 +306,9 @@ pub struct RemoveRequest {
 impl RemoveRequest {
     pub fn parse(json: &str, request_id: &str, key: Option<&str>) -> Result<Self, RequestError> {
         let plan: RemovePlan = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
-        let agent = find(&plan.name).ok_or(RequestError::UnknownAgent)?;
+        let agent = find(&plan.name)
+            .or_else(|| valid_agent_name(&plan.name).then(|| Agent::named(plan.name.clone())))
+            .ok_or(RequestError::UnknownAgent)?;
         let (request_id, idempotency_key) = ids(request_id, key)?;
         Ok(Self {
             agent,
@@ -587,12 +639,17 @@ mod tests {
     #[test]
     fn remove_and_unban_requests_are_strict() {
         assert!(RemoveRequest::parse(r#"{"name":"backup-agent"}"#, ID, None).is_ok());
-        assert_eq!(
-            RemoveRequest::parse(r#"{"name":"x"}"#, ID, None)
-                .err()
-                .unwrap(),
-            RequestError::UnknownAgent
-        );
+        // A name outside the catalog may belong to a registry agent.
+        assert!(RemoveRequest::parse(r#"{"name":"disk-report"}"#, ID, None).is_ok());
+        for name in ["../x", "X", "a b", "", "-x", "a;b"] {
+            assert_eq!(
+                RemoveRequest::parse(&format!(r#"{{"name":"{name}"}}"#), ID, None)
+                    .err()
+                    .unwrap(),
+                RequestError::UnknownAgent,
+                "{name:?}"
+            );
+        }
         assert!(UnbanRequest::parse(r#"{"ip":"203.0.113.7"}"#, ID, None).is_ok());
         assert!(UnbanRequest::parse(r#"{"ip":"::1"}"#, ID, None).is_ok());
         for ip in ["1.2.3.4; rm -rf /", "not-an-ip", "", "1.2.3.4 ", "1.2.3"] {

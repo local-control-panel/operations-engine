@@ -1,5 +1,5 @@
 use crate::{
-    agent_config, agent_lifecycle,
+    agent_config, agent_lifecycle, agent_registry,
     cli::AgentCommand,
     commands::read_root_owned_content_file,
     error::ErrorCode,
@@ -17,6 +17,26 @@ pub fn run(command: AgentCommand) -> Result<Response, ResponseBuildError> {
             idempotency_key,
         } => lifecycle(
             agent_lifecycle::INSTALL_OPERATION,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        AgentCommand::InstallFromRegistry {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => lifecycle(
+            agent_registry::INSTALL_OPERATION,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        AgentCommand::Approve {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => lifecycle(
+            agent_registry::APPROVE_OPERATION,
             &request_file,
             &request_id,
             idempotency_key.as_deref(),
@@ -137,6 +157,15 @@ fn lifecycle(
             }};
         }
         match operation {
+            agent_registry::INSTALL_OPERATION => Ok(install_from_registry(
+                &context,
+                &engine_state,
+                &json,
+                request_id,
+                key,
+                &cancel,
+            )),
+            agent_registry::APPROVE_OPERATION => Ok(approve(&engine_state, &json, request_id)),
             agent_lifecycle::INSTALL_OPERATION => {
                 run!(agent_lifecycle::InstallRequest, execute::install)
             }
@@ -223,4 +252,131 @@ fn activate(path: &std::path::Path) -> Result<Response, ResponseBuildError> {
             "agent.activateBruteforceConfig requires a Unix host",
         ))
     }
+}
+
+fn registry_request_message(error: agent_registry::RequestError) -> &'static str {
+    use agent_registry::RequestError;
+    match error {
+        RequestError::InvalidJson => "request-file is not a valid registry agent request",
+        RequestError::InvalidName => "name is not a valid agent name",
+        RequestError::InvalidRelease => "release must be a plain x.y.z version",
+        RequestError::InvalidHash => "sha256 must be 64 lowercase hex characters",
+        RequestError::InvalidSchedule => {
+            "schedule must be five cron fields or @hourly/@daily/@weekly/@monthly/@yearly"
+        }
+        RequestError::InvalidRequestId => "request-id is not a canonical UUID",
+        RequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+#[cfg(unix)]
+fn install_from_registry(
+    context: &agent_lifecycle::execute::Context<'_>,
+    engine_state: &ManagedRoot,
+    json: &str,
+    request_id: &str,
+    key: Option<&str>,
+    cancel: &crate::process::CancellationToken,
+) -> Response {
+    use crate::transaction::{IdempotencyKey, RequestId};
+    let operation = agent_registry::INSTALL_OPERATION;
+    let failure = |code: ErrorCode, message: &str| Response::failure(operation, code, message);
+    let request = match agent_registry::InstallRequest::parse(json) {
+        Ok(v) => v,
+        Err(error) => return failure(ErrorCode::InvalidInput, registry_request_message(error)),
+    };
+    let Ok(request_id) = RequestId::parse(request_id) else {
+        return failure(
+            ErrorCode::InvalidInput,
+            "request-id is not a canonical UUID",
+        );
+    };
+    let idempotency_key = match key.map(IdempotencyKey::parse).transpose() {
+        Ok(v) => v,
+        Err(_) => return failure(ErrorCode::InvalidInput, "idempotency-key is invalid"),
+    };
+    let approved = |name: &str, sha256: &str| {
+        crate::site::SiteRelativePath::parse(agent_registry::approval_file(name, sha256))
+            .is_ok_and(|path| engine_state.exists(&path))
+    };
+    // Downloaded before the transaction starts, so no lock is held on the
+    // network.
+    let verified = match agent_registry::fetch_verified(
+        &agent_registry::Source::default(),
+        &agent_registry::network_fetch,
+        &request,
+        env!("CARGO_PKG_VERSION"),
+        &approved,
+    ) {
+        Ok(v) => v,
+        Err(error) => {
+            let (code, message) = error.protocol();
+            return failure(code, &message);
+        }
+    };
+    let install = agent_lifecycle::InstallRequest {
+        agent: verified.agent,
+        schedule: request.schedule,
+        request_id,
+        idempotency_key,
+    };
+    match agent_lifecycle::execute::install(context, &install, cancel) {
+        Ok(value) => Response::success(operation, value).unwrap_or_else(|_| {
+            failure(
+                ErrorCode::InternalSerializationError,
+                "could not build the response",
+            )
+        }),
+        Err(error) => {
+            let (code, message) = error.protocol();
+            failure(code, &message)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn approve(engine_state: &ManagedRoot, json: &str, request_id: &str) -> Response {
+    use crate::{site::SiteRelativePath, transaction::RequestId};
+    let operation = agent_registry::APPROVE_OPERATION;
+    let failure = |code: ErrorCode, message: &str| Response::failure(operation, code, message);
+    let request = match agent_registry::ApproveRequest::parse(json) {
+        Ok(v) => v,
+        Err(error) => return failure(ErrorCode::InvalidInput, registry_request_message(error)),
+    };
+    if RequestId::parse(request_id).is_err() {
+        return failure(
+            ErrorCode::InvalidInput,
+            "request-id is not a canonical UUID",
+        );
+    }
+    let dir = SiteRelativePath::parse(agent_registry::APPROVALS_DIR).expect("literal path");
+    let file = SiteRelativePath::parse(agent_registry::approval_file(
+        &request.name,
+        &request.sha256,
+    ))
+    .expect("validated name and hash");
+    let written = engine_state
+        .create_dir_all(&dir)
+        .and_then(|()| engine_state.write_atomic_private(&file, b"approved\n"));
+    if written.is_err() {
+        return failure(ErrorCode::Internal, "could not record the approval");
+    }
+    let approved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    Response::success(
+        operation,
+        serde_json::json!({
+            "name": request.name,
+            "sha256": request.sha256,
+            "approvedAtUnixSecs": approved_at,
+        }),
+    )
+    .unwrap_or_else(|_| {
+        failure(
+            ErrorCode::InternalSerializationError,
+            "could not build the response",
+        )
+    })
 }
