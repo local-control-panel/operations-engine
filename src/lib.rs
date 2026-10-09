@@ -1,6 +1,7 @@
 pub mod agent_config;
 pub mod agent_lifecycle;
 pub mod agent_registry;
+pub mod agent_systemd;
 pub mod backup_create;
 pub mod backup_delete;
 pub mod backup_deploy;

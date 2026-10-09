@@ -8,12 +8,13 @@
 //! a scope of its own.
 
 use super::{
-    AGENTS_DIR, BANS_FILE, EVENTS_FILE, GUARD_NAME, INSTALL_OPERATION, InstallRequest,
-    InstallResult, LIBRARY_FILE, MANIFEST_FILE, REMOVE_OPERATION, RemoveRequest, RemoveResult,
-    UNBAN_OPERATION, UnbanRequest, UnbanResult, current_schedule, find, library, manifest_entry,
-    manifest_with, tab_too_large, unban_event, with_agent, without_ban,
+    AGENTS_DIR, Agent, BANS_FILE, EVENTS_FILE, GUARD_NAME, INSTALL_OPERATION, InstallRequest,
+    InstallResult, LIBRARY_FILE, MANIFEST_FILE, REMOVE_OPERATION, ROOT, RemoveRequest,
+    RemoveResult, UNBAN_OPERATION, UnbanRequest, UnbanResult, current_schedule, find, library,
+    manifest_entry, manifest_with, tab_too_large, unban_event, with_agent, without_ban,
 };
 use crate::{
+    agent_systemd,
     backup_schedule::Schedule,
     cron::execute::{InstallFailure, open_cron_state, read_current_tab},
     error::ErrorCode,
@@ -36,6 +37,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const CRON_USER: &str = "root";
 /// The guard re-applies the ban list and reloads Caddy in a container.
 const APPLY_TIMEOUT: Duration = Duration::from_secs(120);
+const SYSTEMCTL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct Context<'a> {
     pub engine_state: &'a ManagedRoot,
@@ -45,6 +47,16 @@ pub struct Context<'a> {
     pub crontab_program: &'a str,
     /// What runs the guard script; `bash` outside tests.
     pub shell_program: &'a str,
+    /// Where sandboxed agents get their units. None when systemd is not the
+    /// init of this host; such agents then run from cron like any other.
+    pub systemd: Option<Systemd<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Systemd<'a> {
+    /// `/etc/systemd/system`.
+    pub units: &'a ManagedRoot,
+    pub systemctl_program: &'a str,
 }
 
 #[derive(Debug)]
@@ -60,6 +72,7 @@ pub enum Error {
     Install(InstallFailure),
     Cancelled,
     ApplyFailed(Option<ErrorCode>),
+    Systemd(Option<ErrorCode>),
     Replayed { code: ErrorCode, message: String },
 }
 
@@ -110,6 +123,10 @@ impl Error {
             Self::ApplyFailed(code) => (
                 code.unwrap_or(ErrorCode::SubprocessFailed),
                 "the brute-force guard could not apply the ban list; the ban was kept".into(),
+            ),
+            Self::Systemd(code) => (
+                code.unwrap_or(ErrorCode::SubprocessFailed),
+                "systemctl could not set up the agent's timer; nothing was changed".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
         }
@@ -302,6 +319,179 @@ fn is_executable(root: &ManagedRoot, path: &SiteRelativePath) -> bool {
     root.mode(path).is_ok_and(|mode| mode & 0o777 == 0o755)
 }
 
+/// What a sandboxed install will leave on the host.
+struct UnitsPlan {
+    service: String,
+    timer: String,
+    writable: &'static [&'static str],
+}
+
+fn unit_path(name: String) -> SiteRelativePath {
+    rel(&name)
+}
+
+fn systemctl(sd: &Systemd<'_>, args: &[&str]) -> Result<(), Error> {
+    let output = process::run(
+        &ProcessRequest::new(sd.systemctl_program).args(args),
+        &ProcessLimits {
+            timeout: SYSTEMCTL_TIMEOUT,
+            ..ProcessLimits::default()
+        },
+        &CancellationToken::default(),
+    );
+    match output {
+        Ok(output) => match process::error_code(&output.termination) {
+            None => Ok(()),
+            code => Err(Error::Systemd(code)),
+        },
+        Err(error) => Err(Error::Systemd(Some(process::spawn_error_code(&error)))),
+    }
+}
+
+fn read_unit(sd: &Systemd<'_>, name: String) -> Option<Vec<u8>> {
+    sd.units.read_bytes(&unit_path(name)).ok()
+}
+
+fn write_unit(sd: &Systemd<'_>, name: String, bytes: &[u8]) -> std::io::Result<()> {
+    let path = unit_path(name);
+    sd.units.write_atomic(&path, bytes)?;
+    // systemd warns about world-inaccessible units, and the umask is not ours.
+    sd.units.set_mode(&path, 0o644)
+}
+
+/// Puts the units back as they were (`None` = absent) and tells systemd.
+/// Best effort: this runs on a failure path that is already reporting.
+fn restore_units(sd: &Systemd<'_>, agent: &Agent, previous: &(Option<Vec<u8>>, Option<Vec<u8>>)) {
+    let timer = agent_systemd::timer_name(agent);
+    let service = agent_systemd::service_name(agent);
+    if previous.1.is_none() {
+        let _ = systemctl(sd, &["disable", "--now", &timer]);
+    }
+    for (name, bytes) in [(service, &previous.0), (timer.clone(), &previous.1)] {
+        let _ = match bytes {
+            Some(bytes) => write_unit(sd, name, bytes),
+            None => sd.units.remove_file(&unit_path(name)).or_else(|error| {
+                (error.kind() == std::io::ErrorKind::NotFound)
+                    .then_some(())
+                    .ok_or(error)
+            }),
+        };
+    }
+    let _ = systemctl(sd, &["daemon-reload"]);
+    if previous.1.is_some() {
+        let _ = systemctl(sd, &["restart", &timer]);
+    }
+}
+
+/// Takes the agent's timer and units out. Returns whether there were any.
+fn remove_units(sd: &Systemd<'_>, agent: &Agent) -> Result<bool, Error> {
+    let timer = agent_systemd::timer_name(agent);
+    let service = agent_systemd::service_name(agent);
+    let previous = (read_unit(sd, service.clone()), read_unit(sd, timer.clone()));
+    if previous.0.is_none() && previous.1.is_none() {
+        return Ok(false);
+    }
+    if previous.1.is_some() {
+        systemctl(sd, &["disable", "--now", &timer])?;
+    }
+    // A run that is already going finishes under its own terms; stopping the
+    // service is only about not leaving a stale unit behind.
+    let _ = systemctl(sd, &["stop", &service]);
+    for name in [service, timer] {
+        if let Err(error) = sd.units.remove_file(&unit_path(name)) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                restore_units(sd, agent, &previous);
+                return Err(Error::Io(error));
+            }
+        }
+    }
+    systemctl(sd, &["daemon-reload"])?;
+    Ok(true)
+}
+
+/// The crontab (and, for a sandboxed agent, the timer) goes live last.
+///
+/// Sandboxed: units first, then the cron line is dropped, so a failure at the
+/// crontab leaves the cron line running and the units are removed again.
+/// Otherwise: the cron line, and any units a previous sandboxed install left
+/// are taken out so the agent does not run twice.
+fn activate(
+    ctx: &Context<'_>,
+    agent: &Agent,
+    plan: Option<&UnitsPlan>,
+    before: &str,
+    content: &str,
+) -> Result<(), Error> {
+    let (Some(plan), Some(sd)) = (plan, ctx.systemd.as_ref()) else {
+        install_guarded(ctx, before, content)?;
+        if let Some(sd) = ctx.systemd.as_ref() {
+            if let Err(error) = remove_units(sd, agent) {
+                // The new cron line must not stay live next to a timer while
+                // the caller puts the old files back.
+                let _ = crate::cron::execute::install(
+                    ctx.state_root,
+                    ctx.crontab_program,
+                    before,
+                    None,
+                );
+                return Err(error);
+            }
+        }
+        return Ok(());
+    };
+    let previous = (
+        read_unit(sd, agent_systemd::service_name(agent)),
+        read_unit(sd, agent_systemd::timer_name(agent)),
+    );
+    let changed = previous.0.as_deref() != Some(plan.service.as_bytes())
+        || previous.1.as_deref() != Some(plan.timer.as_bytes());
+    let timer = agent_systemd::timer_name(agent);
+    let go_live = || -> Result<(), Error> {
+        for path in plan.writable {
+            if !agent_systemd::has_no_symlink(path) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a writable path goes through a symlink",
+                )));
+            }
+            // Only the agent root is ours to create; other paths must exist
+            // (a missing one is skipped by the leading `-` in the unit).
+            if let Some(inside) = path.strip_prefix(&format!("{ROOT}/")) {
+                let inside = rel(inside);
+                ctx.root.create_dir_all(&inside).map_err(Error::Io)?;
+                ctx.root.set_mode(&inside, 0o700).map_err(Error::Io)?;
+            }
+        }
+        if changed {
+            write_unit(
+                sd,
+                agent_systemd::service_name(agent),
+                plan.service.as_bytes(),
+            )
+            .and_then(|()| write_unit(sd, timer.clone(), plan.timer.as_bytes()))
+            .map_err(Error::Io)?;
+            systemctl(sd, &["daemon-reload"])?;
+        }
+        systemctl(sd, &["enable", &timer])?;
+        systemctl(sd, &[if changed { "restart" } else { "start" }, &timer])
+    };
+    if let Err(error) = go_live() {
+        if changed {
+            restore_units(sd, agent, &previous);
+        }
+        return Err(error);
+    }
+    if let Err(error) = install_guarded(ctx, before, content) {
+        if changed {
+            restore_units(sd, agent, &previous);
+        } else if previous.1.is_none() {
+            let _ = systemctl(sd, &["disable", "--now", &timer]);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn install(
     ctx: &Context<'_>,
     request: &InstallRequest,
@@ -322,6 +512,11 @@ pub fn install(
                     .schedule
                     .clone()
                     .or_else(|| current_schedule(&before, agent.name))
+                    .or_else(|| {
+                        let sd = ctx.systemd.as_ref()?;
+                        let timer = read_unit(sd, agent_systemd::timer_name(agent))?;
+                        agent_systemd::schedule_from_timer(&String::from_utf8_lossy(&timer))
+                    })
             } else {
                 None
             }
@@ -330,7 +525,32 @@ pub fn install(
                     .default_schedule
                     .map(|text| Schedule::parse(text).expect("catalog schedules are valid"))
             });
-            let (content, replaced) = with_agent(&before, agent, schedule.as_ref());
+            // A sandboxed agent gets a timer when this host has systemd and
+            // cron's schedule has an exact OnCalendar equivalent; otherwise it
+            // stays on cron.
+            let units = match (agent.systemd_writable, ctx.systemd.as_ref(), &schedule) {
+                (Some(writable), Some(_), Some(schedule)) => agent_systemd::on_calendar(schedule)
+                    .map(|calendar| UnitsPlan {
+                        service: agent_systemd::service_unit(agent, writable),
+                        timer: agent_systemd::timer_unit(agent, schedule, &calendar),
+                        writable,
+                    }),
+                _ => None,
+            };
+            let unit_drift = match (&units, ctx.systemd.as_ref()) {
+                (Some(plan), Some(sd)) => {
+                    read_unit(sd, agent_systemd::service_name(agent)).as_deref()
+                        != Some(plan.service.as_bytes())
+                        || read_unit(sd, agent_systemd::timer_name(agent)).as_deref()
+                            != Some(plan.timer.as_bytes())
+                }
+                _ => false,
+            };
+            let (content, replaced) = with_agent(
+                &before,
+                agent,
+                schedule.as_ref().filter(|_| units.is_none()),
+            );
 
             let agents_dir = rel(AGENTS_DIR);
             let script_path = rel(&agent.relative_script_path());
@@ -380,7 +600,7 @@ pub fn install(
                 })();
                 let committed = written
                     .map_err(Error::Io)
-                    .and_then(|()| install_guarded(ctx, &before, &content));
+                    .and_then(|()| activate(ctx, agent, units.as_ref(), &before, &content));
                 if let Err(error) = committed {
                     // The crontab line never became live; put the files back.
                     restore(ctx.root, &manifest_path, &previous_manifest, Kind::Private);
@@ -391,14 +611,16 @@ pub fn install(
                     return Err(error);
                 }
             } else {
-                install_guarded(ctx, &before, &content)?;
+                activate(ctx, agent, units.as_ref(), &before, &content)?;
             }
+            let on_systemd = units.is_some();
             Ok(InstallResult {
                 name: agent.name.to_owned(),
                 version: agent.version.to_owned(),
                 schedule: schedule.map(|value| value.as_str().to_owned()),
-                changed: !files_current || before != content,
+                changed: !files_current || before != content || unit_drift,
                 replaced_cron_lines: replaced as u32,
+                scheduler: if on_systemd { "systemd" } else { "cron" }.to_owned(),
                 script_sha256: sha256(script.as_bytes()),
                 installed_at_unix_secs: installed_at,
             })
@@ -430,10 +652,35 @@ pub fn remove(
                 .as_deref()
                 .and_then(|bytes| std::str::from_utf8(bytes).ok());
             let had_entry = manifest_entry(previous_manifest_text, agent.name).is_some();
-            let removed = removed_lines > 0 || previous_script.is_some() || had_entry;
+            let units_present = ctx.systemd.as_ref().is_some_and(|sd| {
+                read_unit(sd, agent_systemd::service_name(agent)).is_some()
+                    || read_unit(sd, agent_systemd::timer_name(agent)).is_some()
+            });
+            let removed =
+                removed_lines > 0 || previous_script.is_some() || had_entry || units_present;
 
-            // The line goes first, so cron never runs a missing script.
-            install_guarded(ctx, &before, &content)?;
+            // The schedule goes first, so nothing runs a missing script. A
+            // timer is stopped before the crontab is touched; if that fails,
+            // it comes back.
+            let previous_units = ctx.systemd.as_ref().map(|sd| {
+                (
+                    read_unit(sd, agent_systemd::service_name(agent)),
+                    read_unit(sd, agent_systemd::timer_name(agent)),
+                )
+            });
+            if let Some(sd) = ctx.systemd.as_ref() {
+                remove_units(sd, agent)?;
+            }
+            if let Err(error) = install_guarded(ctx, &before, &content) {
+                if let (Some(sd), Some(previous)) = (ctx.systemd.as_ref(), previous_units.as_ref())
+                {
+                    if units_present {
+                        restore_units(sd, agent, previous);
+                        let _ = systemctl(sd, &["enable", &agent_systemd::timer_name(agent)]);
+                    }
+                }
+                return Err(error);
+            }
             let undo_tab = |error: Error| {
                 let _ = crate::cron::execute::install(
                     ctx.state_root,
@@ -474,6 +721,7 @@ pub fn remove(
                 name: agent.name.to_owned(),
                 removed,
                 removed_cron_lines: removed_lines as u32,
+                removed_systemd_units: units_present,
                 removed_at_unix_secs: now(),
             })
         },
@@ -573,6 +821,8 @@ mod tests {
         root: ManagedRoot,
         crontab: String,
         shell: String,
+        units: ManagedRoot,
+        systemctl: String,
     }
 
     fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
@@ -607,7 +857,20 @@ mod tests {
             ),
         );
         let state_root = TrustedRoot::parse(&state).unwrap();
+        std::fs::create_dir_all(dir.path().join("units")).unwrap();
+        // Logs every call; `systemctl-fail` names a subcommand that fails.
+        let systemctl = script(
+            dir.path(),
+            "systemctl",
+            &format!(
+                "D='{d}'\necho \"$@\" >> \"$D/systemctl-calls\"\n[ \"$1\" = \"$(cat \"$D/systemctl-fail\" 2>/dev/null)\" ] && exit 1\nexit 0",
+                d = dir.path().display()
+            ),
+        );
         Host {
+            units: ManagedRoot::open(&TrustedRoot::parse(dir.path().join("units")).unwrap())
+                .unwrap(),
+            systemctl,
             engine_state: ManagedRoot::open(&state_root).unwrap(),
             root: ManagedRoot::open(&TrustedRoot::parse(&root).unwrap()).unwrap(),
             state_root,
@@ -629,7 +892,30 @@ mod tests {
                 root: &self.root,
                 crontab_program: &self.crontab,
                 shell_program: &self.shell,
+                systemd: None,
             }
+        }
+        fn sd_ctx(&self) -> Context<'_> {
+            Context {
+                systemd: Some(Systemd {
+                    units: &self.units,
+                    systemctl_program: &self.systemctl,
+                }),
+                ..self.ctx()
+            }
+        }
+        fn unit(&self, name: &str) -> Option<String> {
+            std::fs::read_to_string(self.dir.path().join("units").join(name)).ok()
+        }
+        fn systemctl_calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.path().join("systemctl-calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+        fn fail_systemctl(&self, subcommand: &str) {
+            std::fs::write(self.dir.path().join("systemctl-fail"), subcommand).unwrap();
         }
         fn tab(&self) -> String {
             std::fs::read_to_string(self.dir.path().join("tab")).unwrap_or_default()
@@ -667,6 +953,7 @@ mod tests {
             Some("0 5 * * *".into()),
             true,
             script.clone(),
+            None,
         );
         let request = InstallRequest {
             agent,
@@ -1026,6 +1313,292 @@ mod tests {
         let result = unban(&host, "198.51.100.1", A).unwrap();
         assert_eq!(result.removed_bans, 0);
         assert!(host.file("bruteforce-active-bans.txt").is_none());
+    }
+
+    fn sandboxed(schedule: &str, writable: &[&str]) -> &'static crate::agent_lifecycle::Agent {
+        crate::agent_lifecycle::Agent::from_registry(
+            "disk-report".into(),
+            "1.0.0".into(),
+            Some(schedule.into()),
+            true,
+            "#!/usr/bin/env bash\necho hi\n".into(),
+            Some(writable.iter().map(|p| (*p).to_owned()).collect()),
+        )
+    }
+
+    fn install_agent(
+        host: &Host,
+        agent: &'static crate::agent_lifecycle::Agent,
+        schedule: Option<&str>,
+        id: &str,
+        with_systemd: bool,
+    ) -> Result<InstallResult, Error> {
+        let request = InstallRequest {
+            agent,
+            schedule: schedule.map(|s| Schedule::parse(s).unwrap()),
+            request_id: RequestId::parse(id).unwrap(),
+            idempotency_key: None,
+        };
+        let ctx = if with_systemd {
+            host.sd_ctx()
+        } else {
+            host.ctx()
+        };
+        install(&ctx, &request, &cancel())
+    }
+
+    const WRITABLE: [&str; 2] = ["/root/.wcp/agents", "/root/.wcp/logs"];
+
+    #[test]
+    fn a_sandboxed_agent_gets_a_timer_and_no_cron_line() {
+        let host = host(Some("MAILTO=x\n"));
+        let agent = sandboxed("0 5 * * *", &WRITABLE);
+        let result = install_agent(&host, agent, None, A, true).unwrap();
+        assert_eq!(result.scheduler, "systemd");
+        assert_eq!(result.schedule.as_deref(), Some("0 5 * * *"));
+        assert_eq!(host.tab(), "MAILTO=x\n");
+        let service = host.unit("wcp-agent-disk-report.service").unwrap();
+        assert!(service.contains("ProtectSystem=strict\n"));
+        assert!(service.contains("ReadWritePaths=-/root/.wcp/agents -/root/.wcp/logs\n"));
+        let timer = host.unit("wcp-agent-disk-report.timer").unwrap();
+        assert!(timer.contains("OnCalendar=*-*-* 05:00:00\n"));
+        assert_eq!(
+            host.systemctl_calls(),
+            [
+                "daemon-reload",
+                "enable wcp-agent-disk-report.timer",
+                "restart wcp-agent-disk-report.timer"
+            ]
+        );
+        assert!(host.dir.path().join("wcp/logs").is_dir());
+        assert_eq!(host.mode("logs"), 0o700);
+        let mode = std::fs::metadata(host.dir.path().join("units/wcp-agent-disk-report.timer"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[test]
+    fn an_existing_cron_install_migrates_to_a_timer_and_keeps_its_schedule() {
+        let host = host(Some(
+            "MAILTO=x\n0 7 * * 1 bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n5 5 * * * echo hi\n",
+        ));
+        let agent = sandboxed("0 5 * * *", &WRITABLE);
+        let result = install_agent(&host, agent, None, A, true).unwrap();
+        assert_eq!(result.scheduler, "systemd");
+        assert_eq!(result.replaced_cron_lines, 1);
+        assert_eq!(host.tab(), "MAILTO=x\n5 5 * * * echo hi\n");
+        assert!(
+            host.unit("wcp-agent-disk-report.timer")
+                .unwrap()
+                .contains("OnCalendar=Mon *-*-* 07:00:00\n")
+        );
+        // An update keeps the schedule that now lives in the timer.
+        let again = install_agent(&host, sandboxed("0 5 * * *", &WRITABLE), None, B, true).unwrap();
+        assert_eq!(again.schedule.as_deref(), Some("0 7 * * 1"));
+        assert!(!again.changed);
+    }
+
+    #[test]
+    fn an_unchanged_sandboxed_reinstall_only_starts_the_timer() {
+        let host = host(None);
+        let agent = sandboxed("0 5 * * *", &WRITABLE);
+        install_agent(&host, agent, None, A, true).unwrap();
+        let before = host.systemctl_calls().len();
+        let again = install_agent(&host, agent, None, B, true).unwrap();
+        assert!(!again.changed);
+        assert_eq!(
+            host.systemctl_calls()[before..],
+            [
+                "enable wcp-agent-disk-report.timer",
+                "start wcp-agent-disk-report.timer"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failing_systemctl_leaves_the_cron_line_and_no_units() {
+        let cron = "0 7 * * 1 bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n";
+        let host = host(Some(cron));
+        host.fail_systemctl("enable");
+        let error =
+            install_agent(&host, sandboxed("0 5 * * *", &WRITABLE), None, A, true).unwrap_err();
+        assert_eq!(error.protocol().0, ErrorCode::SubprocessFailed);
+        assert_eq!(host.tab(), cron);
+        assert!(host.unit("wcp-agent-disk-report.timer").is_none());
+        assert!(host.unit("wcp-agent-disk-report.service").is_none());
+        assert!(host.file("agents/disk-report.sh").is_none());
+        assert!(host.file("manifest.json").is_none());
+        assert!(
+            host.systemctl_calls()
+                .iter()
+                .any(|c| c.starts_with("disable --now"))
+        );
+    }
+
+    #[test]
+    fn a_failing_crontab_write_takes_the_new_units_out_again() {
+        let host = host_with(
+            Some("0 7 * * 1 bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n"),
+            Some("if [ \"$1\" = \"-l\" ]; then cat \"$0.tab\"; else exit 1; fi"),
+        );
+        std::fs::write(
+            format!("{}.tab", host.crontab),
+            "0 7 * * 1 bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n",
+        )
+        .unwrap();
+        let error =
+            install_agent(&host, sandboxed("0 5 * * *", &WRITABLE), None, A, true).unwrap_err();
+        assert!(matches!(error, Error::Install(_)));
+        assert!(host.unit("wcp-agent-disk-report.timer").is_none());
+        assert!(host.file("agents/disk-report.sh").is_none());
+    }
+
+    #[test]
+    fn a_schedule_without_an_exact_calendar_stays_on_cron() {
+        let host = host(None);
+        let agent = sandboxed("0 5 * * *", &WRITABLE);
+        // Day of month and weekday together: cron ORs them, systemd would AND.
+        let result = install_agent(&host, agent, Some("0 5 1 * 1"), A, true).unwrap();
+        assert_eq!(result.scheduler, "cron");
+        assert!(host.tab().contains("0 5 1 * 1 bash"));
+        assert!(host.unit("wcp-agent-disk-report.timer").is_none());
+    }
+
+    #[test]
+    fn without_systemd_a_sandboxed_agent_runs_from_cron() {
+        let host = host(None);
+        let result =
+            install_agent(&host, sandboxed("0 5 * * *", &WRITABLE), None, A, false).unwrap();
+        assert_eq!(result.scheduler, "cron");
+        assert!(host.tab().contains("disk-report"));
+        assert!(host.systemctl_calls().is_empty());
+    }
+
+    #[test]
+    fn going_back_to_cron_removes_the_timer_so_the_agent_never_runs_twice() {
+        let host = host(None);
+        install_agent(&host, sandboxed("0 5 * * *", &WRITABLE), None, A, true).unwrap();
+        let result = install_agent(
+            &host,
+            sandboxed("0 5 * * *", &WRITABLE),
+            Some("0 5 1 * 1"),
+            B,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.scheduler, "cron");
+        assert!(host.unit("wcp-agent-disk-report.timer").is_none());
+        assert!(host.tab().contains("0 5 1 * 1 bash"));
+    }
+
+    #[test]
+    fn removing_a_sandboxed_agent_stops_the_timer_and_deletes_the_units() {
+        let host = host(Some("MAILTO=x\n"));
+        install_agent(&host, sandboxed("0 5 * * *", &WRITABLE), None, A, true).unwrap();
+        let request = RemoveRequest::parse(r#"{"name":"disk-report"}"#, B, None).unwrap();
+        let result = remove(&host.sd_ctx(), &request, &cancel()).unwrap();
+        assert!(result.removed && result.removed_systemd_units);
+        assert!(host.unit("wcp-agent-disk-report.timer").is_none());
+        assert!(host.unit("wcp-agent-disk-report.service").is_none());
+        assert!(host.file("agents/disk-report.sh").is_none());
+        let calls = host.systemctl_calls();
+        assert!(calls.contains(&"disable --now wcp-agent-disk-report.timer".to_owned()));
+        assert_eq!(calls.last().unwrap(), "daemon-reload");
+    }
+
+    /// Real systemd, real `/etc/systemd/system`, real `/root/.wcp`: run as
+    /// root in a VM with `cargo test real_systemd -- --ignored`.
+    #[test]
+    #[ignore = "needs root and a systemd host; run in the Lima VM"]
+    fn real_systemd_runs_the_agent_inside_the_sandbox() {
+        use std::process::Command;
+        let sh = |cmd: &str| {
+            let out = Command::new("sh").arg("-c").arg(cmd).output().unwrap();
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let state_root = TrustedRoot::parse(&state).unwrap();
+        std::fs::create_dir_all(ROOT).unwrap();
+        let root = ManagedRoot::open(&TrustedRoot::parse(ROOT).unwrap()).unwrap();
+        let units = ManagedRoot::open(&TrustedRoot::parse(super::agent_systemd::UNIT_DIR).unwrap())
+            .unwrap();
+        let ctx = Context {
+            engine_state: &ManagedRoot::open(&state_root).unwrap(),
+            state_root: &state_root,
+            root: &root,
+            crontab_program: "crontab",
+            shell_program: "bash",
+            systemd: Some(Systemd {
+                units: &units,
+                systemctl_program: "systemctl",
+            }),
+        };
+        let script = "#!/usr/bin/env bash\n\
+            r=\n\
+            echo x > /root/.wcp/logs/allowed 2>/dev/null && r=\"$r allowed=written\" || r=\"$r allowed=BLOCKED\"\n\
+            echo x > /root/.wcp/outside 2>/dev/null && r=\"$r root=WRITTEN\" || r=\"$r root=blocked\"\n\
+            echo x > /etc/wcp-outside 2>/dev/null && r=\"$r etc=WRITTEN\" || r=\"$r etc=blocked\"\n\
+            echo x > /tmp/wcp-private-probe && r=\"$r tmp=private\"\n\
+            echo \"$r\" > /root/.wcp/logs/result\n";
+        let agent = crate::agent_lifecycle::Agent::from_registry(
+            "wcp-sandbox-probe".into(),
+            "1.0.0".into(),
+            Some("* * * * *".into()),
+            true,
+            script.into(),
+            Some(vec!["/root/.wcp/agents".into(), "/root/.wcp/logs".into()]),
+        );
+        let _ = sh("crontab -l > /tmp/wcp-test-crontab.bak 2>/dev/null; true");
+        let request = InstallRequest {
+            agent,
+            schedule: None,
+            request_id: RequestId::parse(A).unwrap(),
+            idempotency_key: None,
+        };
+        let result = install(&ctx, &request, &cancel()).unwrap();
+        assert_eq!(result.scheduler, "systemd");
+        let (_, active) = sh("systemctl is-active wcp-agent-wcp-sandbox-probe.timer");
+        assert_eq!(active, "active");
+        let (_, enabled) = sh("systemctl is-enabled wcp-agent-wcp-sandbox-probe.timer");
+        assert_eq!(enabled, "enabled");
+        let (verified, report) = sh(
+            "systemd-analyze verify /etc/systemd/system/wcp-agent-wcp-sandbox-probe.service /etc/systemd/system/wcp-agent-wcp-sandbox-probe.timer 2>&1; echo $?",
+        );
+        assert!(verified && report.ends_with('0'), "{report}");
+        // The timer itself must fire (every minute) and run the service.
+        let started = std::time::Instant::now();
+        while !std::path::Path::new("/root/.wcp/logs/result").exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(100),
+                "the timer never ran the service"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let (_, outcome) = sh("cat /root/.wcp/logs/result");
+        assert_eq!(
+            outcome,
+            "allowed=written root=blocked etc=blocked tmp=private"
+        );
+        assert!(!std::path::Path::new("/tmp/wcp-private-probe").exists());
+        assert!(!std::path::Path::new("/root/.wcp/outside").exists());
+        assert!(!std::path::Path::new("/etc/wcp-outside").exists());
+
+        let request = RemoveRequest::parse(r#"{"name":"wcp-sandbox-probe"}"#, B, None).unwrap();
+        let removed = remove(&ctx, &request, &cancel()).unwrap();
+        assert!(removed.removed_systemd_units);
+        let (_, after) =
+            sh("systemctl list-unit-files 'wcp-agent-wcp-sandbox-probe*' --no-legend | wc -l");
+        assert_eq!(after, "0");
+        let _ = sh("rm -rf /root/.wcp/logs/result /root/.wcp/logs/allowed");
     }
 
     #[test]

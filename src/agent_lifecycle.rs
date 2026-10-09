@@ -62,6 +62,9 @@ pub struct Agent {
     /// Built-in agents inline the shared library. An agent installed from the
     /// registry is self-contained and is written exactly as it was verified.
     pub bundled: bool,
+    /// Set for an agent that runs from a sandboxed systemd timer instead of a
+    /// cron line: the paths its service may write to (validated).
+    pub systemd_writable: Option<&'static [&'static str]>,
 }
 
 /// Lowercase letters, digits and `-`, starting with a letter or digit.
@@ -84,6 +87,7 @@ impl Agent {
         default_schedule: Option<String>,
         configurable_schedule: bool,
         script: String,
+        systemd_writable: Option<Vec<String>>,
     ) -> &'static Agent {
         Box::leak(Box::new(Agent {
             name: Box::leak(name.into_boxed_str()),
@@ -92,13 +96,22 @@ impl Agent {
             configurable_schedule,
             script: Box::leak(script.into_boxed_str()),
             bundled: false,
+            systemd_writable: systemd_writable.map(|paths| {
+                &*Box::leak(
+                    paths
+                        .into_iter()
+                        .map(|path| &*Box::leak(path.into_boxed_str()))
+                        .collect::<Vec<&'static str>>()
+                        .into_boxed_slice(),
+                )
+            }),
         }))
     }
 
     /// Only a name, for removing an agent the registry installed: removal
     /// needs the name and nothing else.
     fn named(name: String) -> &'static Agent {
-        Self::from_registry(name, String::new(), None, false, String::new())
+        Self::from_registry(name, String::new(), None, false, String::new(), None)
     }
 
     /// The file that is written to disk: the script with the shared library
@@ -129,6 +142,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: false,
         script: include_str!("../resources/agents/metrics-agent.sh"),
         bundled: true,
+        systemd_writable: None,
     },
     Agent {
         name: "resource-alert",
@@ -137,22 +151,25 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: false,
         script: include_str!("../resources/agents/resource-alert.sh"),
         bundled: true,
+        systemd_writable: None,
     },
     Agent {
         name: "backup-agent",
-        version: "1.1.0",
+        version: "1.1.1",
         default_schedule: None,
         configurable_schedule: false,
         script: include_str!("../resources/agents/backup-agent.sh"),
         bundled: true,
+        systemd_writable: None,
     },
     Agent {
         name: GUARD_NAME,
-        version: "1.0.0",
+        version: "2.0.0",
         default_schedule: Some("* * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/bruteforce-guard.sh"),
         bundled: true,
+        systemd_writable: None,
     },
     Agent {
         name: "backup-restore-drill",
@@ -161,6 +178,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: true,
         script: include_str!("../resources/agents/backup-restore-drill.sh"),
         bundled: true,
+        systemd_writable: None,
     },
     Agent {
         name: "error-log-digest",
@@ -169,6 +187,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: true,
         script: include_str!("../resources/agents/error-log-digest.sh"),
         bundled: true,
+        systemd_writable: None,
     },
     Agent {
         name: "cache-warmup",
@@ -177,6 +196,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: true,
         script: include_str!("../resources/agents/cache-warmup.sh"),
         bundled: true,
+        systemd_writable: None,
     },
 ];
 
@@ -468,6 +488,10 @@ pub fn unban_event(ip: IpAddr, ts: u64) -> String {
     format!("{{\"ts\":{ts},\"action\":\"unban\",\"ip\":\"{ip}\",\"jail\":\"manual\"}}\n")
 }
 
+fn default_scheduler() -> String {
+    "cron".to_owned()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallResult {
@@ -478,6 +502,9 @@ pub struct InstallResult {
     /// False when the files and the crontab already matched.
     pub changed: bool,
     pub replaced_cron_lines: u32,
+    /// What runs the agent: `cron` or, for a sandboxed agent, `systemd`.
+    #[serde(default = "default_scheduler")]
+    pub scheduler: String,
     /// SHA-256 of the installed script file.
     pub script_sha256: String,
     pub installed_at_unix_secs: u64,
@@ -490,6 +517,9 @@ pub struct RemoveResult {
     /// False when there was nothing of this agent to remove.
     pub removed: bool,
     pub removed_cron_lines: u32,
+    /// Whether the agent's systemd units were taken out.
+    #[serde(default)]
+    pub removed_systemd_units: bool,
     pub removed_at_unix_secs: u64,
 }
 
