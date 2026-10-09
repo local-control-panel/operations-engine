@@ -277,6 +277,7 @@ fn import_with_recovery(
         content.create_dir(relative).map_err(Error::Io)?;
         created = true;
         content.set_mode(relative, old_mode).map_err(Error::Io)?;
+        crate::failpoint::hit("import.after-move");
         let dest = content.open_managed_dir(relative).map_err(Error::Io)?;
         let (max_entries, max_bytes) = limits();
         summary = tar_extract::extract(
@@ -288,6 +289,7 @@ fn import_with_recovery(
             },
         )
         .map_err(Error::Extract)?;
+        crate::failpoint::hit("import.after-extract");
         repair_tree(&absolute, req.dest_uid, req.dest_gid, &[]).map_err(Error::Io)?;
         // What replaced the root is a directory the site's user owns.
         let after = fs::symlink_metadata(&absolute).map_err(|_| Error::UnsafeTarget)?;

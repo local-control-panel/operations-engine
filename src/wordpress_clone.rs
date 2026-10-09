@@ -485,8 +485,10 @@ fn clone_with_recovery(
     let saved_dir = SiteRelativePath::parse(format!(".wcp-clone-{}", req.request_id)).unwrap();
     let saved_files =
         SiteRelativePath::parse(format!(".wcp-clone-{}/site", req.request_id)).unwrap();
+    let had_target = staging.symlink_metadata(relative).is_ok();
     let manifest = serde_json::to_vec(&serde_json::json!({
         "requestId": req.request_id, "stagingRoot": req.staging_root,
+        "hadTarget": had_target,
         "database": req.db_name.as_str(), "databaseContainer": req.mariadb_container.as_str(),
         "databaseSnapshot": ctx.dump_root.join(&recovery_sql),
         "savedFiles": content_root.join(&saved_files),
@@ -614,7 +616,9 @@ fn clone_with_recovery(
             cancel,
         ))?;
         database_mutated = true; // Even a failed import may have changed tables.
+        crate::failpoint::hit("clone.before-db");
         restore(ctx, req, &source_sql, cancel)?;
+        crate::failpoint::hit("clone.after-db");
         wp_step(
             ctx,
             req,
