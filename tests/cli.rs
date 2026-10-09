@@ -1,3 +1,6 @@
+// The capability list outgrew serde_json::json!'s default macro depth.
+#![recursion_limit = "256"]
+
 use assert_cmd::Command;
 use serde_json::Value;
 
@@ -155,6 +158,7 @@ fn capabilities_describe_only_implemented_operations() {
             "site.importArchive",
             "site.discardArchive",
             "site.reconcile",
+            "site.migrateRuntime",
             "system.service",
             "compose.action",
             "compose.remove"

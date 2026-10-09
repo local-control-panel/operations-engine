@@ -145,6 +145,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "site.importArchive",
                 "site.discardArchive",
                 "site.reconcile",
+                "site.migrateRuntime",
                 "system.service",
                 "compose.action",
                 "compose.remove",

@@ -30,6 +30,7 @@ pub mod docker_prune;
 pub mod docker_resource;
 pub mod engine;
 pub mod error;
+pub mod failpoint;
 pub mod filesystem;
 pub mod ingress;
 pub mod maria_drop;
@@ -56,6 +57,7 @@ pub mod site_file;
 #[cfg(unix)]
 pub mod site_identity;
 pub mod site_manifest;
+pub mod site_migrate_runtime;
 #[cfg(unix)]
 pub mod site_probe;
 pub mod site_reconcile;

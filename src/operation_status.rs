@@ -247,7 +247,18 @@ pub struct IncompleteOperation {
     pub request_id: RequestId,
     pub operation: String,
     pub started_at_unix_secs: u64,
+    /// The operation that finishes this one, when there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovered_by: Option<&'static str>,
 }
+
+/// Operations whose interrupted runs `site.reconcile` rolls back.
+const RECONCILED: [&str; 4] = [
+    "site.importArchive",
+    "wordpress.migrateImport",
+    "wordpress.clone",
+    "site.migrateRuntime",
+];
 
 /// A recovery marker (`pending/*.json`) found by [`incomplete`].
 #[derive(Debug, PartialEq, Serialize)]
@@ -302,6 +313,13 @@ pub fn incomplete(
                     name,
                 }));
         }
+        // `wordpress.clone` keeps one marker per scope, not a `pending/` directory.
+        if dir.exists(&SiteRelativePath::parse("pending.json").unwrap()) {
+            list.markers.push(PendingMarker {
+                scope: label.clone(),
+                name: "pending.json".into(),
+            });
+        }
         let Ok(transactions) =
             dir.open_managed_dir(&SiteRelativePath::parse("transactions").unwrap())
         else {
@@ -329,6 +347,9 @@ pub fn incomplete(
                         list.interrupted.push(IncompleteOperation {
                             scope: label.clone(),
                             request_id: record.request_id,
+                            recovered_by: RECONCILED
+                                .contains(&record.operation.as_str())
+                                .then_some("site.reconcile"),
                             operation: record.operation,
                             started_at_unix_secs: record.started_at_unix_secs,
                         });
@@ -673,6 +694,48 @@ mod tests {
                 name: "abc.json".into()
             }]
         );
+    }
+
+    #[test]
+    fn incomplete_sees_clone_markers_and_names_the_recoverer() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::open(&TrustedRoot::parse(directory.path()).unwrap()).unwrap();
+        let scope = directory.path().join("wordpress-clone/abc");
+        for sub in ["transactions", "locks"] {
+            std::fs::create_dir_all(scope.join(sub)).unwrap();
+        }
+        std::fs::write(scope.join("pending.json"), "{}").unwrap();
+        let id = RequestId::parse("323e4567-e89b-12d3-a456-426614174000").unwrap();
+        let other = RequestId::parse("423e4567-e89b-12d3-a456-426614174000").unwrap();
+        let dir = root
+            .open_managed_dir(&SiteRelativePath::parse("wordpress-clone/abc").unwrap())
+            .unwrap();
+        for (id, operation) in [(id, "wordpress.clone"), (other, "site.deploy")] {
+            create(
+                &dir,
+                &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+                &TransactionState::start(id, None, operation),
+            )
+            .unwrap();
+        }
+        let found = incomplete(&root, directory.path()).unwrap();
+        assert_eq!(
+            found.markers,
+            vec![PendingMarker {
+                scope: "wordpress-clone/abc".into(),
+                name: "pending.json".into()
+            }]
+        );
+        let by = |op: &str| {
+            found
+                .interrupted
+                .iter()
+                .find(|i| i.operation == op)
+                .unwrap()
+                .recovered_by
+        };
+        assert_eq!(by("wordpress.clone"), Some("site.reconcile"));
+        assert_eq!(by("site.deploy"), None);
     }
 
     #[test]
