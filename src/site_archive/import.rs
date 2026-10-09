@@ -241,6 +241,13 @@ fn import_with_recovery(
     if existing.dev() != parent_dev {
         return Err(Error::UnsafeTarget);
     }
+    // The snapshot of the previous state is renamed to the content root.
+    let content_dev = fs::metadata(&canonical_root)
+        .map_err(|_| Error::UnsafeTarget)?
+        .dev();
+    if existing.dev() != content_dev {
+        return Err(Error::OtherFilesystem);
+    }
     let old_mode = existing.mode() & 0o7777;
     ensure_space(&canonical_root, req.manifest.content_bytes)?;
 
