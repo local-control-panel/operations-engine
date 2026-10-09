@@ -70,7 +70,29 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             archive_id,
             request_id,
         } => discard_archive(&kind, archive_id.as_deref(), &request_id),
-        SiteCommand::Reconcile { request_id } => reconcile(&request_id),
+        SiteCommand::Reconcile {
+            request_id,
+            request_file,
+        } => reconcile(&request_id, request_file.as_deref()),
+        SiteCommand::MigrateRuntime {
+            domain,
+            target_runtime_id,
+            health_path,
+            health_status,
+            health_body,
+            stop_idle_source,
+            request_id,
+            idempotency_key,
+        } => migrate_runtime(
+            &domain,
+            &target_runtime_id,
+            health_path.as_deref(),
+            health_status,
+            health_body.as_deref(),
+            stop_idle_source,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SiteCommand::WriteEnvFile {
             request_file,
             request_id,
@@ -1085,16 +1107,43 @@ fn import_archive(
     }
 }
 
-fn reconcile(request_id: &str) -> Result<Response, ResponseBuildError> {
+fn reconcile(
+    request_id: &str,
+    request_file: Option<&std::path::Path>,
+) -> Result<Response, ResponseBuildError> {
     use crate::site_reconcile::{self as rec, OPERATION};
     #[cfg(unix)]
     {
         let fail = |code, message: &str| Ok(Response::failure(OPERATION, code, message));
-        let Ok(request) = rec::Request::parse(request_id) else {
-            return fail(
-                ErrorCode::InvalidInput,
-                "request-id must be a canonical UUID",
-            );
+        let document = match request_file {
+            None => None,
+            Some(path) => match crate::commands::read_root_owned_content_file_bounded(
+                path,
+                rec::Request::max_document_bytes(),
+            ) {
+                Ok(text) => Some(text),
+                Err(_) => {
+                    return fail(
+                        ErrorCode::InvalidInput,
+                        "request-file must be a root-owned regular file",
+                    );
+                }
+            },
+        };
+        let request = match rec::Request::parse(request_id, document.as_deref()) {
+            Ok(request) => request,
+            Err(rec::RequestError::InvalidRequestId) => {
+                return fail(
+                    ErrorCode::InvalidInput,
+                    "request-id must be a canonical UUID",
+                );
+            }
+            Err(rec::RequestError::InvalidDocument) => {
+                return fail(
+                    ErrorCode::InvalidInput,
+                    "request-file is not a valid reconcile document",
+                );
+            }
         };
         let Ok(config) = crate::config::EngineConfig::load_root_owned(std::path::Path::new(
             "/etc/operations-engine/config.json",
@@ -1107,7 +1156,56 @@ fn reconcile(request_id: &str) -> Result<Response, ResponseBuildError> {
         let Ok(state) = crate::filesystem::ManagedRoot::open(&config.state_root) else {
             return fail(ErrorCode::Internal, "engine state root is unavailable");
         };
-        match rec::reconcile(&state, &config.content_roots, &request) {
+        // Database snapshots live under the backup root; without it only
+        // file-only recovery works.
+        let recovery_root = crate::site::TrustedRoot::parse(std::path::Path::new(
+            crate::backup_delete::BACKUP_ROOT,
+        ))
+        .ok();
+        // The runtime-migration journals need the whole stack; a host that
+        // cannot provide it still gets the file and database recovery.
+        let stack_dir = crate::compose::compose_base_dir().ok();
+        let log_root = crate::site::TrustedRoot::parse(RUNTIME_LOG_DIR).ok();
+        let stack = match (&stack_dir, &log_root) {
+            (Some(stack_dir), Some(log_root)) => Some(crate::stack_service::Context {
+                engine_state: &state,
+                runtime_root: &config.runtime_root,
+                site_services_root: &config.site_services_root,
+                log_root,
+                chown_logs: true,
+                stack_dir,
+                docker: "docker",
+                health: crate::stack_service::HealthWait::PRODUCTION,
+            }),
+            _ => None,
+        };
+        let compose_access = crate::compose::Access::default();
+        let backend = stack
+            .as_ref()
+            .map(|stack| crate::site_migrate_runtime::host::HostBackend {
+                config: &config,
+                engine_state: &state,
+                stack,
+                compose: &compose_access,
+                passwd_file: std::path::Path::new("/etc/passwd"),
+                group_file: std::path::Path::new("/etc/group"),
+                legacy_uid_counter: Some(std::path::Path::new(
+                    crate::site_migrate_runtime::host::LEGACY_COUNTER_PATH,
+                )),
+                tools: crate::site_identity::UserTools::PRODUCTION,
+                pause: true,
+            });
+        let context = rec::Context {
+            engine_state: &state,
+            state_root: config.state_root.as_path(),
+            content_roots: &config.content_roots,
+            recovery_root: recovery_root.as_ref(),
+            docker_program: "docker",
+            migrate: backend
+                .as_ref()
+                .map(|b| b as &dyn crate::site_migrate_runtime::Backend),
+        };
+        match rec::reconcile(&context, &request) {
             Ok(result) => Response::success(OPERATION, result),
             Err(crate::site_archive::Error::PostCommit(value)) => {
                 Response::success(OPERATION, value)
@@ -1120,11 +1218,138 @@ fn reconcile(request_id: &str) -> Result<Response, ResponseBuildError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = request_id;
+        let _ = (request_id, request_file);
         Ok(Response::failure(
             OPERATION,
             ErrorCode::UnsupportedPlatform,
             "site.reconcile requires a Unix host",
+        ))
+    }
+}
+
+/// Where each site's runtime log lives; the same host path `stack.*` uses.
+#[cfg(unix)]
+const RUNTIME_LOG_DIR: &str = "/var/log/caddy";
+
+/// Builds everything the real migration backend needs and runs `body` with it.
+#[cfg(unix)]
+fn with_host_backend<T>(
+    operation: &'static str,
+    body: impl FnOnce(
+        &crate::filesystem::ManagedRoot,
+        &crate::site_migrate_runtime::host::HostBackend<'_>,
+    ) -> Result<T, Response>,
+) -> Result<T, Response> {
+    use std::path::Path;
+
+    use crate::{
+        compose, config::EngineConfig, filesystem::ManagedRoot, site::TrustedRoot,
+        site_identity::UserTools, stack_service,
+    };
+
+    let fail = |code, message: &str| Response::failure(operation, code, message);
+    let config = EngineConfig::load_root_owned(Path::new(CONFIG_PATH)).map_err(|_| {
+        fail(
+            ErrorCode::Internal,
+            crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+        )
+    })?;
+    let engine_state = ManagedRoot::open(&config.state_root)
+        .map_err(|_| fail(ErrorCode::Internal, "engine state root is unavailable"))?;
+    let stack_dir = compose::compose_base_dir()
+        .map_err(|_| fail(ErrorCode::Internal, "stack directory is unavailable"))?;
+    let log_root = TrustedRoot::parse(RUNTIME_LOG_DIR)
+        .map_err(|_| fail(ErrorCode::Internal, "log directory is unavailable"))?;
+    let stack = stack_service::Context {
+        engine_state: &engine_state,
+        runtime_root: &config.runtime_root,
+        site_services_root: &config.site_services_root,
+        log_root: &log_root,
+        chown_logs: true,
+        stack_dir: &stack_dir,
+        docker: "docker",
+        health: stack_service::HealthWait::PRODUCTION,
+    };
+    let compose_access = compose::Access::default();
+    let backend = crate::site_migrate_runtime::host::HostBackend {
+        config: &config,
+        engine_state: &engine_state,
+        stack: &stack,
+        compose: &compose_access,
+        passwd_file: Path::new("/etc/passwd"),
+        group_file: Path::new("/etc/group"),
+        legacy_uid_counter: Some(Path::new(
+            crate::site_migrate_runtime::host::LEGACY_COUNTER_PATH,
+        )),
+        tools: UserTools::PRODUCTION,
+        pause: true,
+    };
+    body(&engine_state, &backend)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn migrate_runtime(
+    domain: &str,
+    target_runtime_id: &str,
+    health_path: Option<&str>,
+    health_status: Option<u16>,
+    health_body: Option<&str>,
+    stop_idle_source: bool,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::site_migrate_runtime::{self as migrate, OPERATION};
+    #[cfg(unix)]
+    {
+        let request = match migrate::Request::parse(
+            domain,
+            target_runtime_id,
+            health_path,
+            health_status,
+            health_body,
+            stop_idle_source,
+            request_id,
+            idempotency_key,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        let outcome = with_host_backend(OPERATION, |state, backend| {
+            Ok(migrate::execute(state, backend, &request))
+        });
+        match outcome {
+            Err(response) => Ok(response),
+            Ok(Ok(result) | Err(migrate::Error::PostCommit(result))) => {
+                Response::success(OPERATION, result)
+            }
+            Ok(Err(error)) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (
+            domain,
+            target_runtime_id,
+            health_path,
+            health_status,
+            health_body,
+            stop_idle_source,
+            request_id,
+            idempotency_key,
+        );
+        Ok(Response::failure(
+            OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "site.migrateRuntime requires a Unix host",
         ))
     }
 }

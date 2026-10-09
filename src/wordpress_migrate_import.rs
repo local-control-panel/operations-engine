@@ -464,6 +464,7 @@ fn import_with_recovery(
         "database": req.db_name.as_str(), "databaseContainer": req.mariadb_container.as_str(),
         "databaseSnapshot": ctx.recovery_root.join(&recovery_sql),
         "savedFiles": ctx.content_root.join(&saved_files),
+        "hadTarget": target_exists,
     }))
     .map_err(|_| Error::UnsafeTarget)?;
     scope
@@ -546,6 +547,7 @@ fn import_with_recovery(
         }
 
         database_mutated = true; // Even a failed import may have changed tables.
+        crate::failpoint::hit("migrate-import.before-db");
         critical(process::run(
             &ProcessRequest::new(ctx.gunzip_program)
                 .args(["-t".to_owned(), db_artifact.to_string_lossy().into_owned()]),
@@ -564,6 +566,7 @@ fn import_with_recovery(
             return Err(Error::Rejected(code));
         }
         critical(Ok(output))?;
+        crate::failpoint::hit("migrate-import.after-db");
 
         if req.source_domain.as_str() != req.dest_domain.as_str() {
             critical(process::run(
