@@ -1105,10 +1105,42 @@ pub enum SiteCommand {
         #[arg(long = "request-id")]
         request_id: String,
     },
-    /// Roll back `site.importArchive` runs that a killed engine left half done.
+    /// Roll back `site.importArchive`, `wordpress.migrateImport` and
+    /// `wordpress.clone` runs that a killed engine left half done.
     Reconcile {
         #[arg(long = "request-id")]
         request_id: String,
+        /// Optional root-owned JSON file `{"mariadbRootPasswords": {"<container>": "<password>"}}`;
+        /// needed only to replay the database snapshot of a migration or clone.
+        #[arg(long = "request-file")]
+        request_file: Option<PathBuf>,
+    },
+    /// Move a site to another runtime pool: identity, service and exec config
+    /// on the target, route cutover, check through the ingress, cleanup of the
+    /// old pool, with the previous state restored on failure. The target pool
+    /// must be running.
+    MigrateRuntime {
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "target-runtime-id")]
+        target_runtime_id: String,
+        /// Check this path instead of the control-token probe.
+        #[arg(long = "health-path")]
+        health_path: Option<String>,
+        /// Expected HTTP status of the health path (default 200).
+        #[arg(long = "health-status")]
+        health_status: Option<u16>,
+        /// Exact expected body of the health path.
+        #[arg(long = "health-body")]
+        health_body: Option<String>,
+        /// Stop the old pool when its last site left (`true`/`false`). Pass
+        /// `false` for the base install's default pool.
+        #[arg(long = "stop-idle-source", action = clap::ArgAction::Set, default_value_t = false)]
+        stop_idle_source: bool,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
     },
     /// Change the document root of a site's identity record.
     UpdateIdentity {
@@ -1164,6 +1196,7 @@ impl SiteCommand {
             Self::ImportArchive { .. } => "site.importArchive",
             Self::DiscardArchive { .. } => "site.discardArchive",
             Self::Reconcile { .. } => "site.reconcile",
+            Self::MigrateRuntime { .. } => "site.migrateRuntime",
         }
     }
 }
