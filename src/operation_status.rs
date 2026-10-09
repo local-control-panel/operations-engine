@@ -237,6 +237,135 @@ pub fn list(
     })
 }
 
+/// One interrupted transaction found by [`incomplete`].
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompleteOperation {
+    /// The scope directory below the state root, e.g. `site-archive-import`
+    /// or `sites/<id>`.
+    pub scope: String,
+    pub request_id: RequestId,
+    pub operation: String,
+    pub started_at_unix_secs: u64,
+}
+
+/// A recovery marker (`pending/*.json`) found by [`incomplete`].
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMarker {
+    pub scope: String,
+    pub name: String,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncompleteList {
+    /// `IN_PROGRESS` transactions whose owner no longer holds the lock.
+    pub interrupted: Vec<IncompleteOperation>,
+    /// Transactions still running right now (not a problem).
+    pub active: usize,
+    /// Recovery markers waiting for `site.reconcile` or an operator.
+    pub markers: Vec<PendingMarker>,
+    /// Transaction records that could not be read.
+    pub unreadable: usize,
+}
+
+/// Finds every scope below the state root (two levels deep) that has a
+/// `transactions/` directory and reports the interrupted ones. Reads only.
+pub fn incomplete(
+    engine_state: &ManagedRoot,
+    state_root: &std::path::Path,
+) -> Result<IncompleteList, StatusError> {
+    let mut scopes = Vec::new();
+    collect_scopes(state_root, std::path::Path::new(""), 0, &mut scopes);
+    scopes.sort();
+    let mut list = IncompleteList {
+        interrupted: Vec::new(),
+        active: 0,
+        markers: Vec::new(),
+        unreadable: 0,
+    };
+    for scope in scopes {
+        let Ok(path) = SiteRelativePath::parse(scope.to_string_lossy().as_ref()) else {
+            continue;
+        };
+        let Ok(dir) = engine_state.open_managed_dir(&path) else {
+            continue;
+        };
+        let label = scope.to_string_lossy().into_owned();
+        if let Ok(pending) = dir.open_managed_dir(&SiteRelativePath::parse("pending").unwrap()) {
+            let mut names = pending.file_names().unwrap_or_default();
+            names.sort();
+            list.markers
+                .extend(names.into_iter().map(|name| PendingMarker {
+                    scope: label.clone(),
+                    name,
+                }));
+        }
+        let Ok(transactions) =
+            dir.open_managed_dir(&SiteRelativePath::parse("transactions").unwrap())
+        else {
+            continue;
+        };
+        let lock_path = SiteRelativePath::parse("locks/mutation.lock").unwrap();
+        // A scope without a lock file has never run a mutation: no owner.
+        let owner = if dir.exists(&SiteRelativePath::parse("locks").unwrap()) {
+            lock::holder(&dir, &lock_path).map_err(|_| StatusError::Io)?
+        } else {
+            None
+        };
+        let mut names = transactions.file_names().map_err(|_| StatusError::Io)?;
+        names.sort();
+        for name in names.into_iter().filter(|n| n.ends_with(".json")) {
+            let Ok(path) = SiteRelativePath::parse(&name) else {
+                list.unreadable += 1;
+                continue;
+            };
+            match state::load(&transactions, &path) {
+                Ok(record) if record.status == TransactionStatus::InProgress => {
+                    if owner == Some(record.request_id) {
+                        list.active += 1;
+                    } else {
+                        list.interrupted.push(IncompleteOperation {
+                            scope: label.clone(),
+                            request_id: record.request_id,
+                            operation: record.operation,
+                            started_at_unix_secs: record.started_at_unix_secs,
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => list.unreadable += 1,
+            }
+        }
+    }
+    Ok(list)
+}
+
+fn collect_scopes(
+    root: &std::path::Path,
+    relative: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(root.join(relative)) else {
+        return;
+    };
+    if !relative.as_os_str().is_empty() && root.join(relative).join("transactions").is_dir() {
+        out.push(relative.to_path_buf());
+        return;
+    }
+    if depth >= 2 {
+        return;
+    }
+    for entry in entries.flatten() {
+        // A symlink is never followed.
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            collect_scopes(root, &relative.join(entry.file_name()), depth + 1, out);
+        }
+    }
+}
+
 fn load_scoped(
     engine_state: &ManagedRoot,
     scope_path: &SiteRelativePath,
@@ -501,5 +630,56 @@ mod tests {
         .unwrap();
         let listed = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
         assert_eq!(listed.unreadable, 1);
+    }
+
+    #[test]
+    fn incomplete_finds_interrupted_work_and_markers_in_every_scope() {
+        let (directory, root) = state_root();
+        let site = root
+            .open_managed_dir(&SiteRelativePath::parse(format!("sites/{SITE_ID}")).unwrap())
+            .unwrap();
+        let stuck = RequestId::parse("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let done = RequestId::parse("223e4567-e89b-12d3-a456-426614174000").unwrap();
+        let mut finished = TransactionState::start(done, None, "site.deploy");
+        finished
+            .mark_failed(crate::error::ErrorCode::Internal, "x")
+            .unwrap();
+        for (id, state) in [
+            (stuck, TransactionState::start(stuck, None, "site.deploy")),
+            (done, finished),
+        ] {
+            create(
+                &site,
+                &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+                &state,
+            )
+            .unwrap();
+        }
+        // A second, single-level scope with a recovery marker and no transaction.
+        let import = directory.path().join("site-archive-import");
+        std::fs::create_dir_all(import.join("pending")).unwrap();
+        std::fs::create_dir_all(import.join("transactions")).unwrap();
+        std::fs::write(import.join("pending/abc.json"), "{}").unwrap();
+
+        let found = incomplete(&root, directory.path()).unwrap();
+        assert_eq!(found.interrupted.len(), 1, "{found:?}");
+        assert_eq!(found.interrupted[0].request_id, stuck);
+        assert_eq!(found.interrupted[0].scope, format!("sites/{SITE_ID}"));
+        assert_eq!(found.active, 0);
+        assert_eq!(
+            found.markers,
+            vec![PendingMarker {
+                scope: "site-archive-import".into(),
+                name: "abc.json".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn incomplete_on_an_empty_state_root_is_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = ManagedRoot::open(&TrustedRoot::parse(directory.path()).unwrap()).unwrap();
+        let found = incomplete(&root, directory.path()).unwrap();
+        assert!(found.interrupted.is_empty() && found.markers.is_empty());
     }
 }

@@ -11,10 +11,48 @@ use crate::{
 
 const OPERATION: &str = "operation.status";
 const LIST_OPERATION: &str = "operation.list";
+const INCOMPLETE_OPERATION: &str = "operation.incomplete";
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
+
+fn incomplete() -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        let Ok(config) = EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) else {
+            return Ok(Response::failure(
+                INCOMPLETE_OPERATION,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        };
+        let Ok(root) = ManagedRoot::open(&config.state_root) else {
+            return Ok(Response::failure(
+                INCOMPLETE_OPERATION,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        };
+        match operation_status::incomplete(&root, config.state_root.as_path()) {
+            Ok(list) => Response::success(INCOMPLETE_OPERATION, list),
+            Err(_) => Ok(Response::failure(
+                INCOMPLETE_OPERATION,
+                ErrorCode::Internal,
+                "operation records are unavailable",
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Response::failure(
+            INCOMPLETE_OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "operation.incomplete requires a Unix host",
+        ))
+    }
+}
 
 pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        OperationCommand::Incomplete => incomplete(),
         OperationCommand::Status {
             site_id,
             database,

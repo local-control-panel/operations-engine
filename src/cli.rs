@@ -390,6 +390,8 @@ pub enum OperationCommand {
         #[arg(long = "request-id")]
         request_id: String,
     },
+    /// Find interrupted transactions and recovery markers in every scope.
+    Incomplete,
     /// List the newest durable transactions of one scope, redacted.
     List {
         #[arg(long = "site-id")]
@@ -416,6 +418,7 @@ impl OperationCommand {
         match self {
             Self::Status { .. } => "operation.status",
             Self::List { .. } => "operation.list",
+            Self::Incomplete => "operation.incomplete",
         }
     }
 }
