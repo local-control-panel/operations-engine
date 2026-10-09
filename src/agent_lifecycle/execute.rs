@@ -1542,6 +1542,8 @@ mod tests {
             echo x > /root/.wcp/logs/allowed 2>/dev/null && r=\"$r allowed=written\" || r=\"$r allowed=BLOCKED\"\n\
             echo x > /root/.wcp/outside 2>/dev/null && r=\"$r root=WRITTEN\" || r=\"$r root=blocked\"\n\
             echo x > /etc/wcp-outside 2>/dev/null && r=\"$r etc=WRITTEN\" || r=\"$r etc=blocked\"\n\
+            echo x >> /root/.wcp/agents/wcp_agent_lib.py 2>/dev/null && r=\"$r lib=WRITTEN\" || r=\"$r lib=blocked\"\n\
+            rm -f /root/.wcp/agents/wcp_agent_lib.py 2>/dev/null && r=\"$r libdel=DELETED\" || r=\"$r libdel=blocked\"\n\
             echo x > /tmp/wcp-private-probe && r=\"$r tmp=private\"\n\
             echo \"$r\" > /root/.wcp/logs/result\n";
         let agent = crate::agent_lifecycle::Agent::from_registry(
@@ -1582,7 +1584,11 @@ mod tests {
         let (_, outcome) = sh("cat /root/.wcp/logs/result");
         assert_eq!(
             outcome,
-            "allowed=written root=blocked etc=blocked tmp=private"
+            "allowed=written root=blocked etc=blocked lib=blocked libdel=blocked tmp=private"
+        );
+        assert_eq!(
+            std::fs::read_to_string("/root/.wcp/agents/wcp_agent_lib.py").unwrap(),
+            library()
         );
         assert!(!std::path::Path::new("/tmp/wcp-private-probe").exists());
         assert!(!std::path::Path::new("/root/.wcp/outside").exists());
