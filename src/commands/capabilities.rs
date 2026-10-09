@@ -107,6 +107,8 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.setSmtpRelay",
                 "agent.activateBruteforceConfig",
                 "agent.install",
+                "agent.installFromRegistry",
+                "agent.approve",
                 "agent.remove",
                 "agent.bruteforceUnban",
                 "system.activateAutoupdatesConfig",

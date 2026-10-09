@@ -117,6 +117,8 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.setSmtpRelay",
             "agent.activateBruteforceConfig",
             "agent.install",
+            "agent.installFromRegistry",
+            "agent.approve",
             "agent.remove",
             "agent.bruteforceUnban",
             "system.activateAutoupdatesConfig",

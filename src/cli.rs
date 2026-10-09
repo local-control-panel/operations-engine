@@ -439,6 +439,26 @@ pub enum AgentCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Install an agent from the open agents repository, verified against the
+    /// release's registry.json.
+    InstallFromRegistry {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Record that the operator reviewed one exact script hash of a community
+    /// agent.
+    Approve {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Remove a bundled agent: cron line, manifest entry and script.
     Remove {
         #[arg(long = "request-file")]
@@ -464,6 +484,8 @@ impl AgentCommand {
         match self {
             Self::ActivateBruteforceConfig { .. } => "agent.activateBruteforceConfig",
             Self::Install { .. } => "agent.install",
+            Self::InstallFromRegistry { .. } => "agent.installFromRegistry",
+            Self::Approve { .. } => "agent.approve",
             Self::Remove { .. } => "agent.remove",
             Self::BruteforceUnban { .. } => "agent.bruteforceUnban",
         }

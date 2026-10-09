@@ -346,7 +346,7 @@ pub fn install(
             let previous_entry = manifest_entry(previous_manifest_text, agent.name);
 
             let files_current = previous_script.as_deref() == Some(script.as_bytes())
-                && previous_library.as_deref() == Some(library().as_bytes())
+                && (!agent.bundled || previous_library.as_deref() == Some(library().as_bytes()))
                 && is_executable(ctx.root, &script_path)
                 && previous_entry
                     .as_ref()
@@ -372,7 +372,9 @@ pub fn install(
                 ctx.root.create_dir_all(&agents_dir).map_err(Error::Io)?;
                 ctx.root.set_mode(&agents_dir, 0o700).map_err(Error::Io)?;
                 let written = (|| -> std::io::Result<()> {
-                    write(ctx.root, &library_path, library().as_bytes(), Kind::Private)?;
+                    if agent.bundled {
+                        write(ctx.root, &library_path, library().as_bytes(), Kind::Private)?;
+                    }
                     write(ctx.root, &script_path, script.as_bytes(), Kind::Executable)?;
                     write(ctx.root, &manifest_path, manifest.as_bytes(), Kind::Private)
                 })();
@@ -383,7 +385,9 @@ pub fn install(
                     // The crontab line never became live; put the files back.
                     restore(ctx.root, &manifest_path, &previous_manifest, Kind::Private);
                     restore(ctx.root, &script_path, &previous_script, Kind::Executable);
-                    restore(ctx.root, &library_path, &previous_library, Kind::Private);
+                    if agent.bundled {
+                        restore(ctx.root, &library_path, &previous_library, Kind::Private);
+                    }
                     return Err(error);
                 }
             } else {
@@ -649,6 +653,56 @@ mod tests {
 
     fn cancel() -> CancellationToken {
         CancellationToken::default()
+    }
+
+    #[test]
+    fn a_registry_agent_is_written_as_verified_without_the_library_and_removed_by_name() {
+        let host = host(Some("MAILTO=x\n"));
+        let script = "#!/usr/bin/env bash\necho from the registry\n".to_owned();
+        let agent = crate::agent_lifecycle::Agent::from_registry(
+            "disk-report".into(),
+            "1.2.0".into(),
+            Some("0 5 * * *".into()),
+            true,
+            script.clone(),
+        );
+        let request = InstallRequest {
+            agent,
+            schedule: None,
+            request_id: RequestId::parse(A).unwrap(),
+            idempotency_key: None,
+        };
+        let result = install(&host.ctx(), &request, &cancel()).unwrap();
+        assert_eq!(result.version, "1.2.0");
+        assert_eq!(result.script_sha256, sha256(script.as_bytes()));
+        assert_eq!(host.file("agents/disk-report.sh").unwrap(), script);
+        assert_eq!(host.mode("agents/disk-report.sh"), 0o755);
+        assert!(host.file("agents/wcp_agent_lib.py").is_none());
+        assert_eq!(
+            host.tab(),
+            "MAILTO=x\n0 5 * * * bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_str(&host.file("manifest.json").unwrap()).unwrap();
+        assert_eq!(manifest["disk-report"]["version"], "1.2.0");
+
+        // An unchanged reinstall does nothing.
+        let again = InstallRequest {
+            request_id: RequestId::parse(B).unwrap(),
+            ..request
+        };
+        assert!(!install(&host.ctx(), &again, &cancel()).unwrap().changed);
+
+        // Removal works for a name that is not in the built-in catalog.
+        let removed = remove(
+            &host.ctx(),
+            &RemoveRequest::parse(r#"{"name":"disk-report"}"#, C, None).unwrap(),
+            &cancel(),
+        )
+        .unwrap();
+        assert!(removed.removed);
+        assert_eq!(host.tab(), "MAILTO=x\n");
+        assert!(host.file("agents/disk-report.sh").is_none());
     }
 
     #[test]
