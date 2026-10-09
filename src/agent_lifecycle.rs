@@ -12,8 +12,8 @@
 //! - `agent.remove` takes the cron line out first (cron never runs a missing
 //!   file), then the manifest entry and the script.
 //! - `agent.bruteforceUnban` drops one IP from the active-ban file, then runs
-//!   the installed guard with `--apply-only`. Editing Caddyfiles stays the
-//!   guard's own job until `ingress.applyBans`.
+//!   the installed guard with `--apply-only`, which hands the remaining list to
+//!   `ingress.applyBans`.
 //!
 //! Install and remove hold the same per-user cron lock scope as
 //! `cron.installTab` (`cron/root`), so the panel's generic cron writes cannot

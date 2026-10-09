@@ -234,6 +234,9 @@ pub enum Error {
     ArtifactMismatch,
     ManifestOverLimit,
     UnsafeTarget,
+    /// The destination root is on another filesystem than the content root,
+    /// where the snapshot of the previous state has to go (a rename).
+    OtherFilesystem,
     Extract(ExtractError),
     RecoveryRequired,
     /// The operation committed but its record could not be saved; the result
@@ -305,6 +308,22 @@ impl Error {
                  or not an existing directory"
                     .into(),
             ),
+            Self::OtherFilesystem => (
+                ErrorCode::InvalidInput,
+                "the destination root is on a different filesystem than the content root; \
+                 the previous state is kept beside the content root, so a sync cannot replace it"
+                    .into(),
+            ),
+            Self::Extract(ExtractError::Io(error))
+                if error.raw_os_error() == Some(libc::ENOSPC) =>
+            {
+                (
+                    ErrorCode::InvalidInput,
+                    "the destination ran out of disk space while the archive was extracted; \
+                 the destination was restored"
+                        .into(),
+                )
+            }
             Self::Extract(ExtractError::Unsafe(name)) => (
                 ErrorCode::InvalidInput,
                 format!(
@@ -943,6 +962,19 @@ mod tests {
             ensure_space(fx.base.as_path(), u64::MAX / 2),
             Err(Error::InsufficientSpace)
         ));
+    }
+
+    #[test]
+    fn a_full_disk_and_another_filesystem_have_their_own_messages() {
+        let (code, message) = Error::OtherFilesystem.protocol();
+        assert_eq!(code, ErrorCode::InvalidInput);
+        assert!(message.contains("different filesystem"), "{message}");
+        let full = Error::Extract(ExtractError::Io(io::Error::from_raw_os_error(libc::ENOSPC)));
+        let (code, message) = full.protocol();
+        assert_eq!(code, ErrorCode::InvalidInput);
+        assert!(message.contains("ran out of disk space"), "{message}");
+        let other = Error::Extract(ExtractError::Io(io::Error::from_raw_os_error(libc::EIO)));
+        assert!(other.protocol().1.contains("corrupt"));
     }
 
     #[test]
