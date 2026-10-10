@@ -59,6 +59,8 @@ pub mod site_error_pages;
 pub mod site_file;
 #[cfg(unix)]
 pub mod site_identity;
+#[cfg(unix)]
+pub mod site_list;
 pub mod site_manifest;
 pub mod site_migrate_runtime;
 #[cfg(unix)]

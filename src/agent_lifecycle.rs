@@ -34,6 +34,22 @@ pub const REMOVE_OPERATION: &str = "agent.remove";
 pub const UNBAN_OPERATION: &str = "agent.bruteforceUnban";
 
 pub const ROOT: &str = crate::agent_config::ROOT;
+
+/// The `ops-engine agent <sub>` helper commands this engine has, in the order
+/// they were added. Reported by `capabilities` (`features.agentHelpers`) and
+/// by `agent version`, so an agent or the developer CLI can tell what an
+/// engine offers. Additive only.
+pub const AGENT_HELPERS: &[&str] = &[
+    "heartbeat",
+    "lock",
+    "log",
+    "result",
+    "config",
+    "site",
+    "version",
+];
+/// Raised when an existing helper's contract changes (it never should).
+pub const AGENT_HELPER_API: u32 = 1;
 pub const AGENTS_DIR: &str = "agents";
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const LIBRARY_FILE: &str = "wcp_agent_lib.py";

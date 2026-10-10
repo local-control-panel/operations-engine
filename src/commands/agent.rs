@@ -12,13 +12,17 @@ pub fn run(command: AgentCommand) -> Result<Response, ResponseBuildError> {
     match command {
         // The helpers return exit codes, not envelopes; `main` runs them
         // before this path (see `agent_helper`).
-        AgentCommand::Heartbeat { .. } | AgentCommand::Lock { .. } | AgentCommand::Log { .. } => {
-            Ok(Response::failure(
-                command.operation(),
-                ErrorCode::InvalidInput,
-                "agent helper subcommands run as scripts' commands, not as protocol operations",
-            ))
-        }
+        AgentCommand::Heartbeat { .. }
+        | AgentCommand::Lock { .. }
+        | AgentCommand::Log { .. }
+        | AgentCommand::ResultCmd { .. }
+        | AgentCommand::ConfigCmd { .. }
+        | AgentCommand::SiteCmd { .. }
+        | AgentCommand::Version { .. } => Ok(Response::failure(
+            command.operation(),
+            ErrorCode::InvalidInput,
+            "agent helper subcommands run as scripts' commands, not as protocol operations",
+        )),
         AgentCommand::ActivateBruteforceConfig { request_file } => activate(&request_file),
         AgentCommand::Install {
             request_file,

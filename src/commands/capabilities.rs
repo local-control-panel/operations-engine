@@ -16,6 +16,8 @@ struct Features {
     json_lines_progress: bool,
     cancellation: bool,
     mutations: bool,
+    /// The `ops-engine agent <sub>` helper commands this engine has.
+    agent_helpers: &'static [&'static str],
 }
 
 pub fn run() -> Result<Response, ResponseBuildError> {
@@ -39,6 +41,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "backup.runScheduledDatabase",
                 "backup.activateConfig",
                 "backup.triggerNow",
+                "site.list",
                 "site.deploy",
                 "site.rollback",
                 "site.moveRoot",
@@ -162,6 +165,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 json_lines_progress: false,
                 cancellation: false,
                 mutations: true,
+                agent_helpers: crate::agent_lifecycle::AGENT_HELPERS,
             },
         },
     )

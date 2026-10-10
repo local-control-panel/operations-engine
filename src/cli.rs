@@ -627,6 +627,109 @@ pub enum AgentCommand {
         json: bool,
         message: Vec<String>,
     },
+    /// Helper for agent scripts: record what the run found (the result line
+    /// the panel shows).
+    #[command(name = "result")]
+    ResultCmd {
+        #[command(subcommand)]
+        command: AgentResultCommand,
+    },
+    /// Helper for agent scripts: read the agent's own configuration
+    /// (`$WCP_DIR/agents/NAME.conf`).
+    #[command(name = "config")]
+    ConfigCmd {
+        #[command(subcommand)]
+        command: AgentConfigCommand,
+    },
+    /// Helper for agent scripts: read-only facts about this server.
+    #[command(name = "site")]
+    SiteCmd {
+        #[command(subcommand)]
+        command: AgentSiteCommand,
+    },
+    /// Helper for agent scripts: which helper commands this engine has.
+    Version {
+        /// Print one protocol envelope on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentResultCommand {
+    /// Append the result line `{"ts","agent","status","summary","data"}` to
+    /// `$WCP_DIR/logs/NAME.log`. Nothing is written under `WCP_DRY_RUN=1`.
+    Emit {
+        name: String,
+        #[arg(long, value_enum)]
+        status: ResultStatus,
+        /// What happened, in one sentence (cut at 500 characters).
+        #[arg(long)]
+        summary: String,
+        /// A `KEY=VALUE` pair for the result's `data` object (repeatable).
+        #[arg(long = "data")]
+        data: Vec<String>,
+        /// A JSON object merged into `data` (before the `--data` pairs).
+        #[arg(long = "data-json")]
+        data_json: Option<String>,
+        /// Keep at most this many lines in the log.
+        #[arg(long = "max-lines", default_value_t = 2000)]
+        max_lines: usize,
+        /// Print one protocol envelope on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentConfigCommand {
+    /// Print the value of KEY from `$WCP_DIR/agents/NAME.conf`. Exit 1 when
+    /// the key is missing and there is no `--default`.
+    Get {
+        name: String,
+        key: String,
+        #[arg(long)]
+        default: Option<String>,
+        /// Print one protocol envelope on stdout (it contains the value).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the key names (never the values), one per line.
+    List {
+        name: String,
+        /// Print one protocol envelope on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentSiteCommand {
+    /// The sites on this server, one domain per line.
+    List {
+        /// Print one protocol envelope on stdout with the full records.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ResultStatus {
+    Ok,
+    Warn,
+    Fail,
+    Skipped,
+}
+
+impl ResultStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+            Self::Skipped => "skipped",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -661,7 +764,29 @@ impl AgentCommand {
             Self::Heartbeat { .. } => "agent.heartbeat",
             Self::Lock { .. } => "agent.lock",
             Self::Log { .. } => "agent.log",
+            Self::ResultCmd { .. } => "agent.result.emit",
+            Self::ConfigCmd { command } => match command {
+                AgentConfigCommand::Get { .. } => "agent.config.get",
+                AgentConfigCommand::List { .. } => "agent.config.list",
+            },
+            Self::SiteCmd { .. } => "agent.site.list",
+            Self::Version { .. } => "agent.version",
         }
+    }
+
+    /// Whether this is a helper for agent scripts (exit code is the contract,
+    /// no envelope unless `--json`) rather than a protocol operation.
+    pub const fn is_helper(&self) -> bool {
+        matches!(
+            self,
+            Self::Heartbeat { .. }
+                | Self::Lock { .. }
+                | Self::Log { .. }
+                | Self::ResultCmd { .. }
+                | Self::ConfigCmd { .. }
+                | Self::SiteCmd { .. }
+                | Self::Version { .. }
+        )
     }
 }
 
@@ -1010,6 +1135,8 @@ impl PermissionsCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SiteCommand {
+    /// List the sites on this server (read-only).
+    List,
     /// Deploy a resolved Git revision for one site.
     Deploy {
         #[arg(long = "site-id")]
@@ -1350,6 +1477,7 @@ pub enum SiteCommand {
 impl SiteCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
+            Self::List => "site.list",
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
             Self::MoveRoot { .. } => "site.moveRoot",
