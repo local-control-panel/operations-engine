@@ -21,8 +21,13 @@ interoperate (both take the same `flock`).
 `WCP_DRY_RUN=1` skips the heartbeat and log writes (a dry run must not look
 like a real run to the panel) but still takes the lock.
 
-Cron runs agents with a minimal `PATH`; call the binary as
-`/usr/local/bin/ops-engine` (or `$OPS_ENGINE`).
+Cron runs agents with a minimal `PATH`. The engine therefore writes
+`WCP_DIR=/root/.wcp OPS_ENGINE=/usr/local/bin/ops-engine
+PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` into every agent cron line
+and `Environment=` lines into every sandboxed agent's systemd service, on
+install or reinstall (a line written by an older engine gets them the next time
+the agent is installed). Call the binary as `$OPS_ENGINE`, with
+`/usr/local/bin/ops-engine` as the default.
 
 ```bash
 NAME=my-agent

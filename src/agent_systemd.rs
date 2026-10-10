@@ -179,6 +179,9 @@ pub fn service_unit(agent: &Agent, writable: &[&str]) -> String {
          \n\
          [Service]\n\
          Type=oneshot\n\
+         Environment=WCP_DIR={wcp_dir}\n\
+         Environment=OPS_ENGINE={engine}\n\
+         Environment=PATH={path}\n\
          ExecStart=/usr/bin/env bash '{script}'\n\
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
@@ -197,6 +200,9 @@ pub fn service_unit(agent: &Agent, writable: &[&str]) -> String {
          ReadOnlyPaths=-{library}\n",
         TAG = crate::agent_lifecycle::TAG,
         name = agent.name,
+        wcp_dir = crate::agent_lifecycle::ROOT,
+        engine = crate::backup_schedule::ENGINE_BINARY,
+        path = crate::agent_lifecycle::AGENT_PATH,
         script = agent.absolute_script_path(),
         paths = paths.join(" "),
         library = library_path,
@@ -348,6 +354,9 @@ mod tests {
     fn the_service_is_the_fixed_template_with_only_the_declared_paths() {
         let unit = service_unit(agent(), &["/root/.wcp/agents", "/root/.wcp/logs"]);
         assert!(unit.contains("ExecStart=/usr/bin/env bash '/root/.wcp/agents/disk-report.sh'\n"));
+        assert!(unit.contains("Environment=WCP_DIR=/root/.wcp\n"));
+        assert!(unit.contains("Environment=OPS_ENGINE=/usr/local/bin/ops-engine\n"));
+        assert!(unit.contains("Environment=PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"));
         assert!(unit.contains("ProtectSystem=strict\n"));
         assert!(unit.contains("NoNewPrivileges=yes\n"));
         assert!(unit.contains("ReadWritePaths=-/root/.wcp/agents -/root/.wcp/logs\n"));
