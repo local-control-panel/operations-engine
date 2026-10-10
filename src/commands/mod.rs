@@ -5,6 +5,7 @@ pub mod compose_config;
 pub mod cron;
 pub mod db_restore;
 pub mod doctor;
+pub mod drupal;
 pub mod engine;
 pub mod ingress;
 pub mod meilisearch;

@@ -106,6 +106,9 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 // install), carried by `wordpress.boundedAction`.
                 "wordpress.typedActions",
                 "wordpress.setSmtpRelay",
+                "drupal.cacheRebuild",
+                "drupal.cronRun",
+                "drupal.maintenance",
                 "agent.activateBruteforceConfig",
                 "agent.install",
                 "agent.installFromRegistry",
