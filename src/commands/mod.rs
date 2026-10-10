@@ -14,6 +14,7 @@ pub mod operation;
 pub mod permissions;
 pub mod runtime_config;
 pub mod site;
+pub mod site_admin;
 pub mod stack;
 pub mod system;
 pub mod tool;

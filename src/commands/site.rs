@@ -16,6 +16,14 @@ use crate::{
 pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
     match command {
         SiteCommand::List => list(),
+        SiteCommand::AdminUsers { request_file } => {
+            crate::commands::site_admin::users(&request_file)
+        }
+        SiteCommand::AdminLogin {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::site_admin::login(&request_file, &request_id, &idempotency_key),
         SiteCommand::Deploy {
             site_id,
             revision,

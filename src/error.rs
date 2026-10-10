@@ -117,6 +117,10 @@ pub enum WarningCode {
     /// repaired, `engine rollback` would restore the version named by the
     /// stale record rather than the one just replaced.
     InstallStateRecordIncomplete,
+    /// A replay (same idempotency key) of an operation whose result carried a
+    /// one-time secret. The original succeeded, but the secret was never
+    /// stored and is not returned again; a new secret needs a new key.
+    SecretResultAlreadyIssued,
 }
 
 #[cfg(test)]

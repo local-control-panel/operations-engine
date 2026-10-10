@@ -7,15 +7,46 @@ use crate::error::{ErrorCode, WarningCode};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Response {
     pub protocol_version: u32,
     pub operation: &'static str,
     pub ok: bool,
     pub result: Option<Value>,
+    /// `true` when `result` carries a one-time secret (see `secret_result`).
+    /// Clients must not persist, log or replay such a response. Absent
+    /// (not `false`) on every ordinary response.
+    #[serde(skip_serializing_if = "is_false")]
+    pub secret_result: bool,
     pub warnings: Vec<Warning>,
     pub error: Option<ProtocolError>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// A response that carries a secret never prints it through `Debug`, so a
+/// stray `{:?}` in a log line or a panic message cannot leak it.
+impl std::fmt::Debug for Response {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("Response");
+        debug
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &self.operation)
+            .field("ok", &self.ok);
+        if self.secret_result {
+            debug.field("result", &"<redacted: secretResult>");
+        } else {
+            debug.field("result", &self.result);
+        }
+        debug
+            .field("secret_result", &self.secret_result)
+            .field("warnings", &self.warnings)
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 impl Response {
@@ -30,6 +61,25 @@ impl Response {
             operation,
             ok: true,
             result: Some(result),
+            secret_result: false,
+            warnings: Vec::new(),
+            error: None,
+        })
+    }
+
+    /// A success whose `result` is `public` plus the one-time `secret`
+    /// fields, flagged `secretResult: true`. See `secret_result`.
+    pub fn success_with_secret<P: Serialize, S: Serialize>(
+        operation: &'static str,
+        result: crate::secret_result::SecretResult<P, S>,
+    ) -> Result<Self, ResponseBuildError> {
+        let merged = result.into_response_value()?;
+        Ok(Self {
+            protocol_version: PROTOCOL_VERSION,
+            operation,
+            ok: true,
+            result: Some(merged),
+            secret_result: true,
             warnings: Vec::new(),
             error: None,
         })
@@ -41,6 +91,7 @@ impl Response {
             operation,
             ok: false,
             result: None,
+            secret_result: false,
             warnings: Vec::new(),
             error: Some(ProtocolError {
                 code,
