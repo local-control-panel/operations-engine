@@ -404,6 +404,27 @@ request with the same idempotency key, like every other WordPress mutation.
 It takes no backup: callers are expected to have shown the user the exact
 names (and typically to have taken a database export) before sending them.
 
+## `drupal.cacheRebuild`, `drupal.cronRun`, `drupal.maintenance`
+
+`drupal cache-rebuild`, `drupal cron-run` and `drupal maintenance` each accept
+a root-owned JSON request with the validated runtime container, the Drupal
+project root, the public document root (the project root itself or a directory
+below it), the site UID/GID and, for `maintenance` only, an explicit
+`"state": "on"` or `"off"`. Unknown fields are rejected, so there is no way to
+name a Drush command or argument: the operation selects a fixed argv
+(`cache:rebuild`, `core:cron`, or `state:set system.maintenance_mode 1|0
+--input-format=integer` followed by `cache:rebuild`).
+
+Under a per-site lock the engine runs Drush inside the site's container as the
+site user, never root, from the project root: the project's own
+`vendor/bin/drush` when it is executable, `drush` on `PATH` otherwise, with
+`--root=<document root>`. `maintenance` reads `system.maintenance_mode` back
+and fails the request if Drupal does not report the requested state. Output is
+bounded and the response carries no Drush output, only the action, the
+maintenance mode read back (for `maintenance`) and the completion time. The
+operations are transaction/audit recorded and replay their outcome for a
+retried request with the same idempotency key.
+
 ## `agent.activateBruteforceConfig`
 
 `agent activate-bruteforce-config` accepts a root-owned JSON request with the

@@ -28,6 +28,7 @@ pub mod docker_container;
 #[cfg(unix)]
 pub mod docker_prune;
 pub mod docker_resource;
+pub mod drupal_action;
 pub mod engine;
 pub mod error;
 pub mod failpoint;
@@ -114,6 +115,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Meilisearch { command } => commands::meilisearch::run(command),
         Command::Permissions { command } => commands::permissions::run(command),
         Command::Wordpress { command } => commands::wordpress::run(command),
+        Command::Drupal { command } => commands::drupal::run(command),
         Command::Agent { command } => commands::agent::run(command),
         Command::System { command } => commands::system::run(command),
         Command::Stack { command } => commands::stack::run(command),

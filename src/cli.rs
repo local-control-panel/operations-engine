@@ -99,6 +99,12 @@ pub enum Command {
         command: WordpressCommand,
     },
 
+    /// Typed Drupal application operations (Drush with a fixed argv).
+    Drupal {
+        #[command(subcommand)]
+        command: DrupalCommand,
+    },
+
     /// Configuration for bundled host agents.
     Agent {
         #[command(subcommand)]
@@ -136,9 +142,54 @@ impl Command {
             Self::Meilisearch { command } => command.operation(),
             Self::Permissions { command } => command.operation(),
             Self::Wordpress { command } => command.operation(),
+            Self::Drupal { command } => command.operation(),
             Self::Agent { command } => command.operation(),
             Self::System { command } => command.operation(),
             Self::Stack { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DrupalCommand {
+    /// Run `drush cache:rebuild` as the site user under one
+    /// lock/idempotency/transaction/audit-backed request.
+    CacheRebuild {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Run Drupal cron (`drush core:cron`) as the site user under one
+    /// lock/idempotency/transaction/audit-backed request.
+    CronRun {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Turn maintenance mode on or off (explicit `state` in the request)
+    /// and verify the mode Drupal reports afterwards.
+    Maintenance {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl DrupalCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::CacheRebuild { .. } => "drupal.cacheRebuild",
+            Self::CronRun { .. } => "drupal.cronRun",
+            Self::Maintenance { .. } => "drupal.maintenance",
         }
     }
 }
