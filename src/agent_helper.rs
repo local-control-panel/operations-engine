@@ -422,7 +422,7 @@ fn run_lock(
     json: bool,
     command: &[String],
 ) -> i32 {
-    if check == !command.is_empty() {
+    if check != command.is_empty() {
         let error = HelperError::Invalid(
             "give either --check or a command after `--` (`lock NAME -- CMD...`)".into(),
         );

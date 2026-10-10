@@ -2,13 +2,7 @@
 //! stdout and the files left in `$WCP_DIR`.
 #![cfg(unix)]
 
-use std::{
-    fs,
-    path::Path,
-    process::{Command as Std, Stdio},
-    thread::sleep,
-    time::{Duration, Instant},
-};
+use std::{fs, os::fd::AsRawFd, path::Path};
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -202,23 +196,16 @@ fn the_command_sees_which_lock_it_holds() {
 #[test]
 fn a_second_run_exits_zero_without_starting_the_command() {
     let dir = tempfile::tempdir().unwrap();
-    let mut holder = Std::new(env!("CARGO_BIN_EXE_ops-engine"))
-        .env("WCP_DIR", dir.path())
-        .args(["agent", "lock", "demo", "--", "sleep", "30"])
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while engine(dir.path(), &["agent", "lock", "demo", "--check"])
-        .output()
-        .unwrap()
-        .status
-        .code()
-        != Some(75)
-    {
-        assert!(Instant::now() < deadline, "the holder never took the lock");
-        sleep(Duration::from_millis(20));
-    }
+    // Another run, simulated by holding the same flock from this process.
+    fs::create_dir_all(dir.path().join("agents")).unwrap();
+    let holder = fs::File::create(dir.path().join("agents/demo.lock")).unwrap();
+    assert_eq!(
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    engine(dir.path(), &["agent", "lock", "demo", "--check"])
+        .assert()
+        .code(75);
 
     let marker = dir.path().join("ran");
     let script = format!("touch '{}'", marker.display());
@@ -253,8 +240,7 @@ fn a_second_run_exits_zero_without_starting_the_command() {
     assert_eq!(response["result"]["held"], true);
     assert_eq!(response["result"]["ran"], false);
 
-    holder.kill().unwrap();
-    holder.wait().unwrap();
+    drop(holder);
 }
 
 #[test]
