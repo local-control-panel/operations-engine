@@ -580,6 +580,23 @@ pub enum AgentCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Start an installed agent once, now, the way its scheduler would, and
+    /// report its exit code, heartbeat and last result line. `--dry-run` sets
+    /// `WCP_DRY_RUN=1` (not a sandbox).
+    Run {
+        name: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Kill the agent after this many seconds (1 to 3600).
+        #[arg(long = "timeout-seconds", default_value_t = 300)]
+        timeout_seconds: u64,
+    },
+    /// Write one agent's own configuration (`$WCP_DIR/agents/NAME.conf`, mode
+    /// 0600) from a staged request file; values never appear in the answer.
+    Configure {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+    },
     /// Helper for agent scripts: write `$WCP_DIR/agents/NAME.heartbeat`
     /// atomically. Silent on success; exit 0, or 1 on I/O failure, 2 on a bad
     /// name. Skipped under `WCP_DRY_RUN=1`.
@@ -791,6 +808,8 @@ impl AgentCommand {
             Self::Unapprove { .. } => "agent.unapprove",
             Self::Remove { .. } => "agent.remove",
             Self::BruteforceUnban { .. } => "agent.bruteforceUnban",
+            Self::Run { .. } => "agent.run",
+            Self::Configure { .. } => "agent.configure",
             Self::Heartbeat { .. } => "agent.heartbeat",
             Self::Lock { .. } => "agent.lock",
             Self::Log { .. } => "agent.log",

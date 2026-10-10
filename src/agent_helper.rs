@@ -17,7 +17,7 @@
 //!
 //! See `docs/agent-api.md` in the agents repository.
 
-mod config;
+pub mod config;
 mod result;
 
 use std::{

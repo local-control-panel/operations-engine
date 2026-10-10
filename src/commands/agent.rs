@@ -25,6 +25,12 @@ pub fn run(command: AgentCommand) -> Result<Response, ResponseBuildError> {
             "agent helper subcommands run as scripts' commands, not as protocol operations",
         )),
         AgentCommand::ActivateBruteforceConfig { request_file } => activate(&request_file),
+        AgentCommand::Run {
+            name,
+            dry_run,
+            timeout_seconds,
+        } => run_agent(&name, dry_run, timeout_seconds),
+        AgentCommand::Configure { request_file } => configure(&request_file),
         AgentCommand::Install {
             request_file,
             request_id,
@@ -474,4 +480,95 @@ fn unapprove(engine_state: &ManagedRoot, json: &str, request_id: &str) -> Respon
             "could not build the response",
         )
     })
+}
+
+/// `agent.run`: starts an installed agent once and reports the outcome.
+fn run_agent(
+    name: &str,
+    dry_run: bool,
+    timeout_seconds: u64,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::agent_run::{self, Context};
+        let dir = crate::agent_helper::state_dir();
+        let engine = std::env::var("OPS_ENGINE")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| crate::backup_schedule::ENGINE_BINARY.to_owned());
+        let context = Context {
+            dir: &dir,
+            shell: "bash",
+            unit_dir: std::path::Path::new(agent_systemd::UNIT_DIR),
+            systemctl: std::path::Path::new(agent_systemd::RUN_DIR)
+                .is_dir()
+                .then_some("systemctl"),
+            engine_binary: &engine,
+        };
+        match agent_run::run(
+            &context,
+            name,
+            dry_run,
+            std::time::Duration::from_secs(timeout_seconds),
+        ) {
+            Ok(report) => Response::success(agent_run::OPERATION, report),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(agent_run::OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (name, dry_run, timeout_seconds);
+        Ok(Response::failure(
+            "agent.run",
+            ErrorCode::UnsupportedPlatform,
+            "agent.run requires a Unix host",
+        ))
+    }
+}
+
+/// `agent.configure`: writes an agent's own `0600` configuration file.
+fn configure(path: &std::path::Path) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::agent_configure::{self, Request};
+        let operation = agent_configure::OPERATION;
+        let failure =
+            |code: ErrorCode, message: &str| Ok(Response::failure(operation, code, message));
+        let json = match crate::commands::read_root_owned_content_file_bounded(
+            path,
+            agent_configure::MAX_REQUEST_BYTES,
+        ) {
+            Ok(json) => json,
+            Err(_) => {
+                return failure(
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                );
+            }
+        };
+        let outcome = Request::parse(&json).and_then(|request| {
+            // SAFETY: geteuid has no preconditions.
+            let uid = unsafe { libc::geteuid() };
+            agent_configure::execute(&crate::agent_helper::state_dir(), uid, &request)
+        });
+        match outcome {
+            Ok(value) => Response::success(operation, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                failure(code, message)
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(Response::failure(
+            "agent.configure",
+            ErrorCode::UnsupportedPlatform,
+            "agent.configure requires a Unix host",
+        ))
+    }
 }

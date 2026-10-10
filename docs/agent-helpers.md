@@ -61,3 +61,53 @@ are optional and come from the agent's `agent.toml` (`requires_ops`,
 
 At most 32 names per list, validated before they can appear in a message.
 Bundled agents have no requirements.
+
+## Running and configuring an agent (protocol operations)
+
+These two are protocol operations (`capabilities.operations`), not helpers for
+scripts: they print one envelope.
+
+### `agent.run`
+
+`ops-engine agent run NAME [--dry-run] [--timeout-seconds N]`
+
+Starts an installed agent once, now, and answers with
+`{agent, dryRun, scheduler, exitCode, timedOut, durationMs, heartbeat, result, stdout, stderr}`.
+
+- The agent runs as its scheduler would start it: `bash $WCP_DIR/agents/NAME.sh`
+  with `WCP_DIR`, `OPS_ENGINE` and `PATH` set as in its cron line (`scheduler:
+  cron`), or `systemctl start wcp-agent-NAME.service` for a sandboxed agent
+  (`scheduler: systemd`; its output is in the journal).
+- Only an agent listed in `manifest.json` whose script is a regular file owned by
+  the running user and not writable by others runs; anything else is
+  `NOT_FOUND` or `PERMISSION_DENIED`. A held lock is `CONFLICT` and nothing is
+  started.
+- `--dry-run` sets `WCP_DRY_RUN=1`: the helpers write no heartbeat, log or result
+  line, and `heartbeat` and `result` in the answer are null. A cooperating agent
+  changes nothing outside `$WCP_DIR`. It is not a sandbox. A sandboxed agent has
+  no dry run (`INVALID_INPUT`).
+- `heartbeat` and `result` are the ones this run wrote (newer than its start).
+  `stdout` and `stderr` are the last 4 KiB. The run is killed at the timeout
+  (default 300, 1 to 3600 seconds; processes the agent started itself may
+  survive). A failing agent is an answer (`exitCode` 7), not an error.
+- Runs are not journaled by the engine.
+
+### `agent.configure`
+
+`ops-engine agent configure --request-file FILE`
+
+FILE is a root-owned request that is not writable by others:
+
+```json
+{"name": "my-agent", "values": {"WEBHOOK_URL": "https://...", "OLD": null}, "merge": true}
+```
+
+It writes `$WCP_DIR/agents/NAME.conf` (mode 0600), the file `agent config get`
+reads. Keys are `[A-Za-z_][A-Za-z0-9_]{0,63}` (at most 64); values are one line
+of at most 4096 bytes. `null` removes a key. Without `merge` the file becomes
+exactly `values`; with it the other keys stay, so a panel can change one setting
+without holding the secrets it does not show. The agent must be installed. The
+file is replaced atomically under a per-agent lock; the same request again
+reports `changed: false`. The answer lists key names (`keys`, `removed`) and
+**never a value**; errors never contain one either. The engine checks syntax and
+size, not which keys an agent reads.
