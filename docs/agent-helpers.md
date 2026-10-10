@@ -1,6 +1,6 @@
 # Agent helper subcommands
 
-`ops-engine agent heartbeat|lock|log` are the shared helpers for agent scripts,
+`ops-engine agent heartbeat|lock|log|result|config|site|version` are the shared helpers for agent scripts,
 usable identically from Bash and Python (an installed agent is a single script
 file, so a library file is not an option for Bash). They are **not** protocol
 operations: they are not listed in `capabilities`, print no envelope unless
@@ -17,8 +17,13 @@ interoperate (both take the same `flock`).
 | `agent lock NAME -- CMD...` | Takes `agents/NAME.lock` (non-blocking `flock`, mode 0600) and `exec`s CMD with the lock inherited. `WCP_LOCK_HELD=NAME` is set for CMD. Lock held: CMD is not started, exit `--held-exit-code` (default 0) | CMD's own; 126/127 exec failure; 2 bad usage |
 | `agent lock NAME --check` | Probe only | 0 free, 75 held |
 | `agent log NAME [--level L] [--max-lines N] [MESSAGE...]` | Appends `{"ts","agent","level","msg"}` to `logs/NAME.log` and keeps the last N lines (default 2000). Message from stdin when none | 0, 1 I/O, 2 invalid |
+| `agent result emit NAME --status ok\|warn\|fail\|skipped --summary TEXT [--data KEY=VALUE]... [--data-json JSON] [--max-lines N]` | Appends the result line `{"ts","agent","status","summary","data"}` to `logs/NAME.log` (same bounded file as `agent log`). Summary is cut at 500 characters; `data` is an object of at most 4 KiB whose keys are `[A-Za-z0-9_.-]` and must not look like a secret (`password`, `secret`, `token`, `api_key`, `credential`...) | 0, 1 I/O, 2 invalid |
+| `agent config get NAME KEY [--default V] [--json]` | Prints KEY from `agents/NAME.conf`, which is `KEY=VALUE` lines (`#` comments), values verbatim, no expansion. The file must be a regular file owned by the running user and not writable by others (opened with `O_NOFOLLOW`, at most 64 KiB). Missing key without `--default`: exit 1 | 0, 1 missing or unreadable, 2 bad key or name |
+| `agent config list NAME [--json]` | The key names, one per line, never the values | 0, 1, 2 |
+| `agent site list [--json]` | One domain per line; `--json` gives `{"sites":[{siteId,domain,siteUser,contentRoot,source}]}`. Sites with an engine manifest (`/etc/operations-engine/sites`, trusted like a deploy trusts it) plus dot-named directories under `/var/www` without one (`siteId` null, `source` `filesystem`). Overridable by `WCP_SITES_MANIFEST_DIR` and `SITES_ROOT`. The same data is the read-only protocol operation `site.list` (`ops-engine site list`) | 0 |
+| `agent version [--json]` | `agent-helpers N` then the helper names, one per line. The same list is `capabilities.features.agentHelpers`. `ops-engine agent help` lists every subcommand | 0 |
 
-`WCP_DRY_RUN=1` skips the heartbeat and log writes (a dry run must not look
+`WCP_DRY_RUN=1` skips the heartbeat, log and result writes (a dry run must not look
 like a real run to the panel) but still takes the lock.
 
 Cron runs agents with a minimal `PATH`; call the binary as

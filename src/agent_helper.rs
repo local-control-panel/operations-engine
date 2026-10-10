@@ -17,6 +17,9 @@
 //!
 //! See `docs/agent-api.md` in the agents repository.
 
+mod config;
+mod result;
+
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
@@ -29,8 +32,8 @@ use std::{
 use serde_json::{Value, json};
 
 use crate::{
-    agent_lifecycle::{ROOT, valid_agent_name},
-    cli::{AgentCommand, LogLevel},
+    agent_lifecycle::{AGENT_HELPER_API, AGENT_HELPERS, ROOT, valid_agent_name},
+    cli::{AgentCommand, AgentConfigCommand, AgentResultCommand, AgentSiteCommand, LogLevel},
     error::ErrorCode,
     protocol::Response,
 };
@@ -334,10 +337,7 @@ fn print_envelope(response: &Response) {
 /// Whether `command` is one of the helpers handled here instead of through
 /// the protocol path.
 pub fn is_helper(command: &AgentCommand) -> bool {
-    matches!(
-        command,
-        AgentCommand::Heartbeat { .. } | AgentCommand::Lock { .. } | AgentCommand::Log { .. }
-    )
+    command.is_helper()
 }
 
 /// Runs a helper and returns the process exit code. Panics on a non-helper
@@ -382,8 +382,154 @@ pub fn run_in(dir: &Path, dry_run: bool, command: &AgentCommand) -> i32 {
             json,
             command,
         } => run_lock(dir, name, *check, *held_exit_code, *json, command),
+        AgentCommand::ResultCmd {
+            command:
+                AgentResultCommand::Emit {
+                    name,
+                    status,
+                    summary,
+                    data,
+                    data_json,
+                    max_lines,
+                    json,
+                },
+        } => {
+            let outcome = result_outcome(
+                dir,
+                dry_run,
+                name,
+                status.as_str(),
+                summary,
+                data,
+                data_json.as_deref(),
+                *max_lines,
+            );
+            emit("agent.result.emit", outcome, *json)
+        }
+        AgentCommand::ConfigCmd { command } => run_config(dir, command),
+        AgentCommand::SiteCmd {
+            command: AgentSiteCommand::List { json },
+        } => run_site_list(*json),
+        AgentCommand::Version { json } => {
+            let text = std::iter::once(format!("agent-helpers {AGENT_HELPER_API}"))
+                .chain(AGENT_HELPERS.iter().map(|name| (*name).to_owned()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let result = json!({"helperApi": AGENT_HELPER_API, "helpers": AGENT_HELPERS,
+                                "engineVersion": env!("CARGO_PKG_VERSION")});
+            emit_text("agent.version", Ok((result, Some(text))), *json)
+        }
         _ => unreachable!("run is only called for helper commands"),
     }
+}
+
+/// Like `emit`, but a successful call prints `text` on stdout (the helper's
+/// answer, for `config get`, `site list`...) unless `--json` asked for the
+/// envelope instead.
+fn emit_text(
+    operation: &'static str,
+    outcome: Result<(Value, Option<String>), HelperError>,
+    json: bool,
+) -> i32 {
+    match outcome {
+        Ok((result, text)) => {
+            if json {
+                if let Ok(response) = Response::success(operation, result) {
+                    print_envelope(&response);
+                }
+            } else if let Some(text) = text {
+                println!("{text}");
+            }
+            EXIT_OK
+        }
+        Err(error) => emit(operation, Err(error), json),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn result_outcome(
+    dir: &Path,
+    dry_run: bool,
+    name: &str,
+    status: &str,
+    summary: &str,
+    pairs: &[String],
+    data_json: Option<&str>,
+    max_lines: usize,
+) -> Result<Value, HelperError> {
+    check_name(name)?;
+    result::check_max_lines(max_lines)?;
+    let data = result::build_data(pairs, data_json)?;
+    let line = result::result_line(name, status, summary, &data, now())?;
+    let parsed = serde_json::from_str::<Value>(&line).unwrap_or(Value::Null);
+    if dry_run {
+        return Ok(json!({"agent": name, "written": false, "dryRun": true, "line": parsed}));
+    }
+    let path = append_log(dir, name, &line, max_lines)?;
+    Ok(json!({"agent": name, "written": true, "dryRun": false, "path": path, "line": parsed}))
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+fn run_config(dir: &Path, command: &AgentConfigCommand) -> i32 {
+    match command {
+        AgentConfigCommand::Get {
+            name,
+            key,
+            default,
+            json,
+        } => {
+            let outcome = config::check_key(key)
+                .and_then(|()| config::read(dir, name, effective_uid()))
+                .and_then(|values| {
+                    let found = values.as_ref().and_then(|map| map.get(key.as_str()));
+                    match (found, default) {
+                        (Some(value), _) => Ok((value.clone(), "file")),
+                        (None, Some(value)) => Ok((value.clone(), "default")),
+                        (None, None) => Err(HelperError::Failed(format!("{key} is not set"))),
+                    }
+                })
+                .map(|(value, source)| {
+                    (
+                        json!({"agent": name, "key": key, "value": value, "source": source}),
+                        Some(value),
+                    )
+                });
+            emit_text("agent.config.get", outcome, *json)
+        }
+        AgentConfigCommand::List { name, json } => {
+            let outcome = config::read(dir, name, effective_uid()).map(|values| {
+                let keys: Vec<String> = values.unwrap_or_default().into_keys().collect();
+                let text = (!keys.is_empty()).then(|| keys.join("\n"));
+                (json!({"agent": name, "keys": keys}), text)
+            });
+            emit_text("agent.config.list", outcome, *json)
+        }
+    }
+}
+
+fn run_site_list(json: bool) -> i32 {
+    let manifests = std::env::var_os("WCP_SITES_MANIFEST_DIR")
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| PathBuf::from(crate::site_list::SITES_DIR), PathBuf::from);
+    let root = std::env::var_os("SITES_ROOT")
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || PathBuf::from(crate::site_list::SITES_ROOT),
+            PathBuf::from,
+        );
+    let sites = crate::site_list::list(&manifests, &root, effective_uid());
+    let text = (!sites.is_empty()).then(|| {
+        sites
+            .iter()
+            .map(|site| site.domain.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    emit_text("agent.site.list", Ok((json!({"sites": sites}), text)), json)
 }
 
 fn log_outcome(
@@ -395,11 +541,7 @@ fn log_outcome(
     message: &[String],
 ) -> Result<Value, HelperError> {
     check_name(name)?;
-    if max_lines == 0 || max_lines > MAX_LINES_LIMIT {
-        return Err(HelperError::Invalid(format!(
-            "--max-lines must be between 1 and {MAX_LINES_LIMIT}"
-        )));
-    }
+    result::check_max_lines(max_lines)?;
     let text = if message.is_empty() || message == ["-"] {
         read_stdin_message()?
     } else {

@@ -15,6 +15,7 @@ use crate::{
 
 pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        SiteCommand::List => list(),
         SiteCommand::Deploy {
             site_id,
             revision,
@@ -1764,4 +1765,27 @@ fn rollback_request_error_message(error: RollbackRequestError) -> &'static str {
         RollbackRequestError::InvalidRequestId => "request-id is not a canonical UUID",
         RollbackRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
     }
+}
+
+fn list() -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let sites = crate::site_list::list(
+            std::path::Path::new(crate::site_list::SITES_DIR),
+            std::path::Path::new(crate::site_list::SITES_ROOT),
+            uid,
+        );
+        Response::success(
+            crate::site_list::OPERATION,
+            crate::site_list::ListResult { sites },
+        )
+    }
+    #[cfg(not(unix))]
+    Ok(Response::failure(
+        "site.list",
+        ErrorCode::UnsupportedPlatform,
+        "site.list requires a Unix host",
+    ))
 }

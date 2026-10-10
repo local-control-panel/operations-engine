@@ -56,6 +56,7 @@ fn capabilities_describe_only_implemented_operations() {
             "backup.runScheduledDatabase",
             "backup.activateConfig",
             "backup.triggerNow",
+            "site.list",
             "site.deploy",
             "site.rollback",
             "site.moveRoot",
@@ -172,6 +173,18 @@ fn capabilities_describe_only_implemented_operations() {
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
+    assert_eq!(
+        response["result"]["features"]["agentHelpers"],
+        serde_json::json!([
+            "heartbeat",
+            "lock",
+            "log",
+            "result",
+            "config",
+            "site",
+            "version"
+        ])
+    );
     // Neither mechanism is wired to the CLI process lifecycle yet: nothing
     // ever calls `CancellationToken::cancel()` from a signal, and `--output`
     // has no JSON Lines variant. Advertising either now would be a real
