@@ -171,10 +171,13 @@ fn capabilities_describe_only_implemented_operations() {
             "site.migrateRuntime",
             "system.service",
             "compose.action",
-            "compose.remove"
+            "compose.remove",
+            "journal.append",
+            "journal.list"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
+    assert_eq!(response["result"]["features"]["journal"], cfg!(unix));
     assert_eq!(
         response["result"]["features"]["agentHelpers"],
         serde_json::json!([

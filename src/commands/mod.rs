@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod drupal;
 pub mod engine;
 pub mod ingress;
+pub mod journal;
 pub mod meilisearch;
 pub mod operation;
 pub mod permissions;
