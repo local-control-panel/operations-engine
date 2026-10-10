@@ -841,4 +841,19 @@ mod tests {
             Err(RequestError::InvalidIdempotencyKey)
         ));
     }
+
+    /// Network: the pinned official release still hashes to the pinned digest
+    /// and has the shape of the expected artifact. Run with `--ignored`.
+    #[test]
+    #[ignore = "downloads the official release"]
+    fn the_official_wp_cli_release_matches_the_pin() {
+        for tool in Tool::ALL {
+            let artifact = tool.pinned();
+            let bytes =
+                fetch::fetch_bytes_bounded(&artifact.url, MAX_ARTIFACT_BYTES, FETCH_TIMEOUT)
+                    .unwrap();
+            assert_eq!(hex_digest(&Sha256::digest(&bytes)), artifact.sha256);
+            assert!(tool.looks_valid(&bytes));
+        }
+    }
 }
