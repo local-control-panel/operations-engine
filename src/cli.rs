@@ -580,6 +580,72 @@ pub enum AgentCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Helper for agent scripts: write `$WCP_DIR/agents/NAME.heartbeat`
+    /// atomically. Silent on success; exit 0, or 1 on I/O failure, 2 on a bad
+    /// name. Skipped under `WCP_DRY_RUN=1`.
+    Heartbeat {
+        name: String,
+        /// The exit status to record (use `$?` in an EXIT trap).
+        #[arg(long = "exit-code", default_value_t = 0, allow_hyphen_values = true)]
+        exit_code: i32,
+        /// Print one protocol envelope on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Helper for agent scripts: take the agent's non-blocking lock
+    /// (`$WCP_DIR/agents/NAME.lock`) and run `-- CMD...` while holding it.
+    /// When another run holds it, CMD is not started and the exit code is 0
+    /// (`--held-exit-code`). `--check` only probes: 0 free, 75 held.
+    Lock {
+        name: String,
+        /// Probe without running anything.
+        #[arg(long)]
+        check: bool,
+        /// Exit code when the lock is already held.
+        #[arg(long = "held-exit-code", default_value_t = 0)]
+        held_exit_code: u8,
+        /// Print one protocol envelope on stdout when the command is not run.
+        #[arg(long)]
+        json: bool,
+        /// The command to run under the lock; replaces this process, so its
+        /// exit status is the exit status.
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    /// Helper for agent scripts: append one JSON line to
+    /// `$WCP_DIR/logs/NAME.log` and keep the file bounded. The message comes
+    /// from the arguments, or from standard input when none (or `-`) is given.
+    Log {
+        name: String,
+        #[arg(long, value_enum, default_value_t = LogLevel::Info)]
+        level: LogLevel,
+        /// Keep at most this many lines.
+        #[arg(long = "max-lines", default_value_t = 2000)]
+        max_lines: usize,
+        /// Print one protocol envelope on stdout.
+        #[arg(long)]
+        json: bool,
+        message: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
 }
 
 impl AgentCommand {
@@ -592,6 +658,9 @@ impl AgentCommand {
             Self::Unapprove { .. } => "agent.unapprove",
             Self::Remove { .. } => "agent.remove",
             Self::BruteforceUnban { .. } => "agent.bruteforceUnban",
+            Self::Heartbeat { .. } => "agent.heartbeat",
+            Self::Lock { .. } => "agent.lock",
+            Self::Log { .. } => "agent.log",
         }
     }
 }

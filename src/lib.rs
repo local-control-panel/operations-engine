@@ -1,4 +1,6 @@
 pub mod agent_config;
+#[cfg(unix)]
+pub mod agent_helper;
 pub mod agent_lifecycle;
 pub mod agent_registry;
 pub mod agent_systemd;
