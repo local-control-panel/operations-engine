@@ -47,6 +47,7 @@ pub const AGENT_HELPERS: &[&str] = &[
     "config",
     "site",
     "version",
+    "tool",
 ];
 /// Raised when an existing helper's contract changes (it never should).
 pub const AGENT_HELPER_API: u32 = 1;

@@ -182,7 +182,8 @@ fn capabilities_describe_only_implemented_operations() {
             "result",
             "config",
             "site",
-            "version"
+            "version",
+            "tool"
         ])
     );
     // Neither mechanism is wired to the CLI process lifecycle yet: nothing
