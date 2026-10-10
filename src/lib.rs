@@ -58,7 +58,9 @@ pub mod process;
 pub mod protocol;
 pub mod rollback;
 pub mod runtime_config;
+pub mod secret_result;
 pub mod site;
+pub mod site_admin;
 #[cfg(unix)]
 pub mod site_archive;
 pub mod site_enroll;

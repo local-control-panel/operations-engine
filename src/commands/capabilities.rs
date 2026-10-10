@@ -165,6 +165,8 @@ pub const OPERATIONS: &[&str] = &[
     "compose.remove",
     "site.changeLog.append",
     "site.changeLog.list",
+    "site.adminUsers",
+    "site.adminLogin",
 ];
 
 pub fn run() -> Result<Response, ResponseBuildError> {

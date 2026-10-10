@@ -1276,6 +1276,22 @@ impl PermissionsCommand {
 pub enum SiteCommand {
     /// List the sites on this server (read-only).
     List,
+    /// List a site's administrators (ids and logins, at most 50; read-only).
+    AdminUsers {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+    },
+    /// Issue a short-lived, single-use login link for one administrator. The
+    /// link is returned once (`secretResult`) and is never stored.
+    AdminLogin {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        /// Required: a replay returns "already issued", never the link.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
     /// Deploy a resolved Git revision for one site.
     Deploy {
         #[arg(long = "site-id")]
@@ -1617,6 +1633,8 @@ impl SiteCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::List => "site.list",
+            Self::AdminUsers { .. } => "site.adminUsers",
+            Self::AdminLogin { .. } => "site.adminLogin",
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
             Self::MoveRoot { .. } => "site.moveRoot",

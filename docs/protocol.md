@@ -38,6 +38,66 @@ but that feature is not implemented yet.
   interpret them.
 - Operation and warning codes are stable API values, not display text.
 
+## `secretResult`
+
+A response whose `result` carries a value that must reach the caller exactly
+once and must never be stored (a one-time login link) sets the top-level
+envelope field `"secretResult": true` (the field is absent on every ordinary
+response). The rule, which clients must follow:
+
+- Do not persist, log, cache or replay a response with `secretResult: true`.
+  Show it once and keep it in memory only.
+- The engine splits such a result into a *public* part and a *secret* part
+  (`src/secret_result.rs`). Only the public part is written to the transaction
+  state, only the public part is returned by an idempotent replay, and
+  `operation.status`/`operation.list` can therefore never expose the secret.
+  The secret is not written to the audit trail, the change journal or stderr,
+  and the response type redacts it in `Debug` output.
+- A replay (same idempotency key) succeeds with the stored public fields plus
+  `alreadyIssued: true`, no secret, no `secretResult` flag and the warning
+  `SECRET_RESULT_ALREADY_ISSUED`. A new secret needs a new idempotency key.
+
+## `site.adminUsers`, `site.adminLogin`
+
+One-time administrator login. Implemented for WordPress (`"cms":
+"wordpress"`); `drupal` and `joomla` are refused with `INVALID_INPUT` until
+their follow-ups (Drupal `drush uli` needs Drush as an engine-managed tool,
+and its link lives 24 h by default, not minutes; Joomla needs a spike).
+
+Both take `--request-file`, a root-owned JSON plan:
+`{"cms","container","root","uid","gid"}` plus, for the login,
+`"adminUserId"` and an optional `"ttlSeconds"` (60 to 600, default 300). The
+root must lie under a configured content root; the CMS kind comes from the
+panel's `site.probe` result.
+
+`site admin-users` is read-only and returns `users: [{id, login}]` for the
+`administrator` role (at most 50, `truncated` when there are more). No emails,
+no hashes.
+
+`site admin-login` also takes `--request-id` and a **required**
+`--idempotency-key`, runs under the per-site resource lock and returns, with
+`secretResult: true`: `url`, `adminUserId`, `adminLogin`, `issuedAtUnixSecs`,
+`expiresAtUnixSecs`. Errors: `NOT_FOUND` (no such user), `PERMISSION_DENIED`
+(not an administrator), `CONFLICT` (10 unexpired links already outstanding, or
+another operation in progress).
+
+How it works on WordPress: the engine generates a 244-bit token and keeps it
+in memory. The container receives (on stdin, never argv) only the user id, the
+expiry and the SHA-256 of the token, and writes a mu-plugin
+`wp-content/mu-plugins/wcp-otl-<expiresAt>-<random>.php` as the site user.
+That file holds the hash; a request with `?wcp_otl=<token>` is compared with
+`hash_equals`, the file is `unlink`ed (atomic: exactly one of several
+concurrent requests wins), the administrator is logged in (`wp_login` fires)
+and redirected to the dashboard with `no-store` and `Referrer-Policy:
+no-referrer`. An expired file deletes itself on its next request, and every
+issue removes expired files. Not covered: a site-level two-factor plugin that
+only hooks the login form does not run, and the site's own web server access
+log records the request line of the spent link (the token is already invalid
+by then).
+
+The panel records only the fact in the change journal
+(`site.changeLog.append`, action `cms.adminLogin`, `target` = admin login).
+
 ## Version negotiation
 
 Clients should call `version` and `capabilities` before using operations whose

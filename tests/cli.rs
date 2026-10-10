@@ -173,7 +173,9 @@ fn capabilities_describe_only_implemented_operations() {
             "compose.action",
             "compose.remove",
             "site.changeLog.append",
-            "site.changeLog.list"
+            "site.changeLog.list",
+            "site.adminUsers",
+            "site.adminLogin"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
@@ -537,4 +539,42 @@ fn journal_list_rejects_invalid_filters() {
         assert_eq!(response["error"]["code"], "INVALID_INPUT");
         assert_eq!(response["error"]["message"], message);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn admin_login_requires_an_idempotency_key_and_never_returns_a_secret_on_failure() {
+    const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    // The idempotency key is mandatory at the argument level.
+    Command::cargo_bin("ops-engine")
+        .expect("binary should build")
+        .args([
+            "site",
+            "admin-login",
+            "--request-file",
+            "/nonexistent",
+            "--request-id",
+            ID,
+        ])
+        .assert()
+        .failure();
+
+    let response = journal_failure(&[
+        "site",
+        "admin-login",
+        "--request-file",
+        "/nonexistent",
+        "--request-id",
+        ID,
+        "--idempotency-key",
+        "k1",
+    ]);
+    assert_eq!(response["operation"], "site.adminLogin");
+    assert_eq!(response["ok"], false);
+    assert!(response["result"].is_null());
+    assert!(response.get("secretResult").is_none());
+
+    let response = journal_failure(&["site", "admin-users", "--request-file", "/nonexistent"]);
+    assert_eq!(response["operation"], "site.adminUsers");
+    assert_eq!(response["ok"], false);
 }
