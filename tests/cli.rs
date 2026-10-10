@@ -133,6 +133,8 @@ fn capabilities_describe_only_implemented_operations() {
             "agent.unapprove",
             "agent.remove",
             "agent.bruteforceUnban",
+            "agent.run",
+            "agent.configure",
             "system.activateAutoupdatesConfig",
             "system.installAutoupdates",
             "system.installDocker",

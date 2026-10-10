@@ -120,6 +120,8 @@ pub const OPERATIONS: &[&str] = &[
     "agent.unapprove",
     "agent.remove",
     "agent.bruteforceUnban",
+    "agent.run",
+    "agent.configure",
     "system.activateAutoupdatesConfig",
     "system.installAutoupdates",
     "system.installDocker",
