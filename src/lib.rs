@@ -78,6 +78,7 @@ pub mod system_start_docker;
 #[cfg(unix)]
 pub mod system_swap;
 pub mod tar_extract;
+pub mod tool_manage;
 pub mod transaction;
 pub mod valkey;
 pub mod wordpress;
@@ -116,6 +117,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Permissions { command } => commands::permissions::run(command),
         Command::Wordpress { command } => commands::wordpress::run(command),
         Command::Drupal { command } => commands::drupal::run(command),
+        Command::Tool { command } => commands::tool::run(command),
         Command::Agent { command } => commands::agent::run(command),
         Command::System { command } => commands::system::run(command),
         Command::Stack { command } => commands::stack::run(command),
