@@ -1,4 +1,4 @@
-//! `journal.append` and `journal.list`: the server-side change journal
+//! `site.changeLog.append` and `site.changeLog.list`: the server-side change journal
 //! ("who changed what on which site, when, with which result").
 //!
 //! The engine is the source of truth; the panel reads it and may keep its
@@ -52,8 +52,8 @@ use crate::{
     transaction::{IdempotencyKey, RequestId},
 };
 
-pub const APPEND_OPERATION: &str = "journal.append";
-pub const LIST_OPERATION: &str = "journal.list";
+pub const APPEND_OPERATION: &str = "site.changeLog.append";
+pub const LIST_OPERATION: &str = "site.changeLog.list";
 
 pub const SCHEMA_VERSION: u32 = 1;
 const DIR: &str = "journal";
@@ -112,7 +112,7 @@ pub const ACTION_NAMESPACES: &[&str] = &[
     "wordpress",
 ];
 
-/// Whether an entry was supplied through `journal.append` or written by the
+/// Whether an entry was supplied through `site.changeLog.append` or written by the
 /// engine itself for one of its own operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -126,6 +126,26 @@ impl Source {
         match value {
             "api" => Some(Self::Api),
             "engine" => Some(Self::Engine),
+            _ => None,
+        }
+    }
+}
+
+/// The site's environment label (ROADMAP C7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Environment {
+    Production,
+    Staging,
+    Development,
+}
+
+impl Environment {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "production" => Some(Self::Production),
+            "staging" => Some(Self::Staging),
+            "development" => Some(Self::Development),
             _ => None,
         }
     }
@@ -169,13 +189,15 @@ pub enum JournalError {
     Io,
 }
 
-/// Unvalidated `journal.append` fields.
+/// Unvalidated `site.changeLog.append` fields.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RawEntry<'a> {
     pub actor: &'a str,
     pub action: &'a str,
     pub result: &'a str,
     pub site: Option<&'a str>,
+    pub subsite: Option<&'a str>,
+    pub environment: Option<&'a str>,
     pub operation_id: Option<&'a str>,
     pub target: Option<&'a str>,
     pub error_code: Option<&'a str>,
@@ -189,6 +211,8 @@ pub struct NewEntry {
     action: String,
     result: JournalResult,
     site: Option<String>,
+    subsite: Option<String>,
+    environment: Option<Environment>,
     operation_id: Option<String>,
     target: Option<String>,
     error_code: Option<String>,
@@ -208,6 +232,14 @@ impl NewEntry {
         let site = raw
             .site
             .map(|v| token(v, MAX_SITE_LEN, "", Rejected("site is invalid")))
+            .transpose()?;
+        let subsite = raw
+            .subsite
+            .map(|v| token(v, MAX_SITE_LEN, "", Rejected("subsite is invalid")))
+            .transpose()?;
+        let environment = raw
+            .environment
+            .map(|v| Environment::parse(v).ok_or(Rejected("environment is invalid")))
             .transpose()?;
         let operation_id = raw
             .operation_id
@@ -231,6 +263,8 @@ impl NewEntry {
             action,
             result,
             site,
+            subsite,
+            environment,
             operation_id,
             target,
             error_code,
@@ -390,7 +424,7 @@ fn has_secret_assignment(lower: &str) -> bool {
 pub struct Entry {
     pub schema_version: u32,
     pub seq: u64,
-    /// The request id of the `journal.append` call (or of the engine
+    /// The request id of the `site.changeLog.append` call (or of the engine
     /// operation, for [`Source::Engine`] entries).
     pub id: RequestId,
     pub at_unix_secs: u64,
@@ -400,6 +434,10 @@ pub struct Entry {
     pub result: JournalResult,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subsite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<Environment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -648,6 +686,8 @@ pub fn append_with(
         action: entry.action.clone(),
         result: entry.result,
         site: entry.site.clone(),
+        subsite: entry.subsite.clone(),
+        environment: entry.environment,
         operation_id: entry.operation_id.clone(),
         target: entry.target.clone(),
         error_code: entry.error_code.clone(),
@@ -716,10 +756,12 @@ fn prune(dir: &ManagedRoot, now: u64, max_segments: usize) {
     }
 }
 
-/// `journal.list` filters. All are optional; a page is newest first.
+/// `site.changeLog.list` filters. All are optional; a page is newest first.
 #[derive(Clone, Debug, Default)]
 pub struct Query {
     pub site: Option<String>,
+    pub subsite: Option<String>,
+    pub environment: Option<Environment>,
     pub since_unix_secs: Option<u64>,
     pub action_prefix: Option<String>,
     pub result: Option<JournalResult>,
@@ -733,6 +775,9 @@ impl Query {
     pub fn validate(&self) -> Result<(), Rejected> {
         if let Some(site) = &self.site {
             token(site, MAX_SITE_LEN, "", Rejected("site is invalid"))?;
+        }
+        if let Some(subsite) = &self.subsite {
+            token(subsite, MAX_SITE_LEN, "", Rejected("subsite is invalid"))?;
         }
         if let Some(prefix) = &self.action_prefix {
             if prefix.is_empty()
@@ -751,6 +796,13 @@ impl Query {
         self.site
             .as_deref()
             .is_none_or(|s| entry.site.as_deref() == Some(s))
+            && self
+                .subsite
+                .as_deref()
+                .is_none_or(|s| entry.subsite.as_deref() == Some(s))
+            && self
+                .environment
+                .is_none_or(|e| entry.environment == Some(e))
             && self.since_unix_secs.is_none_or(|t| entry.at_unix_secs >= t)
             && self
                 .action_prefix

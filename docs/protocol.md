@@ -79,14 +79,15 @@ scope that never ran a mutation returns an empty list. `unreadable` counts
 records that exist but could not be parsed and `truncated` is true when more
 records exist than were returned.
 
-## `journal.append`, `journal.list`
+## `site.changeLog.append`, `site.changeLog.list`
 
 The change journal answers "who changed what on which site, when, with which
 result". The engine is the source of truth; the panel appends its own events
-and reads the list. `capabilities` advertises it as `features.journal`.
+and reads the list. `capabilities` advertises it as `features.changeLog`.
 
-`journal append` takes `--actor`, `--action`, `--result` and optional `--site`,
-`--operation-id`, `--target`, `--error-code`, `--summary`, plus `--request-id`
+`change-log append` takes `--actor`, `--action`, `--result` and optional
+`--site`, `--subsite`, `--environment` (`production`, `staging` or
+`development`), `--operation-id`, `--target`, `--error-code`, `--summary`, plus `--request-id`
 (canonical UUID, becomes the entry id) and an optional `--idempotency-key`.
 The engine assigns `seq` (strictly increasing, the pagination cursor), the
 time (`atUnixSecs`, engine clock) and `source: "api"`. A retry with the same
@@ -116,8 +117,8 @@ Never put secrets or one-time login links in any field. For a one-time admin
 login the journal records only the fact (`cms.adminLogin`) and the admin user
 (`target`), never the link.
 
-`journal list` is read-only and returns the newest entries first. Filters:
-`--site`, `--since <unix secs>`, `--action-prefix`, `--result`, `--source`
+`change-log list` is read-only and returns the newest entries first. Filters:
+`--site`, `--subsite`, `--environment`, `--since <unix secs>`, `--action-prefix`, `--result`, `--source`
 (`api` or `engine`), `--limit` (default 50, clamped to 200) and
 `--before-seq` (the previous page's `nextCursor`). The result is `entries`,
 `nextCursor` (absent on the last page) and `skipped` (stored lines that could

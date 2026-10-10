@@ -21,6 +21,8 @@ pub fn run(command: JournalCommand) -> Result<Response, ResponseBuildError> {
                 action,
                 result,
                 site,
+                subsite,
+                environment,
                 operation_id,
                 target,
                 error_code,
@@ -33,6 +35,8 @@ pub fn run(command: JournalCommand) -> Result<Response, ResponseBuildError> {
                     action: &action,
                     result: &result,
                     site: site.as_deref(),
+                    subsite: subsite.as_deref(),
+                    environment: environment.as_deref(),
                     operation_id: operation_id.as_deref(),
                     target: target.as_deref(),
                     error_code: error_code.as_deref(),
@@ -43,15 +47,19 @@ pub fn run(command: JournalCommand) -> Result<Response, ResponseBuildError> {
             ),
             JournalCommand::List {
                 site,
+                subsite,
+                environment,
                 since,
                 action_prefix,
                 result,
                 source,
                 limit,
                 before_seq,
-            } => list(&result, &source, {
+            } => list(&result, &source, &environment, {
                 Query {
                     site,
+                    subsite,
+                    environment: None,
                     since_unix_secs: since,
                     action_prefix,
                     result: None,
@@ -144,6 +152,7 @@ fn append(
 fn list(
     result: &Option<String>,
     source: &Option<String>,
+    environment: &Option<String>,
     mut query: Query,
 ) -> Result<Response, ResponseBuildError> {
     let operation = journal::LIST_OPERATION;
@@ -164,6 +173,12 @@ fn list(
         match Source::parse(value) {
             Some(parsed) => query.source = Some(parsed),
             None => return invalid("source is invalid"),
+        }
+    }
+    if let Some(value) = environment {
+        match crate::journal::Environment::parse(value) {
+            Some(parsed) => query.environment = Some(parsed),
+            None => return invalid("environment is invalid"),
         }
     }
     if let Err(rejected) = query.validate() {

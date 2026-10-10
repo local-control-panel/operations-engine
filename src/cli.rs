@@ -132,6 +132,7 @@ pub enum Command {
 
     /// The server-side change journal (who changed what, when, with which
     /// result). Never carries secrets or one-time links.
+    #[command(name = "change-log")]
     Journal {
         #[command(subcommand)]
         command: JournalCommand,
@@ -182,6 +183,12 @@ pub enum JournalCommand {
         result: String,
         #[arg(long)]
         site: Option<String>,
+        /// Network subsite (WordPress multisite and similar).
+        #[arg(long)]
+        subsite: Option<String>,
+        /// `production`, `staging` or `development`.
+        #[arg(long)]
+        environment: Option<String>,
         /// The panel operation this event belongs to.
         #[arg(long = "operation-id")]
         operation_id: Option<String>,
@@ -203,6 +210,10 @@ pub enum JournalCommand {
     List {
         #[arg(long)]
         site: Option<String>,
+        #[arg(long)]
+        subsite: Option<String>,
+        #[arg(long)]
+        environment: Option<String>,
         /// Only events at or after this Unix time (seconds).
         #[arg(long)]
         since: Option<u64>,
@@ -211,7 +222,7 @@ pub enum JournalCommand {
         action_prefix: Option<String>,
         #[arg(long)]
         result: Option<String>,
-        /// `api` (journal.append) or `engine` (written by the engine).
+        /// `api` (site.changeLog.append) or `engine` (written by the engine).
         #[arg(long)]
         source: Option<String>,
         /// Page size; defaults to 50 and is clamped to 200.
@@ -226,8 +237,8 @@ pub enum JournalCommand {
 impl JournalCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
-            Self::Append { .. } => "journal.append",
-            Self::List { .. } => "journal.list",
+            Self::Append { .. } => "site.changeLog.append",
+            Self::List { .. } => "site.changeLog.list",
         }
     }
 }

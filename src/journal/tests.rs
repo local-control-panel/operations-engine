@@ -634,7 +634,7 @@ fn auto_plan_covers_the_wired_operations_only() {
     assert!(auto::plan(&cli(&["site", "list"]).command).is_none());
     assert!(auto::plan(&cli(&["capabilities"]).command).is_none());
     // The journal does not journal itself.
-    let append = cli(&["journal", "list"]);
+    let append = cli(&["change-log", "list"]);
     assert!(auto::plan(&append.command).is_none());
 }
 
@@ -731,5 +731,62 @@ fn stored_lines_contain_no_unexpected_fields() {
             "source",
             "summary"
         ]
+    );
+}
+
+#[test]
+fn environment_and_subsite_are_validated_stored_and_filterable() {
+    let (_dir, root) = state();
+    let staging = NewEntry::parse(RawEntry {
+        site: Some("a"),
+        subsite: Some("blog2"),
+        environment: Some("staging"),
+        ..raw("wordpress.updateCore")
+    })
+    .unwrap();
+    let production = NewEntry::parse(RawEntry {
+        site: Some("a"),
+        environment: Some("production"),
+        ..raw("wordpress.updateCore")
+    })
+    .unwrap();
+    add(&root, &staging, 1, 1);
+    add(&root, &production, 2, 2);
+
+    let only = |q: Query| page(&root, &q).entries;
+    let env = only(Query {
+        environment: Some(Environment::Staging),
+        ..Query::default()
+    });
+    assert_eq!(env.len(), 1);
+    assert_eq!(env[0].subsite.as_deref(), Some("blog2"));
+    assert_eq!(env[0].environment, Some(Environment::Staging));
+    let sub = only(Query {
+        subsite: Some("blog2".into()),
+        ..Query::default()
+    });
+    assert_eq!(sub.len(), 1);
+
+    assert!(
+        NewEntry::parse(RawEntry {
+            environment: Some("prod"),
+            ..raw("site.deploy")
+        })
+        .is_err()
+    );
+    assert!(
+        NewEntry::parse(RawEntry {
+            subsite: Some("a b"),
+            ..raw("site.deploy")
+        })
+        .is_err()
+    );
+    assert!(
+        Query {
+            subsite: Some("a b".into()),
+            ..Query::default()
+        }
+        .validate()
+        .is_err()
     );
 }
