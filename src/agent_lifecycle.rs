@@ -406,11 +406,31 @@ pub fn current_schedule(tab: &str, name: &str) -> Option<Schedule> {
     Schedule::parse(&text).ok()
 }
 
-/// The cron line that runs `agent` on `schedule`.
+/// The environment every scheduled agent starts with. Cron's own environment
+/// is just `PATH=/usr/bin:/bin`, which has neither `/usr/local/bin/ops-engine`
+/// nor a `WCP_DIR`, so the helper commands (`ops-engine agent ...`) would not
+/// be found. The values are fixed constants, never taken from a request.
+pub const AGENT_PATH: &str = "/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+pub fn agent_environment() -> [(&'static str, &'static str); 3] {
+    [
+        ("WCP_DIR", ROOT),
+        ("OPS_ENGINE", crate::backup_schedule::ENGINE_BINARY),
+        ("PATH", AGENT_PATH),
+    ]
+}
+
+/// The cron line that runs `agent` on `schedule`, with an explicit
+/// `WCP_DIR`, `OPS_ENGINE` and `PATH` (see `agent_environment`).
 pub fn cron_line(agent: &Agent, schedule: &Schedule) -> String {
+    let environment: Vec<String> = agent_environment()
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
     format!(
-        "{} bash '{}' # {TAG} {}",
+        "{} {} bash '{}' # {TAG} {}",
         schedule.as_str(),
+        environment.join(" "),
         agent.absolute_script_path(),
         agent.name
     )
@@ -709,8 +729,26 @@ mod tests {
         let schedule = Schedule::parse("0 4 * * *").unwrap();
         assert_eq!(
             cron_line(agent, &schedule),
-            "0 4 * * * bash '/root/.wcp/agents/cache-warmup.sh' # [wcp-agent] cache-warmup"
+            "0 4 * * * WCP_DIR=/root/.wcp OPS_ENGINE=/usr/local/bin/ops-engine \
+             PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+             bash '/root/.wcp/agents/cache-warmup.sh' # [wcp-agent] cache-warmup"
         );
+    }
+
+    #[test]
+    fn the_cron_line_schedule_still_round_trips_with_the_environment() {
+        let agent = find("cache-warmup").unwrap();
+        for text in ["0 4 * * *", "*/5 * * * *", "@daily"] {
+            let line = cron_line(agent, &Schedule::parse(text).unwrap());
+            let found = current_schedule(&line, agent.name).unwrap();
+            assert_eq!(found.as_str(), text);
+            let off = current_schedule(&format!("#{line}"), agent.name).unwrap();
+            assert_eq!(off.as_str(), text);
+            assert!(line.contains(" WCP_DIR=/root/.wcp "));
+            assert!(line.contains(" OPS_ENGINE=/usr/local/bin/ops-engine "));
+            assert!(line.contains(" PATH=/usr/local/bin:"));
+            assert!(!line.contains('%'));
+        }
     }
 
     #[test]
