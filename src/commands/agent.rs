@@ -18,6 +18,7 @@ pub fn run(command: AgentCommand) -> Result<Response, ResponseBuildError> {
         | AgentCommand::ResultCmd { .. }
         | AgentCommand::ConfigCmd { .. }
         | AgentCommand::SiteCmd { .. }
+        | AgentCommand::ToolCmd { .. }
         | AgentCommand::Version { .. } => Ok(Response::failure(
             command.operation(),
             ErrorCode::InvalidInput,
@@ -344,6 +345,16 @@ fn install_from_registry(
         &request,
         env!("CARGO_PKG_VERSION"),
         &approved,
+        &agent_registry::HostFacts {
+            operations: crate::commands::capabilities::OPERATIONS,
+            helpers: agent_lifecycle::AGENT_HELPERS,
+            tool_present: &|name| {
+                let tool = crate::agent_tool::AgentTool::parse(name)?;
+                Some(
+                    crate::agent_tool::status(&crate::agent_tool::Host::production(), tool).present,
+                )
+            },
+        },
     ) {
         Ok(v) => v,
         Err(error) => {

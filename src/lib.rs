@@ -4,6 +4,8 @@ pub mod agent_helper;
 pub mod agent_lifecycle;
 pub mod agent_registry;
 pub mod agent_systemd;
+#[cfg(unix)]
+pub mod agent_tool;
 pub mod backup_create;
 pub mod backup_delete;
 pub mod backup_deploy;

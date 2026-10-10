@@ -33,7 +33,10 @@ use serde_json::{Value, json};
 
 use crate::{
     agent_lifecycle::{AGENT_HELPER_API, AGENT_HELPERS, ROOT, valid_agent_name},
-    cli::{AgentCommand, AgentConfigCommand, AgentResultCommand, AgentSiteCommand, LogLevel},
+    cli::{
+        AgentCommand, AgentConfigCommand, AgentResultCommand, AgentSiteCommand, AgentToolCommand,
+        LogLevel,
+    },
     error::ErrorCode,
     protocol::Response,
 };
@@ -410,6 +413,7 @@ pub fn run_in(dir: &Path, dry_run: bool, command: &AgentCommand) -> i32 {
         AgentCommand::SiteCmd {
             command: AgentSiteCommand::List { json },
         } => run_site_list(*json),
+        AgentCommand::ToolCmd { command } => run_tool(dir, dry_run, command),
         AgentCommand::Version { json } => {
             let text = std::iter::once(format!("agent-helpers {AGENT_HELPER_API}"))
                 .chain(AGENT_HELPERS.iter().map(|name| (*name).to_owned()))
@@ -507,6 +511,85 @@ fn run_config(dir: &Path, command: &AgentConfigCommand) -> i32 {
                 (json!({"agent": name, "keys": keys}), text)
             });
             emit_text("agent.config.list", outcome, *json)
+        }
+    }
+}
+
+fn run_tool(dir: &Path, dry_run: bool, command: &AgentToolCommand) -> i32 {
+    use crate::agent_tool::{self, AgentTool, Ensure, Host};
+    let (operation, name, json) = match command {
+        AgentToolCommand::Status { name, json } => ("agent.tool.status", name, *json),
+        AgentToolCommand::Ensure { name, json } => ("agent.tool.ensure", name, *json),
+    };
+    let Some(tool) = AgentTool::parse(name) else {
+        let error = HelperError::Invalid("tool must be one of wp-cli, rclone, docker".into());
+        return emit(operation, Err(error), json);
+    };
+    let host = Host::production();
+    match command {
+        AgentToolCommand::Status { .. } => {
+            let state = agent_tool::status(&host, tool);
+            let text = state.version.clone().unwrap_or_default();
+            let result = serde_json::to_value(&state).unwrap_or(Value::Null);
+            let code = if state.present { EXIT_OK } else { EXIT_FAILURE };
+            if json {
+                // A missing tool is an answer, not an error: one envelope with
+                // `present: false`, and the exit code still says 1.
+                emit_text(operation, Ok((result, None)), true);
+            } else if state.present && !text.is_empty() {
+                println!("{text}");
+            }
+            code
+        }
+        AgentToolCommand::Ensure { .. } => {
+            let allowed = agent_tool::allowed(dir, tool, effective_uid());
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let outcome = agent_tool::ensure(
+                &host,
+                tool,
+                allowed,
+                dry_run,
+                &agent_tool::run_self,
+                &request_id,
+            );
+            let code = outcome.exit_code();
+            let (state, what, failure) = match outcome {
+                Ensure::Present(state) => (state, "present", None),
+                Ensure::Installed(state) => (state, "installed", None),
+                Ensure::WouldInstall(state) => (state, "wouldInstall", None),
+                Ensure::NotAllowed(state) => (
+                    state,
+                    "notAllowed",
+                    Some(format!(
+                        "{} is missing and the operator has not allowed installing it (list it in {}/{})",
+                        tool.name(),
+                        dir.display(),
+                        agent_tool::ALLOW_FILE
+                    )),
+                ),
+                Ensure::Failed(state, message) => (state, "failed", Some(message)),
+            };
+            let result = json!({"tool": tool.name(), "outcome": what, "dryRun": dry_run,
+                                "allowed": allowed, "state": state});
+            match (&failure, json) {
+                (Some(message), true) => {
+                    print_envelope(&Response::failure(
+                        operation,
+                        ErrorCode::DependencyUnavailable,
+                        message,
+                    ));
+                }
+                (Some(_), false) | (None, false) => {}
+                (None, true) => {
+                    emit_text(operation, Ok((result, None)), true);
+                }
+            }
+            if let Some(message) = failure {
+                eprintln!("{operation}: {message}");
+            } else if dry_run && what == "wouldInstall" {
+                eprintln!("{operation}: dry run: would install {}", tool.name());
+            }
+            code
         }
     }
 }

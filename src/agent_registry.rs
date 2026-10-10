@@ -241,6 +241,15 @@ struct RegistryAgent {
     #[serde(default)]
     writable_paths: Vec<String>,
     script: String,
+    /// Engine operations the agent calls (`site.list`, ...).
+    #[serde(default)]
+    requires_ops: Vec<String>,
+    /// Helper groups of `ops-engine agent` the agent uses (`result`, ...).
+    #[serde(default)]
+    requires_helpers: Vec<String>,
+    /// Programs that must exist (`rclone`, `docker`, `wp-cli`).
+    #[serde(default)]
+    requires_tools: Vec<String>,
     files: BTreeMap<String, String>,
 }
 
@@ -258,6 +267,14 @@ pub enum Error {
     BuiltIn,
     Revoked,
     EngineTooOld,
+    /// `requires_ops` names operations this engine does not have.
+    MissingOperations(Vec<String>),
+    /// `requires_helpers` names helper commands this engine does not have.
+    MissingHelpers(Vec<String>),
+    /// `requires_tools` names tools that are not installed.
+    MissingTools(Vec<String>),
+    /// `requires_tools` names something the engine cannot install or check.
+    UnsupportedTools(Vec<String>),
     HashMismatch,
     NotApproved,
     ScheduleNotConfigurable,
@@ -294,6 +311,34 @@ impl Error {
                 ErrorCode::InvalidInput,
                 "this agent needs a newer engine".into(),
             ),
+            Self::MissingOperations(names) => (
+                ErrorCode::DependencyUnavailable,
+                format!(
+                    "this agent needs engine operations this engine does not have: {}",
+                    names.join(", ")
+                ),
+            ),
+            Self::MissingHelpers(names) => (
+                ErrorCode::DependencyUnavailable,
+                format!(
+                    "this agent needs agent helper commands this engine does not have: {}",
+                    names.join(", ")
+                ),
+            ),
+            Self::MissingTools(names) => (
+                ErrorCode::DependencyUnavailable,
+                format!(
+                    "this agent needs tools that are not installed: {}; install them first",
+                    names.join(", ")
+                ),
+            ),
+            Self::UnsupportedTools(names) => (
+                ErrorCode::InvalidInput,
+                format!(
+                    "this agent needs tools this engine cannot manage: {}",
+                    names.join(", ")
+                ),
+            ),
             Self::HashMismatch => (
                 ErrorCode::ArtifactVerificationFailed,
                 "the script does not match the registry or the reviewed hash".into(),
@@ -308,6 +353,84 @@ impl Error {
             ),
         }
     }
+}
+
+/// What this host offers, for the `requires_*` checks. Kept as data and a
+/// callback so the checks need no filesystem of their own.
+pub struct HostFacts<'a> {
+    /// Protocol operations (`capabilities.operations`).
+    pub operations: &'a [&'a str],
+    /// `ops-engine agent` helper commands (`capabilities.features.agentHelpers`).
+    pub helpers: &'a [&'a str],
+    /// `Some(installed)` for a tool the engine knows, `None` for any other.
+    pub tool_present: &'a dyn Fn(&str) -> Option<bool>,
+}
+
+const MAX_REQUIREMENTS: usize = 32;
+
+fn valid_requirement(name: &str, max_len: usize, allow: fn(u8) -> bool) -> bool {
+    !name.is_empty() && name.len() <= max_len && name.bytes().all(allow)
+}
+
+/// Checks `requires_ops`, `requires_helpers` and `requires_tools` against the
+/// host. Every name is validated before it can appear in a message.
+fn check_requirements(entry: &RegistryAgent, host: &HostFacts<'_>) -> Result<(), Error> {
+    let lists = [
+        (
+            &entry.requires_ops,
+            64,
+            (|b: u8| b.is_ascii_alphanumeric() || b == b'.') as fn(u8) -> bool,
+        ),
+        (&entry.requires_helpers, 32, |b: u8| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+        }),
+        (&entry.requires_tools, 32, |b: u8| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'
+        }),
+    ];
+    for (list, max_len, allow) in lists {
+        if list.len() > MAX_REQUIREMENTS
+            || list
+                .iter()
+                .any(|name| !valid_requirement(name, max_len, allow))
+        {
+            return Err(Error::BadRegistry("requirements are not valid"));
+        }
+    }
+    let missing = |wanted: &[String], have: &[&str]| -> Vec<String> {
+        wanted
+            .iter()
+            .filter(|name| !have.contains(&name.as_str()))
+            .cloned()
+            .collect()
+    };
+    let operations = missing(&entry.requires_ops, host.operations);
+    if !operations.is_empty() {
+        return Err(Error::MissingOperations(operations));
+    }
+    let helpers = missing(&entry.requires_helpers, host.helpers);
+    if !helpers.is_empty() {
+        return Err(Error::MissingHelpers(helpers));
+    }
+    let unsupported: Vec<String> = entry
+        .requires_tools
+        .iter()
+        .filter(|name| (host.tool_present)(name).is_none())
+        .cloned()
+        .collect();
+    if !unsupported.is_empty() {
+        return Err(Error::UnsupportedTools(unsupported));
+    }
+    let absent: Vec<String> = entry
+        .requires_tools
+        .iter()
+        .filter(|name| (host.tool_present)(name) == Some(false))
+        .cloned()
+        .collect();
+    if !absent.is_empty() {
+        return Err(Error::MissingTools(absent));
+    }
+    Ok(())
 }
 
 /// An agent whose script was downloaded and checked.
@@ -345,6 +468,7 @@ pub fn fetch_verified(
     request: &InstallRequest,
     engine_version: &str,
     approved: &dyn Fn(&str, &str) -> bool,
+    host: &HostFacts<'_>,
 ) -> Result<Verified, Error> {
     if agent_lifecycle::find(&request.name).is_some() {
         return Err(Error::BuiltIn);
@@ -395,6 +519,7 @@ pub fn fetch_verified(
     if have < needed {
         return Err(Error::EngineTooOld);
     }
+    check_requirements(entry, host)?;
     if parse_semver(&entry.version).is_none() {
         return Err(Error::BadRegistry("version is not x.y.z"));
     }
@@ -544,7 +669,118 @@ mod tests {
             request,
             "0.1.0",
             &|_, _| approved,
+            &host(&["rclone"]),
         )
+    }
+
+    const OPS: &[&str] = &["version", "site.list", "site.deploy"];
+    const HELPERS: &[&str] = &["heartbeat", "lock", "log", "result"];
+
+    /// A host where only the listed tools are installed; `docker` and
+    /// `rclone` are the tools it knows.
+    fn host(installed: &[&'static str]) -> HostFacts<'static> {
+        let installed = installed.to_vec();
+        HostFacts {
+            operations: OPS,
+            helpers: HELPERS,
+            tool_present: Box::leak(Box::new(move |name: &str| match name {
+                "rclone" | "docker" => Some(installed.contains(&name)),
+                _ => None,
+            })),
+        }
+    }
+
+    fn requiring(field: &str, names: &str) -> String {
+        registry("official", "none", "[]", &hash()).replace(
+            r#""minEngine":"0.1.0""#,
+            &format!(r#""minEngine":"0.1.0","{field}":{names}"#),
+        )
+    }
+
+    fn install_with(json: String) -> Result<Verified, Error> {
+        run(json, GOOD, &request(&hash(), None), true)
+    }
+
+    #[test]
+    fn requirements_the_host_meets_install_and_none_is_the_default() {
+        assert!(install_with(registry("official", "none", "[]", &hash())).is_ok());
+        assert!(install_with(requiring("requiresOps", r#"["site.list","version"]"#)).is_ok());
+        assert!(install_with(requiring("requiresHelpers", r#"["result","lock"]"#)).is_ok());
+        assert!(install_with(requiring("requiresTools", r#"["rclone"]"#)).is_ok());
+        assert!(install_with(requiring("requiresTools", "[]")).is_ok());
+    }
+
+    #[test]
+    fn missing_operations_helpers_and_tools_each_refuse_with_their_names() {
+        match install_with(requiring(
+            "requiresOps",
+            r#"["site.list","site.nope","x.y"]"#,
+        )) {
+            Err(Error::MissingOperations(names)) => assert_eq!(names, ["site.nope", "x.y"]),
+            other => panic!("{:?}", other.err()),
+        }
+        match install_with(requiring("requiresHelpers", r#"["result","tool"]"#)) {
+            Err(Error::MissingHelpers(names)) => assert_eq!(names, ["tool"]),
+            other => panic!("{:?}", other.err()),
+        }
+        match install_with(requiring("requiresTools", r#"["rclone","docker"]"#)) {
+            Err(Error::MissingTools(names)) => assert_eq!(names, ["docker"]),
+            other => panic!("{:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn a_tool_the_engine_cannot_manage_is_refused_not_ignored() {
+        match install_with(requiring("requiresTools", r#"["rclone","jq"]"#)) {
+            Err(Error::UnsupportedTools(names)) => assert_eq!(names, ["jq"]),
+            other => panic!("{:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn malformed_requirement_names_never_reach_a_message() {
+        for (field, names) in [
+            ("requiresOps", r#"["site list"]"#),
+            ("requiresOps", r#"[""]"#),
+            ("requiresHelpers", r#"["Result"]"#),
+            ("requiresTools", r#"["rclone\n"]"#),
+            ("requiresTools", r#"["a;b"]"#),
+        ] {
+            assert!(
+                matches!(
+                    install_with(requiring(field, names)),
+                    Err(Error::BadRegistry("requirements are not valid"))
+                ),
+                "{field} {names}"
+            );
+        }
+        let many = format!("[{}]", vec![r#""version""#; 33].join(","));
+        assert!(matches!(
+            install_with(requiring("requiresOps", &many)),
+            Err(Error::BadRegistry(_))
+        ));
+    }
+
+    #[test]
+    fn the_refusals_have_stable_codes_and_say_what_to_do() {
+        let (code, message) = Error::MissingTools(vec!["docker".into()]).protocol();
+        assert_eq!(code, ErrorCode::DependencyUnavailable);
+        assert_eq!(
+            message,
+            "this agent needs tools that are not installed: docker; install them first"
+        );
+        assert_eq!(
+            Error::MissingOperations(vec!["a.b".into()]).protocol().0,
+            ErrorCode::DependencyUnavailable
+        );
+        assert_eq!(
+            Error::MissingHelpers(vec!["tool".into()]).protocol().0,
+            ErrorCode::DependencyUnavailable
+        );
+        assert_eq!(
+            Error::UnsupportedTools(vec!["jq".into()]).protocol().0,
+            ErrorCode::InvalidInput
+        );
     }
 
     fn hash() -> String {
@@ -758,6 +994,7 @@ mod tests {
                 &request,
                 "0.1.0",
                 &|_, _| true,
+                &host(&[]),
             ),
             Err(Error::BuiltIn)
         ));

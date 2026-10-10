@@ -647,6 +647,13 @@ pub enum AgentCommand {
         #[command(subcommand)]
         command: AgentSiteCommand,
     },
+    /// Helper for agent scripts: is a program the agent needs installed, and
+    /// (only when the operator allowed it) install it.
+    #[command(name = "tool")]
+    ToolCmd {
+        #[command(subcommand)]
+        command: AgentToolCommand,
+    },
     /// Helper for agent scripts: which helper commands this engine has.
     Version {
         /// Print one protocol envelope on stdout.
@@ -696,6 +703,29 @@ pub enum AgentConfigCommand {
     },
     /// Print the key names (never the values), one per line.
     List {
+        name: String,
+        /// Print one protocol envelope on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentToolCommand {
+    /// Whether NAME (`wp-cli`, `rclone` or `docker`) is installed and at what
+    /// version. Prints the version (or nothing); exit 0 present, 1 missing,
+    /// 2 unknown name. Read-only.
+    Status {
+        name: String,
+        /// Print one protocol envelope on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install NAME with the engine's own installer, but only when the
+    /// operator listed it in `$WCP_DIR/allow-tool-ensure`; under
+    /// `WCP_DRY_RUN=1` only report. Exit 0 present or installed, 1 refused or
+    /// failed, 2 unknown name.
+    Ensure {
         name: String,
         /// Print one protocol envelope on stdout.
         #[arg(long)]
@@ -770,6 +800,10 @@ impl AgentCommand {
                 AgentConfigCommand::List { .. } => "agent.config.list",
             },
             Self::SiteCmd { .. } => "agent.site.list",
+            Self::ToolCmd { command } => match command {
+                AgentToolCommand::Status { .. } => "agent.tool.status",
+                AgentToolCommand::Ensure { .. } => "agent.tool.ensure",
+            },
             Self::Version { .. } => "agent.version",
         }
     }
@@ -785,6 +819,7 @@ impl AgentCommand {
                 | Self::ResultCmd { .. }
                 | Self::ConfigCmd { .. }
                 | Self::SiteCmd { .. }
+                | Self::ToolCmd { .. }
                 | Self::Version { .. }
         )
     }

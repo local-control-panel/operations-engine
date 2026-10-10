@@ -653,3 +653,145 @@ fn site_list_is_a_protocol_operation_too() {
     assert_eq!(response["ok"], true);
     assert!(response["result"]["sites"].is_array());
 }
+
+fn fake_bin(dir: &Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn tool_engine(root: &Path, args: &[&str]) -> Command {
+    let mut command = engine(&root.join("wcp"), args);
+    command
+        .env("WCP_TOOL_BIN_DIRS", root.join("bin"))
+        .env("WCP_TOOLS_DIR", root.join("tools"));
+    command
+}
+
+#[test]
+fn tool_status_prints_the_version_and_the_exit_code_says_present_or_not() {
+    let root = tempfile::tempdir().unwrap();
+    tool_engine(root.path(), &["agent", "tool", "status", "rclone"])
+        .assert()
+        .code(1)
+        .stdout("");
+    fake_bin(&root.path().join("bin"), "rclone", "echo 'rclone v1.75.1'");
+    tool_engine(root.path(), &["agent", "tool", "status", "rclone"])
+        .assert()
+        .success()
+        .stdout("1.75.1\n");
+    let output = tool_engine(
+        root.path(),
+        &["agent", "tool", "status", "rclone", "--json"],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let response = one_envelope(&output);
+    assert_eq!(response["operation"], "agent.tool.status");
+    assert_eq!(response["result"]["present"], true);
+    assert_eq!(response["result"]["version"], "1.75.1");
+    assert_eq!(response["result"]["installer"], "backup.installRclone");
+}
+
+#[test]
+fn tool_status_json_reports_a_missing_tool_as_an_answer_with_exit_1() {
+    let root = tempfile::tempdir().unwrap();
+    let output = tool_engine(
+        root.path(),
+        &["agent", "tool", "status", "docker", "--json"],
+    )
+    .assert()
+    .code(1)
+    .get_output()
+    .stdout
+    .clone();
+    let response = one_envelope(&output);
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["present"], false);
+}
+
+#[test]
+fn tool_names_outside_the_list_are_invalid() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["curl", "../rclone", "RCLONE", ""] {
+        for sub in ["status", "ensure"] {
+            let output = tool_engine(root.path(), &["agent", "tool", sub, name, "--json"])
+                .assert()
+                .code(2)
+                .get_output()
+                .stdout
+                .clone();
+            assert_eq!(one_envelope(&output)["error"]["code"], "INVALID_INPUT");
+        }
+    }
+}
+
+#[test]
+fn tool_ensure_is_a_no_op_when_present_and_refuses_when_not_allowed() {
+    let root = tempfile::tempdir().unwrap();
+    tool_engine(root.path(), &["agent", "tool", "ensure", "rclone"])
+        .assert()
+        .code(1)
+        .stdout("");
+    let output = tool_engine(
+        root.path(),
+        &["agent", "tool", "ensure", "rclone", "--json"],
+    )
+    .assert()
+    .code(1)
+    .get_output()
+    .stdout
+    .clone();
+    let response = one_envelope(&output);
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "DEPENDENCY_UNAVAILABLE");
+    fake_bin(&root.path().join("bin"), "rclone", "echo 'rclone v1.0.0'");
+    let output = tool_engine(
+        root.path(),
+        &["agent", "tool", "ensure", "rclone", "--json"],
+    )
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let response = one_envelope(&output);
+    assert_eq!(response["result"]["outcome"], "present");
+}
+
+#[test]
+fn tool_ensure_dry_run_only_reports_and_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let wcp = root.path().join("wcp");
+    fs::create_dir_all(&wcp).unwrap();
+    let allow = wcp.join("allow-tool-ensure");
+    fs::write(&allow, "rclone\n").unwrap();
+    fs::set_permissions(&allow, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = tool_engine(
+        root.path(),
+        &["agent", "tool", "ensure", "rclone", "--json"],
+    )
+    .env("WCP_DRY_RUN", "1")
+    .assert()
+    .success()
+    .get_output()
+    .stdout
+    .clone();
+    let response = one_envelope(&output);
+    assert_eq!(response["result"]["outcome"], "wouldInstall");
+    assert_eq!(response["result"]["dryRun"], true);
+    assert_eq!(response["result"]["allowed"], true);
+    assert!(!root.path().join("bin").exists());
+    assert!(!root.path().join("tools").exists());
+    // Not listed: a dry run says it would be refused.
+    tool_engine(root.path(), &["agent", "tool", "ensure", "docker"])
+        .env("WCP_DRY_RUN", "1")
+        .assert()
+        .code(1);
+}
