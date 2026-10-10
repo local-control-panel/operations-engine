@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(host.file("agents/wcp_agent_lib.py").unwrap(), library());
         assert_eq!(
             host.tab(),
-            "MAILTO=x\n0 5 * * * bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n"
+            "MAILTO=x\n0 5 * * * WCP_DIR=/root/.wcp OPS_ENGINE=/usr/local/bin/ops-engine PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash '/root/.wcp/agents/disk-report.sh' # [wcp-agent] disk-report\n"
         );
         let manifest: serde_json::Value =
             serde_json::from_str(&host.file("manifest.json").unwrap()).unwrap();
@@ -1024,7 +1024,7 @@ mod tests {
         assert_eq!(result.author, "Website Control Panel");
         assert_eq!(
             host.tab(),
-            "MAILTO=x\n0 4 * * * bash '/root/.wcp/agents/cache-warmup.sh' # [wcp-agent] cache-warmup\n"
+            "MAILTO=x\n0 4 * * * WCP_DIR=/root/.wcp OPS_ENGINE=/usr/local/bin/ops-engine PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash '/root/.wcp/agents/cache-warmup.sh' # [wcp-agent] cache-warmup\n"
         );
         let leftovers: Vec<_> = std::fs::read_dir(host.dir.path().join("wcp/agents"))
             .unwrap()
@@ -1468,7 +1468,7 @@ mod tests {
         // Day of month and weekday together: cron ORs them, systemd would AND.
         let result = install_agent(&host, agent, Some("0 5 1 * 1"), A, true).unwrap();
         assert_eq!(result.scheduler, "cron");
-        assert!(host.tab().contains("0 5 1 * 1 bash"));
+        assert!(host.tab().contains("0 5 1 * 1 WCP_DIR=/root/.wcp "));
         assert!(host.unit("wcp-agent-disk-report.timer").is_none());
     }
 
@@ -1496,7 +1496,7 @@ mod tests {
         .unwrap();
         assert_eq!(result.scheduler, "cron");
         assert!(host.unit("wcp-agent-disk-report.timer").is_none());
-        assert!(host.tab().contains("0 5 1 * 1 bash"));
+        assert!(host.tab().contains("0 5 1 * 1 WCP_DIR=/root/.wcp "));
     }
 
     #[test]
