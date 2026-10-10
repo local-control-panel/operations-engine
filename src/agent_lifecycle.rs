@@ -47,6 +47,18 @@ const MAX_TAB_BYTES: usize = 256 * 1024;
 
 const LIBRARY: &str = include_str!("../resources/agents/wcp_agent_lib.py");
 
+/// The author of every agent the maintainers wrote. An agent whose manifest
+/// names exactly this author is first-party; any other author, or none, is
+/// third-party. The maintainers check the name when they review the pull
+/// request that adds an agent. The agents repository's checker and the panel
+/// hold the same constant.
+pub const FIRST_PARTY_AUTHOR: &str = "Website Control Panel";
+
+/// Whether `author` names the project itself.
+pub fn is_first_party(author: &str) -> bool {
+    author == FIRST_PARTY_AUTHOR
+}
+
 /// One agent the engine can install. The panel keeps the human-readable
 /// description; everything that decides what runs as root lives here.
 pub struct Agent {
@@ -62,6 +74,8 @@ pub struct Agent {
     /// Set for an agent that runs from a sandboxed systemd timer instead of a
     /// cron line: the paths its service may write to (validated).
     pub systemd_writable: Option<&'static [&'static str]>,
+    /// Who wrote the agent. The built-in agents are the project's own.
+    pub author: &'static str,
 }
 
 /// Lowercase letters, digits and `-`, starting with a letter or digit.
@@ -86,6 +100,27 @@ impl Agent {
         script: String,
         systemd_writable: Option<Vec<String>>,
     ) -> &'static Agent {
+        Self::from_registry_by(
+            name,
+            version,
+            default_schedule,
+            configurable_schedule,
+            script,
+            systemd_writable,
+            String::new(),
+        )
+    }
+
+    /// As `from_registry`, with the author the registry names for the agent.
+    pub fn from_registry_by(
+        name: String,
+        version: String,
+        default_schedule: Option<String>,
+        configurable_schedule: bool,
+        script: String,
+        systemd_writable: Option<Vec<String>>,
+        author: String,
+    ) -> &'static Agent {
         Box::leak(Box::new(Agent {
             name: Box::leak(name.into_boxed_str()),
             version: Box::leak(version.into_boxed_str()),
@@ -101,6 +136,7 @@ impl Agent {
                         .into_boxed_slice(),
                 )
             }),
+            author: Box::leak(author.into_boxed_str()),
         }))
     }
 
@@ -134,6 +170,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: false,
         script: include_str!("../resources/agents/metrics-agent.sh"),
         systemd_writable: None,
+        author: FIRST_PARTY_AUTHOR,
     },
     Agent {
         name: "resource-alert",
@@ -142,6 +179,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: false,
         script: include_str!("../resources/agents/resource-alert.sh"),
         systemd_writable: None,
+        author: FIRST_PARTY_AUTHOR,
     },
     Agent {
         name: "backup-agent",
@@ -150,6 +188,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: false,
         script: include_str!("../resources/agents/backup-agent.sh"),
         systemd_writable: None,
+        author: FIRST_PARTY_AUTHOR,
     },
     Agent {
         name: GUARD_NAME,
@@ -158,6 +197,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: false,
         script: include_str!("../resources/agents/bruteforce-guard.sh"),
         systemd_writable: None,
+        author: FIRST_PARTY_AUTHOR,
     },
     Agent {
         name: "backup-restore-drill",
@@ -166,6 +206,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: true,
         script: include_str!("../resources/agents/backup-restore-drill.sh"),
         systemd_writable: None,
+        author: FIRST_PARTY_AUTHOR,
     },
     Agent {
         name: "error-log-digest",
@@ -174,6 +215,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: true,
         script: include_str!("../resources/agents/error-log-digest.sh"),
         systemd_writable: None,
+        author: FIRST_PARTY_AUTHOR,
     },
     Agent {
         name: "cache-warmup",
@@ -182,6 +224,7 @@ pub static AGENTS: [Agent; 7] = [
         configurable_schedule: true,
         script: include_str!("../resources/agents/cache-warmup.sh"),
         systemd_writable: None,
+        author: FIRST_PARTY_AUTHOR,
     },
 ];
 
@@ -458,6 +501,9 @@ pub struct InstallResult {
     /// SHA-256 of the installed script file.
     pub script_sha256: String,
     pub installed_at_unix_secs: u64,
+    /// The author the agent names; empty when the registry names none.
+    #[serde(default)]
+    pub author: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -489,6 +535,14 @@ mod tests {
     use super::*;
 
     const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    #[test]
+    fn the_built_in_agents_are_first_party_and_a_lookalike_is_not() {
+        assert!(AGENTS.iter().all(|agent| is_first_party(agent.author)));
+        for other in ["", "website control panel", "Website Control Panel ", "Ada"] {
+            assert!(!is_first_party(other), "{other:?}");
+        }
+    }
 
     /// SHA-256 of every installed script (the plain source). The panel
     /// pins the same values, so a script edited on one side only fails a test

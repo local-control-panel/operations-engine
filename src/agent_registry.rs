@@ -228,6 +228,10 @@ struct Registry {
 struct RegistryAgent {
     version: String,
     tier: String,
+    /// Who wrote the agent, as its manifest says. Missing is unknown and
+    /// counts as third-party.
+    #[serde(default)]
+    author: String,
     schedule: String,
     default_schedule: String,
     min_engine: String,
@@ -370,6 +374,13 @@ pub fn fetch_verified(
     {
         return Err(Error::Revoked);
     }
+    // The name is shown to operators and written into the manifest.
+    if entry.author.chars().count() > 100
+        || entry.author.chars().any(char::is_control)
+        || entry.author != entry.author.trim()
+    {
+        return Err(Error::BadRegistry("invalid author"));
+    }
     let tier = match entry.tier.as_str() {
         "official" => Tier::Official,
         "community" => Tier::Community,
@@ -449,13 +460,14 @@ pub fn fetch_verified(
     if script.contains('\0') || !script.starts_with("#!") {
         return Err(Error::BadRegistry("script must be text starting with #!"));
     }
-    let agent = Agent::from_registry(
+    let agent = Agent::from_registry_by(
         request.name.clone(),
         entry.version.clone(),
         default_schedule,
         configurable,
         script,
         systemd_writable,
+        entry.author.clone(),
     );
     Ok(Verified {
         agent,
@@ -537,6 +549,63 @@ mod tests {
 
     fn hash() -> String {
         sha256(GOOD.as_bytes())
+    }
+
+    fn with_author(json: String, author: &str) -> String {
+        json.replace(
+            r#""tier":"#,
+            &format!(r#""author":{},"tier":"#, serde_json::json!(author)),
+        )
+    }
+
+    #[test]
+    fn the_registry_author_reaches_the_installed_agent() {
+        let h = hash();
+        let json = with_author(registry("official", "none", "[]", &h), "Ada Example");
+        let verified = run(json, GOOD, &request(&h, None), false).unwrap();
+        assert_eq!(verified.agent.author, "Ada Example");
+        assert!(!crate::agent_lifecycle::is_first_party(
+            verified.agent.author
+        ));
+        let ours = with_author(
+            registry("official", "none", "[]", &h),
+            crate::agent_lifecycle::FIRST_PARTY_AUTHOR,
+        );
+        let verified = run(ours, GOOD, &request(&h, None), false).unwrap();
+        assert!(crate::agent_lifecycle::is_first_party(
+            verified.agent.author
+        ));
+    }
+
+    #[test]
+    fn a_missing_author_is_third_party() {
+        let h = hash();
+        let verified = run(
+            registry("official", "none", "[]", &h),
+            GOOD,
+            &request(&h, None),
+            false,
+        )
+        .unwrap();
+        assert_eq!(verified.agent.author, "");
+        assert!(!crate::agent_lifecycle::is_first_party(
+            verified.agent.author
+        ));
+    }
+
+    #[test]
+    fn a_malformed_author_is_refused() {
+        let h = hash();
+        for bad in [" Ada", "Ada ", "Ada\nExample", &"x".repeat(101)] {
+            let json = with_author(registry("official", "none", "[]", &h), bad);
+            assert!(
+                matches!(
+                    run(json, GOOD, &request(&h, None), false),
+                    Err(Error::BadRegistry("invalid author"))
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
