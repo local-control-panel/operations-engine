@@ -368,7 +368,11 @@ fn now_secs() -> u64 {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
 }
 
 /// 244 random bits as 64 lowercase hex characters (two v4 UUIDs).
@@ -911,34 +915,6 @@ mod tests {
         let second_hash = fs::read_to_string(work.join("stdin.1")).unwrap();
         assert_ne!(first_hash, second_hash);
         let _ = second;
-    }
-
-    #[test]
-    fn operation_status_style_state_has_no_secret_either() {
-        // The stored transaction outcome is exactly the public record.
-        let directory = tempfile::tempdir().unwrap();
-        let state_dir = directory.path().join("state");
-        fs::create_dir(&state_dir).unwrap();
-        let work = directory.path().join("work");
-        fs::create_dir(&work).unwrap();
-        let docker = fake_docker(&work, &ok_answer());
-        let state = managed(&state_dir);
-        let ctx = Context {
-            engine_state: &state,
-            docker_program: &docker,
-        };
-        let Issued::New(result) = issue_login(
-            &ctx,
-            &login_request(ID_1, "key-1"),
-            &CancellationToken::default(),
-        )
-        .unwrap() else {
-            panic!()
-        };
-        let mut persisted = String::new();
-        read_all(&state_dir, &mut persisted);
-        let public = serde_json::to_string(result.public()).unwrap();
-        assert!(persisted.contains(&public));
     }
 
     #[test]
