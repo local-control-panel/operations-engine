@@ -76,10 +76,9 @@ pub fn run(command: JournalCommand) -> Result<Response, ResponseBuildError> {
 #[cfg(unix)]
 fn state_root(operation: &'static str) -> Result<ManagedRoot, Response> {
     let fail = |message: &str| Response::failure(operation, ErrorCode::Internal, message);
-    let config = EngineConfig::load_root_owned(std::path::Path::new(
-        "/etc/operations-engine/config.json",
-    ))
-    .map_err(|_| fail(crate::commands::CONFIG_UNAVAILABLE_MESSAGE))?;
+    let config =
+        EngineConfig::load_root_owned(std::path::Path::new("/etc/operations-engine/config.json"))
+            .map_err(|_| fail(crate::commands::CONFIG_UNAVAILABLE_MESSAGE))?;
     ManagedRoot::open(&config.state_root).map_err(|_| fail("engine state root is unavailable"))
 }
 
@@ -106,7 +105,13 @@ fn append(
     key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
     let operation = journal::APPEND_OPERATION;
-    let invalid = |message: &str| Ok(Response::failure(operation, ErrorCode::InvalidInput, message));
+    let invalid = |message: &str| {
+        Ok(Response::failure(
+            operation,
+            ErrorCode::InvalidInput,
+            message,
+        ))
+    };
     let Ok(request_id) = RequestId::parse(request_id) else {
         return invalid("request-id is not a canonical UUID");
     };
@@ -142,7 +147,13 @@ fn list(
     mut query: Query,
 ) -> Result<Response, ResponseBuildError> {
     let operation = journal::LIST_OPERATION;
-    let invalid = |message: &str| Ok(Response::failure(operation, ErrorCode::InvalidInput, message));
+    let invalid = |message: &str| {
+        Ok(Response::failure(
+            operation,
+            ErrorCode::InvalidInput,
+            message,
+        ))
+    };
     if let Some(value) = result {
         match JournalResult::parse(value) {
             Some(parsed) => query.result = Some(parsed),

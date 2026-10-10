@@ -90,8 +90,25 @@ pub const MAX_SUMMARY_CHARS: usize = 200;
 /// First `action` segment. Closed on purpose: a new area of the product adds
 /// its namespace here (and in `docs/protocol.md`), a typo is rejected.
 pub const ACTION_NAMESPACES: &[&str] = &[
-    "agent", "auth", "backup", "cms", "compose", "cron", "db", "docker", "drupal", "engine",
-    "file", "ingress", "joomla", "panel", "runtime", "site", "stack", "system", "tool",
+    "agent",
+    "auth",
+    "backup",
+    "cms",
+    "compose",
+    "cron",
+    "db",
+    "docker",
+    "drupal",
+    "engine",
+    "file",
+    "ingress",
+    "joomla",
+    "panel",
+    "runtime",
+    "site",
+    "stack",
+    "system",
+    "tool",
     "wordpress",
 ];
 
@@ -180,7 +197,12 @@ pub struct NewEntry {
 
 impl NewEntry {
     pub fn parse(raw: RawEntry<'_>) -> Result<Self, Rejected> {
-        let actor = token(raw.actor, MAX_ACTOR_LEN, "@:+", Rejected("actor is invalid"))?;
+        let actor = token(
+            raw.actor,
+            MAX_ACTOR_LEN,
+            "@:+",
+            Rejected("actor is invalid"),
+        )?;
         let action = action_name(raw.action)?;
         let result = JournalResult::parse(raw.result).ok_or(Rejected("result is invalid"))?;
         let site = raw
@@ -200,12 +222,9 @@ impl NewEntry {
             .transpose()?;
         let target = raw
             .target
-            .map(|v| token(v, MAX_TARGET_LEN, "@:+/", Rejected("target is invalid")))
+            .map(|v| token(v, MAX_TARGET_LEN, "@:+", Rejected("target is invalid")))
             .transpose()?;
-        let error_code = raw
-            .error_code
-            .map(|v| error_code(v))
-            .transpose()?;
+        let error_code = raw.error_code.map(error_code).transpose()?;
         let summary = raw.summary.map(summary).transpose()?;
         Ok(Self {
             actor,
@@ -221,12 +240,7 @@ impl NewEntry {
 }
 
 /// Characters allowed in every identifier-like field besides the extra set.
-fn token(
-    value: &str,
-    max: usize,
-    extra: &str,
-    rejected: Rejected,
-) -> Result<String, Rejected> {
+fn token(value: &str, max: usize, extra: &str, rejected: Rejected) -> Result<String, Rejected> {
     if value.is_empty()
         || value.len() > max
         || !value
@@ -305,7 +319,15 @@ const SECRET_WORDS: &[&str] = &[
     "signature",
 ];
 
-const SECRET_PREFIXES: &[&str] = &["eyj", "akia", "ghp_", "gho_", "github_pat_", "xoxb-", "xoxp-"];
+const SECRET_PREFIXES: &[&str] = &[
+    "eyj",
+    "akia",
+    "ghp_",
+    "gho_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+];
 
 /// Rejects free text that could carry a secret or a link with credentials.
 fn summary(value: &str) -> Result<String, Rejected> {
@@ -356,7 +378,7 @@ fn has_secret_assignment(lower: &str) -> bool {
     SECRET_WORDS.iter().any(|word| {
         lower.match_indices(word).any(|(index, _)| {
             lower[index + word.len()..]
-                .trim_start_matches(|c: char| c == ' ' || c == '"' || c == '\'')
+                .trim_start_matches([' ', '"', '\''])
                 .starts_with(['=', ':'])
         })
     })
@@ -553,19 +575,56 @@ pub fn append(
     source: Source,
     now: u64,
 ) -> Result<AppendOutcome, JournalError> {
+    append_with(
+        state,
+        entry,
+        request_id,
+        idempotency_key,
+        source,
+        now,
+        &Limits::DEFAULT,
+    )
+}
+
+/// Rotation limits; tests shrink them.
+pub struct Limits {
+    pub segment_bytes: u64,
+    pub segments: usize,
+}
+
+impl Limits {
+    pub const DEFAULT: Self = Self {
+        segment_bytes: MAX_SEGMENT_BYTES,
+        segments: MAX_SEGMENTS,
+    };
+}
+
+pub fn append_with(
+    state: &ManagedRoot,
+    entry: &NewEntry,
+    request_id: RequestId,
+    idempotency_key: Option<&IdempotencyKey>,
+    source: Source,
+    now: u64,
+    limits: &Limits,
+) -> Result<AppendOutcome, JournalError> {
     let dir = open_dir(state, true)?.ok_or(JournalError::Io)?;
     let _guard = lock(&dir)?;
     let active = rel(ACTIVE);
     create_private(&dir, &active)?;
-    let mut file = dir.open_or_create_file(&active).map_err(|_| JournalError::Io)?;
+    let mut file = dir
+        .open_or_create_file(&active)
+        .map_err(|_| JournalError::Io)?;
     let len = file.metadata().map_err(|_| JournalError::Io)?.len();
     let tail = read_tail(&mut file, TAIL_BYTES).map_err(|_| JournalError::Io)?;
     let (recent, _) = parse_lines(&tail);
 
     let key = idempotency_key.map(IdempotencyKey::as_str);
-    if let Some(existing) = recent.iter().rev().find(|e| {
-        e.id == request_id || (key.is_some() && e.idempotency_key.as_deref() == key)
-    }) {
+    if let Some(existing) = recent
+        .iter()
+        .rev()
+        .find(|e| e.id == request_id || (key.is_some() && e.idempotency_key.as_deref() == key))
+    {
         return Ok(AppendOutcome {
             entry: existing.clone(),
             replayed: true,
@@ -608,18 +667,20 @@ pub fn append(
     }
     buffer.extend_from_slice(&line);
 
-    if len > 0 && len + buffer.len() as u64 > MAX_SEGMENT_BYTES {
+    if len > 0 && len + buffer.len() as u64 > limits.segment_bytes {
         let target = rel(rotated_name(last_seq));
         if !dir.exists(&target) {
             drop(file);
             dir.rename(&active, &target).map_err(|_| JournalError::Io)?;
             create_private(&dir, &active)?;
-            file = dir.open_or_create_file(&active).map_err(|_| JournalError::Io)?;
+            file = dir
+                .open_or_create_file(&active)
+                .map_err(|_| JournalError::Io)?;
             // The torn-line guard belongs to the old segment.
             if torn {
                 buffer.remove(0);
             }
-            prune(&dir, now);
+            prune(&dir, now, limits.segments);
         }
     }
 
@@ -634,11 +695,11 @@ pub fn append(
 
 /// Best-effort retention: oldest segments beyond the count cap and
 /// segments past the age cap.
-fn prune(dir: &ManagedRoot, now: u64) {
+fn prune(dir: &ManagedRoot, now: u64, max_segments: usize) {
     let Ok(mut segments) = rotated_segments(dir) else {
         return;
     };
-    while segments.len() > MAX_SEGMENTS {
+    while segments.len() > max_segments {
         let (_, name) = segments.remove(0);
         let _ = dir.remove_file(&rel(name));
     }
@@ -676,7 +737,9 @@ impl Query {
         if let Some(prefix) = &self.action_prefix {
             if prefix.is_empty()
                 || prefix.len() > MAX_ACTION_LEN
-                || !prefix.chars().all(|c| c.is_ascii_alphanumeric() || c == '.')
+                || !prefix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.')
             {
                 return Err(Rejected("action-prefix is invalid"));
             }
@@ -685,7 +748,9 @@ impl Query {
     }
 
     fn matches(&self, entry: &Entry) -> bool {
-        self.site.as_deref().is_none_or(|s| entry.site.as_deref() == Some(s))
+        self.site
+            .as_deref()
+            .is_none_or(|s| entry.site.as_deref() == Some(s))
             && self.since_unix_secs.is_none_or(|t| entry.at_unix_secs >= t)
             && self
                 .action_prefix
@@ -710,7 +775,10 @@ pub fn list(state: &ManagedRoot, query: &Query) -> Result<ListOutcome, JournalEr
         return Ok(empty);
     };
     let _guard = lock(&dir)?;
-    let limit = query.limit.unwrap_or(LIST_DEFAULT_LIMIT).clamp(1, LIST_MAX_LIMIT);
+    let limit = query
+        .limit
+        .unwrap_or(LIST_DEFAULT_LIMIT)
+        .clamp(1, LIST_MAX_LIMIT);
 
     let rotated = rotated_segments(&dir).map_err(|_| JournalError::Io)?;
     // Newest first: the active segment, then rotated ones descending. Each

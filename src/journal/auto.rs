@@ -89,11 +89,7 @@ pub fn plan(command: &Command) -> Option<Plan> {
         action,
         site,
         request_id: RequestId::parse(request_id).ok()?,
-        idempotency_key: key
-            .as_deref()
-            .map(IdempotencyKey::parse)
-            .transpose()
-            .ok()?,
+        idempotency_key: key.as_deref().map(IdempotencyKey::parse).transpose().ok()?,
     })
 }
 

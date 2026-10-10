@@ -40,6 +40,8 @@ its authoritative operation list. The current source includes:
   safety backup.
 - WordPress install, clone, bounded WXR import, updates, cleanup, credential
   rotation, and multisite subsite deletion.
+- A server-side change journal (`journal.append`, `journal.list`): who
+  changed what, when and with which result, without secrets or one-time links.
 - Permissions repair, Meilisearch lifecycle, system updates, Docker start,
   agent configuration, and engine install/rollback.
 
