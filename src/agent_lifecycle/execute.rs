@@ -572,7 +572,12 @@ pub fn install(
                     .as_ref()
                     .and_then(|entry| entry.get("version"))
                     .and_then(|version| version.as_str())
-                    == Some(agent.version);
+                    == Some(agent.version)
+                && previous_entry
+                    .as_ref()
+                    .and_then(|entry| entry.get("author"))
+                    .and_then(|author| author.as_str())
+                    == Some(agent.author);
             let installed_at = previous_entry
                 .as_ref()
                 .filter(|_| files_current)
@@ -584,6 +589,7 @@ pub fn install(
                 agent.name,
                 Some(serde_json::json!({
                     "version": agent.version,
+                    "author": agent.author,
                     "installed_at": installed_at,
                 })),
             );
@@ -619,6 +625,7 @@ pub fn install(
                 scheduler: if on_systemd { "systemd" } else { "cron" }.to_owned(),
                 script_sha256: sha256(script.as_bytes()),
                 installed_at_unix_secs: installed_at,
+                author: agent.author.to_owned(),
             })
         },
     )
@@ -1013,6 +1020,8 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(&host.file("manifest.json").unwrap()).unwrap();
         assert_eq!(manifest["cache-warmup"]["version"], "1.0.0");
+        assert_eq!(manifest["cache-warmup"]["author"], "Website Control Panel");
+        assert_eq!(result.author, "Website Control Panel");
         assert_eq!(
             host.tab(),
             "MAILTO=x\n0 4 * * * bash '/root/.wcp/agents/cache-warmup.sh' # [wcp-agent] cache-warmup\n"
