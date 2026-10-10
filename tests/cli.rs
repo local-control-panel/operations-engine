@@ -171,10 +171,13 @@ fn capabilities_describe_only_implemented_operations() {
             "site.migrateRuntime",
             "system.service",
             "compose.action",
-            "compose.remove"
+            "compose.remove",
+            "site.changeLog.append",
+            "site.changeLog.list"
         ])
     );
     assert_eq!(response["result"]["features"]["mutations"], true);
+    assert_eq!(response["result"]["features"]["changeLog"], cfg!(unix));
     assert_eq!(
         response["result"]["features"]["agentHelpers"],
         serde_json::json!([
@@ -417,4 +420,121 @@ fn ingress_unpark_rejects_an_invalid_domain_before_touching_the_filesystem() {
         response["error"]["message"],
         "domain is not a valid domain name"
     );
+}
+
+#[cfg(unix)]
+fn journal_failure(args: &[&str]) -> Value {
+    let output = Command::cargo_bin("ops-engine")
+        .expect("binary should build")
+        .args(args)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    serde_json::from_slice(&output).expect("stdout should contain one JSON response")
+}
+
+/// Validation runs before the engine configuration is read, so these
+/// answers do not depend on the host the tests run on.
+#[cfg(unix)]
+#[test]
+fn journal_append_rejects_invalid_fields_before_touching_state() {
+    const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    let base = |extra: &[&str]| {
+        let mut args = vec![
+            "change-log",
+            "append",
+            "--actor",
+            "admin@example.com",
+            "--action",
+            "cms.adminLogin",
+            "--result",
+            "ok",
+            "--request-id",
+            ID,
+        ];
+        args.extend_from_slice(extra);
+        journal_failure(&args)
+    };
+    for (extra, message) in [
+        (
+            vec!["--summary", "open https://example.com/?token=abc"],
+            "summary is not allowed",
+        ),
+        (
+            vec!["--summary", "password=hunter2"],
+            "summary is not allowed",
+        ),
+        (
+            vec!["--target", "https://example.com/login"],
+            "target is invalid",
+        ),
+        (vec!["--site", "a b"], "site is invalid"),
+        (vec!["--environment", "prod"], "environment is invalid"),
+        (vec!["--error-code", "lower"], "error-code is invalid"),
+        (
+            vec!["--idempotency-key", "has space"],
+            "idempotency-key is invalid",
+        ),
+    ] {
+        let response = base(&extra);
+        assert_eq!(response["operation"], "site.changeLog.append");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "INVALID_INPUT");
+        assert_eq!(response["error"]["message"], message);
+        // Rejected values are never echoed back.
+        let text = response.to_string();
+        assert!(
+            !text.contains("hunter2") && !text.contains("example.com/"),
+            "{text}"
+        );
+    }
+
+    let response = journal_failure(&[
+        "change-log",
+        "append",
+        "--actor",
+        "u",
+        "--action",
+        "nope.thing",
+        "--result",
+        "ok",
+        "--request-id",
+        ID,
+    ]);
+    assert_eq!(response["error"]["message"], "action is invalid");
+    let response = journal_failure(&[
+        "change-log",
+        "append",
+        "--actor",
+        "u",
+        "--action",
+        "site.deploy",
+        "--result",
+        "ok",
+        "--request-id",
+        "not-a-uuid",
+    ]);
+    assert_eq!(response["error"]["code"], "INVALID_INPUT");
+}
+
+#[cfg(unix)]
+#[test]
+fn journal_list_rejects_invalid_filters() {
+    for (args, message) in [
+        (vec!["--result", "maybe"], "result is invalid"),
+        (vec!["--source", "panel"], "source is invalid"),
+        (vec!["--site", "a b"], "site is invalid"),
+        (vec!["--environment", "prod"], "environment is invalid"),
+        (vec!["--subsite", "a b"], "subsite is invalid"),
+        (vec!["--action-prefix", "cms?"], "action-prefix is invalid"),
+    ] {
+        let mut full = vec!["change-log", "list"];
+        full.extend(args);
+        let response = journal_failure(&full);
+        assert_eq!(response["operation"], "site.changeLog.list");
+        assert_eq!(response["error"]["code"], "INVALID_INPUT");
+        assert_eq!(response["error"]["message"], message);
+    }
 }

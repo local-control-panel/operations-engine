@@ -42,6 +42,8 @@ pub mod error;
 pub mod failpoint;
 pub mod filesystem;
 pub mod ingress;
+#[cfg(unix)]
+pub mod journal;
 pub mod maria_drop;
 pub mod maria_slow_log;
 pub mod maria_user;
@@ -110,6 +112,8 @@ use protocol::{Response, ResponseBuildError};
 
 pub fn execute(cli: Cli) -> Response {
     let operation = cli.command.operation();
+    #[cfg(unix)]
+    let journal_plan = journal::auto::plan(&cli.command);
     let response = match cli.command {
         Command::Version => commands::version::run(),
         Command::Backup { command } => commands::backup::run(command),
@@ -131,9 +135,15 @@ pub fn execute(cli: Cli) -> Response {
         Command::Agent { command } => commands::agent::run(command),
         Command::System { command } => commands::system::run(command),
         Command::Stack { command } => commands::stack::run(command),
+        Command::Journal { command } => commands::journal::run(command),
     };
 
-    response.unwrap_or_else(|error| internal_error(operation, error))
+    let response = response.unwrap_or_else(|error| internal_error(operation, error));
+    #[cfg(unix)]
+    if let Some(plan) = &journal_plan {
+        journal::auto::record(plan, &response);
+    }
+    response
 }
 
 fn internal_error(operation: &'static str, _error: ResponseBuildError) -> Response {

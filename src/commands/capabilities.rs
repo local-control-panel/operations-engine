@@ -18,6 +18,10 @@ struct Features {
     mutations: bool,
     /// The `ops-engine agent <sub>` helper commands this engine has.
     agent_helpers: &'static [&'static str],
+    /// `site.changeLog.append`/`list` exist and the engine journals its own
+    /// `engine.*` and `site.deploy`/`rollback`/`renameManifest`/`unenroll`
+    /// operations (`source: "engine"`).
+    change_log: bool,
 }
 
 /// Every protocol operation this engine implements, as `capabilities`
@@ -159,6 +163,8 @@ pub const OPERATIONS: &[&str] = &[
     "system.service",
     "compose.action",
     "compose.remove",
+    "site.changeLog.append",
+    "site.changeLog.list",
 ];
 
 pub fn run() -> Result<Response, ResponseBuildError> {
@@ -172,6 +178,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 cancellation: false,
                 mutations: true,
                 agent_helpers: crate::agent_lifecycle::AGENT_HELPERS,
+                change_log: cfg!(unix),
             },
         },
     )

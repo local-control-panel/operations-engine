@@ -129,6 +129,14 @@ pub enum Command {
         #[command(subcommand)]
         command: StackCommand,
     },
+
+    /// The server-side change journal (who changed what, when, with which
+    /// result). Never carries secrets or one-time links.
+    #[command(name = "change-log")]
+    Journal {
+        #[command(subcommand)]
+        command: JournalCommand,
+    },
 }
 
 impl Command {
@@ -154,6 +162,83 @@ impl Command {
             Self::Agent { command } => command.operation(),
             Self::System { command } => command.operation(),
             Self::Stack { command } => command.operation(),
+            Self::Journal { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JournalCommand {
+    /// Append one change event. The engine assigns `seq` and the time; the
+    /// request id is the entry id, so a retry returns the original entry.
+    Append {
+        /// Who made the change (panel user id or email, 1-64 chars).
+        #[arg(long)]
+        actor: String,
+        /// Namespaced action, e.g. `cms.adminLogin` or `wordpress.updateCore`.
+        #[arg(long)]
+        action: String,
+        /// `ok`, `failed`, `denied` or `cancelled`.
+        #[arg(long)]
+        result: String,
+        #[arg(long)]
+        site: Option<String>,
+        /// Network subsite (WordPress multisite and similar).
+        #[arg(long)]
+        subsite: Option<String>,
+        /// `production`, `staging` or `development`.
+        #[arg(long)]
+        environment: Option<String>,
+        /// The panel operation this event belongs to.
+        #[arg(long = "operation-id")]
+        operation_id: Option<String>,
+        /// The thing acted on, e.g. an admin user name. Never a link.
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long = "error-code")]
+        error_code: Option<String>,
+        /// Short redacted note (200 chars); rejected if it looks like a URL
+        /// or a secret.
+        #[arg(long, allow_hyphen_values = true)]
+        summary: Option<String>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// List change events, newest first (read-only).
+    List {
+        #[arg(long)]
+        site: Option<String>,
+        #[arg(long)]
+        subsite: Option<String>,
+        #[arg(long)]
+        environment: Option<String>,
+        /// Only events at or after this Unix time (seconds).
+        #[arg(long)]
+        since: Option<u64>,
+        /// Only actions starting with this text, e.g. `cms.`.
+        #[arg(long = "action-prefix")]
+        action_prefix: Option<String>,
+        #[arg(long)]
+        result: Option<String>,
+        /// `api` (site.changeLog.append) or `engine` (written by the engine).
+        #[arg(long)]
+        source: Option<String>,
+        /// Page size; defaults to 50 and is clamped to 200.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Only events older than this `seq` (the previous `nextCursor`).
+        #[arg(long = "before-seq")]
+        before_seq: Option<u64>,
+    },
+}
+
+impl JournalCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Append { .. } => "site.changeLog.append",
+            Self::List { .. } => "site.changeLog.list",
         }
     }
 }

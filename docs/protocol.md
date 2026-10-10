@@ -79,6 +79,69 @@ scope that never ran a mutation returns an empty list. `unreadable` counts
 records that exist but could not be parsed and `truncated` is true when more
 records exist than were returned.
 
+## `site.changeLog.append`, `site.changeLog.list`
+
+The change journal answers "who changed what on which site, when, with which
+result". The engine is the source of truth; the panel appends its own events
+and reads the list. `capabilities` advertises it as `features.changeLog`.
+
+`change-log append` takes `--actor`, `--action`, `--result` and optional
+`--site`, `--subsite`, `--environment` (`production`, `staging` or
+`development`), `--operation-id`, `--target`, `--error-code`, `--summary`, plus `--request-id`
+(canonical UUID, becomes the entry id) and an optional `--idempotency-key`.
+The engine assigns `seq` (strictly increasing, the pagination cursor), the
+time (`atUnixSecs`, engine clock) and `source: "api"`. A retry with the same
+request id or idempotency key returns the stored entry with `replayed: true`
+and writes nothing; the check covers the recent tail of the active segment.
+
+Validation is closed and server-side, and a rejected value is never echoed:
+
+- `action` is `namespace.name[.name[.name]]` with a namespace from a closed set
+  (`agent auth backup cms compose cron db docker drupal engine file ingress
+  joomla panel runtime site stack system tool wordpress`) and camelCase
+  segments, at most 64 characters (`cms.adminLogin`, `wordpress.updateCore`).
+- `result` is `ok`, `failed`, `denied` or `cancelled`; `errorCode` is
+  `UPPER_SNAKE_CASE` (at most 48).
+- `actor`, `site`, `operationId` and `target` are short identifiers (at most
+  64 characters of `A-Za-z0-9._-`, plus `@:+` for actor/target and `:` for
+  operation id) with no run of 40 or more opaque characters. `target` is the
+  thing acted on, for example an admin user name; it can never hold a link.
+- `summary` is optional free text of at most 200 characters, rejected when it
+  contains a URL (`://`, `www.`), a query pair (`?x=`), a secret-looking word
+  followed by `=` or `:` (password, token, secret, apikey, authorization,
+  cookie, nonce, signature, ...), a bearer value, a PEM header, a well-known
+  token prefix (`eyJ`, `AKIA`, `ghp_`, ...), a run of 32 or more base64/hex
+  characters or a control character.
+
+Never put secrets or one-time login links in any field. For a one-time admin
+login the journal records only the fact (`cms.adminLogin`) and the admin user
+(`target`), never the link.
+
+`change-log list` is read-only and returns the newest entries first. Filters:
+`--site`, `--subsite`, `--environment`, `--since <unix secs>`, `--action-prefix`, `--result`, `--source`
+(`api` or `engine`), `--limit` (default 50, clamped to 200) and
+`--before-seq` (the previous page's `nextCursor`). The result is `entries`,
+`nextCursor` (absent on the last page) and `skipped` (stored lines that could
+not be parsed). A journal that was never written is an empty list.
+
+Storage is `<stateRoot>/journal/` (`0700`, root-owned): `events.jsonl` (the
+active JSON Lines segment) and rotated `events.<lastSeq>.jsonl` segments, all
+`0600`. Appends and reads serialize on `journal.lock` (`flock`, waits up to 3
+seconds, then `CONFLICT`). A segment rotates at 2 MiB, at most 10 rotated
+segments are kept and a rotated segment untouched for 400 days is removed.
+A torn last line after a crash is skipped by readers and does not swallow the
+next entry.
+
+The engine journals its own operations (`source: "engine"`, `actor:
+"engine"`, the request id as entry id and `operationId`) for the ones whose
+identity is on the command line: `site.deploy`, `site.rollback`,
+`site.renameManifest`, `site.unenroll`, `engine.install` and
+`engine.rollback`. The write is best effort and never changes the operation's
+response; an operation rejected as `INVALID_INPUT` is not journaled. Other
+mutating operations are not journaled yet (they name their target in a
+request file or by domain, and need their own secret-free way to name the
+site); they are listed in the CMS-core design notes as a follow-up.
+
 ## `cron.installTab`
 
 `cron install-tab` atomically replaces a complete crontab with an optimistic
