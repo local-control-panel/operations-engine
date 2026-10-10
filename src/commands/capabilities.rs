@@ -98,6 +98,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 "wordpress.updateThemes",
                 "wordpress.rotateCredentials",
                 "wordpress.multisiteDeleteSite",
+                "wordpress.dropTables",
                 "wordpress.boundedAction",
                 // The typed replacements for free-form `wp:cli` mutations
                 // (cache/rewrite flush, salts, cron, config flags,

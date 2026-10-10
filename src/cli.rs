@@ -621,6 +621,17 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Drop an explicit list of orphaned tables, each re-validated against
+    /// the site's prefix and the set WordPress registers, under one
+    /// lock/idempotency/transaction/audit-backed request.
+    DropTables {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Run one of a small fixed set of bounded WordPress mutations
     /// (multisite create-site, multisite set-mode, WooCommerce clear
     /// transients) under one lock/idempotency/transaction/audit-backed
@@ -660,6 +671,7 @@ impl WordpressCommand {
             Self::UpdateThemes { .. } => "wordpress.updateThemes",
             Self::RotateCredentials { .. } => "wordpress.rotateCredentials",
             Self::MultisiteDeleteSite { .. } => "wordpress.multisiteDeleteSite",
+            Self::DropTables { .. } => "wordpress.dropTables",
             Self::BoundedAction { .. } => "wordpress.boundedAction",
             Self::SetSmtpRelay { .. } => "wordpress.setSmtpRelay",
         }

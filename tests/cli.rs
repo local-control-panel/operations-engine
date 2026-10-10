@@ -115,6 +115,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.updateThemes",
             "wordpress.rotateCredentials",
             "wordpress.multisiteDeleteSite",
+            "wordpress.dropTables",
             "wordpress.boundedAction",
             "wordpress.typedActions",
             "wordpress.setSmtpRelay",

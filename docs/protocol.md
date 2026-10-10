@@ -384,6 +384,26 @@ fails. The MariaDB root password and both the old and new site passwords
 never appear in a subprocess argument list. The operation is idempotent and
 transaction/audit recorded like every other WordPress mutation here.
 
+## `wordpress.dropTables`
+
+`wordpress drop-tables` accepts a root-owned JSON request containing the
+validated runtime container, WordPress root, site UID/GID and an explicit list
+of 1..=200 unique table names (`[A-Za-z0-9_$]`, at most 64 bytes each). Under a
+per-site lock the engine re-reads, as the site user, the `table_prefix`
+(`wp config get`), every table carrying that prefix
+(`wp db tables --all-tables-with-prefix`) and the set WordPress registers
+(`wp db tables --scope=all`, plus `--network` on a multisite). A table is
+dropped with a fixed ``DROP TABLE IF EXISTS `name` `` only when it carries the
+prefix, still exists and is not registered; core and registered tables are
+always refused. The result lists every requested table as `dropped` or
+`refused` with a reason (`wrongPrefix`, `notFound`, `registered`,
+`dropFailed`). If the registered listing does not contain the core
+`{prefix}options` table the request fails before anything is dropped. The
+operation is transaction/audit recorded and replays its outcome for a retried
+request with the same idempotency key, like every other WordPress mutation.
+It takes no backup: callers are expected to have shown the user the exact
+names (and typically to have taken a database export) before sending them.
+
 ## `agent.activateBruteforceConfig`
 
 `agent activate-bruteforce-config` accepts a root-owned JSON request with the
