@@ -404,6 +404,42 @@ request with the same idempotency key, like every other WordPress mutation.
 It takes no backup: callers are expected to have shown the user the exact
 names (and typically to have taken a database export) before sending them.
 
+## `tool.install`, `tool.remove`, `tool.status`
+
+Host-managed tools are mounted read-only into the runtime containers instead of
+being baked into their images. The catalog is compiled into the engine: one
+pinned official release URL, exact version and SHA-256 per tool (today only
+`wp-cli`, from the official `wp-cli/wp-cli` GitHub release; the pin was
+cross-checked against the `.sha256` and `.sha512` the release publishes).
+Requests name only a catalog tool; there is no way to supply a URL, version
+or path.
+
+`tool install --tool wp-cli --request-id <uuid> [--idempotency-key <key>]`
+downloads the pinned release over HTTPS with a size and time bound, verifies
+the SHA-256 and that the file has the expected shape (for WP-CLI, a PHP phar),
+and installs it root-owned and executable as
+`/var/lib/wcp/tools/wp-cli/<version>/wp.phar`. A relative `current` symlink is
+switched to the new version with a same-directory atomic rename, so a
+container reading `/var/lib/wcp/tools/wp-cli/current/wp.phar` sees either the
+old or the new file. Other version directories are pruned. An intact install
+of the pinned version is left alone (`changed: false`) without downloading; a
+damaged one is repaired. Download failures are reported as
+`artifact_fetch_failed` / `timeout`, digest or shape mismatches as
+`artifact_verification_failed`, and nothing is installed in either case.
+
+`tool remove --tool wp-cli` removes `current` first and then the tool
+directory; removing an absent tool is `changed: false`.
+
+`tool status` returns, for every catalog tool, the pinned version, the
+installed version `current` points at, whether the tool is recorded as
+selected on this host, and whether the installed file still hashes to its
+pinned digest (`intact`).
+
+Install and remove run under one per-host lock, are transaction/audit
+recorded, and replay their outcome for a retried request with the same
+idempotency key. The selection is recorded in the engine state root
+(`tools/selection.json`).
+
 ## `drupal.cacheRebuild`, `drupal.cronRun`, `drupal.maintenance`
 
 `drupal cache-rebuild`, `drupal cron-run` and `drupal maintenance` each accept

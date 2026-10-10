@@ -105,6 +105,13 @@ pub enum Command {
         command: DrupalCommand,
     },
 
+    /// Host-managed tools (pinned, SHA-256-verified) mounted into runtime
+    /// containers.
+    Tool {
+        #[command(subcommand)]
+        command: ToolCommand,
+    },
+
     /// Configuration for bundled host agents.
     Agent {
         #[command(subcommand)]
@@ -143,9 +150,44 @@ impl Command {
             Self::Permissions { command } => command.operation(),
             Self::Wordpress { command } => command.operation(),
             Self::Drupal { command } => command.operation(),
+            Self::Tool { command } => command.operation(),
             Self::Agent { command } => command.operation(),
             Self::System { command } => command.operation(),
             Self::Stack { command } => command.operation(),
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ToolCommand {
+    /// Install the pinned release of a catalog tool (e.g. `wp-cli`).
+    Install {
+        #[arg(long)]
+        tool: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove an installed catalog tool.
+    Remove {
+        #[arg(long)]
+        tool: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Report every catalog tool: pinned/installed version, selection, integrity.
+    Status,
+}
+
+impl ToolCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Install { .. } => "tool.install",
+            Self::Remove { .. } => "tool.remove",
+            Self::Status => "tool.status",
         }
     }
 }
