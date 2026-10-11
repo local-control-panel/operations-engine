@@ -106,7 +106,7 @@ the Joomla root; the link is `<siteUrl>wcp-otl-...php?wcp_otl=<token>`. The
 file holds only the token hash, the expiry, the user id and the absolute
 administrator URL. The request is compared with `hash_equals`, the file is
 `unlink`ed before Joomla is loaded (atomic: of several concurrent requests
-exactly one continues, the rest get a plain 404), then Joomla's
+exactly one continues, the rest get a 404, or a 500 if the file vanished while PHP was loading it, never a session), then Joomla's
 `AdministratorApplication` is booted and the official `onUserLogin` /
 `onUserAfterLogin` events run for the user (`core.login.admin`, blocked users
 refused, session forked by the `joomla` user plugin), followed by a redirect
