@@ -42,6 +42,18 @@ pub const REMOVE: &str = "tool.remove";
 pub const STATUS: &str = "tool.status";
 /// Host directory that is bind-mounted read-only into runtime containers.
 pub const TOOLS_DIR: &str = "/var/lib/wcp/tools";
+/// Message of the `DEPENDENCY_UNAVAILABLE` failure every WP-CLI-backed action
+/// returns while the managed WP-CLI is not installed. WP-CLI is no longer baked
+/// into the runtime images, so without this check the failure would surface as
+/// an opaque subprocess error from `docker exec`.
+pub const WP_CLI_MISSING_MESSAGE: &str = "WP-CLI is not installed on this server; install the managed tool first (tool.install --tool wp-cli)";
+
+/// Whether the managed WP-CLI is installed and selected under `tools_dir`
+/// (`<tools>/wp-cli/current/wp.phar`, the path the images' `wp` wrapper runs).
+pub fn wp_cli_installed(tools_dir: &Path) -> bool {
+    tools_dir.join("wp-cli/current/wp.phar").is_file()
+}
+
 pub const WP_CLI_VERSION: &str = "2.12.0";
 pub const COMPOSER_VERSION: &str = "2.10.3";
 /// The WP-CLI phar is ~7 MiB.
@@ -875,5 +887,18 @@ mod tests {
             assert_eq!(hex_digest(&Sha256::digest(&bytes)), artifact.sha256);
             assert!(tool.looks_valid(&bytes));
         }
+    }
+
+    #[test]
+    fn wp_cli_is_installed_only_when_the_selected_phar_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!wp_cli_installed(dir.path()));
+        fs::create_dir_all(dir.path().join("wp-cli/2.12.0")).unwrap();
+        fs::write(dir.path().join("wp-cli/2.12.0/wp.phar"), b"x").unwrap();
+        assert!(!wp_cli_installed(dir.path()), "no current selection yet");
+        std::os::unix::fs::symlink("2.12.0", dir.path().join("wp-cli/current")).unwrap();
+        assert!(wp_cli_installed(dir.path()));
+        fs::remove_file(dir.path().join("wp-cli/2.12.0/wp.phar")).unwrap();
+        assert!(!wp_cli_installed(dir.path()), "dangling selection");
     }
 }

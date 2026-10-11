@@ -564,6 +564,11 @@ impl UsersRequest {
     pub fn root(&self) -> &std::path::Path {
         &self.target.root
     }
+
+    /// Whether the request runs through WP-CLI (WordPress sites only).
+    pub fn uses_wp_cli(&self) -> bool {
+        self.target.cms == Cms::WordPress
+    }
 }
 
 pub struct LoginRequest {
@@ -611,6 +616,11 @@ impl LoginRequest {
 
     pub fn root(&self) -> &std::path::Path {
         &self.target.root
+    }
+
+    /// Whether the request runs through WP-CLI (WordPress sites only).
+    pub fn uses_wp_cli(&self) -> bool {
+        self.target.cms == Cms::WordPress
     }
 }
 

@@ -599,6 +599,14 @@ damaged one is repaired. Download failures are reported as
 `artifact_fetch_failed` / `timeout`, digest or shape mismatches as
 `artifact_verification_failed`, and nothing is installed in either case.
 
+Every action that runs WP-CLI in a site's container (all `wordpress.*`
+operations except `wordpress.migrateDiscard`, and `site.adminUsers` /
+`site.adminLogin` for a WordPress site) first checks that the managed WP-CLI is
+installed on the host. If it is not, the request fails with
+`DEPENDENCY_UNAVAILABLE` ("WP-CLI is not installed on this server; install the
+managed tool first") before anything is staged or run, because WP-CLI is not
+part of the runtime images.
+
 `tool remove --tool wp-cli` removes `current` first and then the tool
 directory; removing an absent tool is `changed: false`.
 
