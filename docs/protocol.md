@@ -531,9 +531,10 @@ names (and typically to have taken a database export) before sending them.
 
 Host-managed tools are mounted read-only into the runtime containers instead of
 being baked into their images. The catalog is compiled into the engine: one
-pinned official release URL, exact version and SHA-256 per tool (today only
-`wp-cli`, from the official `wp-cli/wp-cli` GitHub release; the pin was
-cross-checked against the `.sha256` and `.sha512` the release publishes).
+pinned official release URL, exact version and SHA-256 per tool (`wp-cli`, from the official `wp-cli/wp-cli` GitHub release, pin
+cross-checked against the published `.sha256` and `.sha512`; and `composer`,
+`composer.phar` from getcomposer.org, pin cross-checked against the published
+`composer.phar.sha256sum`).
 Requests name only a catalog tool; there is no way to supply a URL, version
 or path.
 
