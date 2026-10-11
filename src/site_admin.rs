@@ -162,6 +162,173 @@ if (file_put_contents($tmp, (string) $plan['source']) === false) { $say(array('o
 if (!rename($tmp, $dir . '/' . $plan['name'])) { @unlink($tmp); $say(array('ok' => false, 'error' => 'cannotWrite')); return; }
 $say(array('ok' => true, 'login' => (string) $u['username'], 'file' => $plan['name']));"#;
 
+/// Lists active administrators: uid 1 and every user with a role flagged
+/// `is_admin`. Fixed text, run through `drush php:eval`.
+const DRUPAL_USERS_PHP: &str = r#"$roles = array_keys(array_filter(\Drupal\user\Entity\Role::loadMultiple(), static function ($r) { return $r->isAdmin(); }));
+$s = \Drupal::entityTypeManager()->getStorage('user');
+$q = $s->getQuery()->accessCheck(FALSE)->condition('status', 1);
+$g = $q->orConditionGroup()->condition('uid', 1);
+if ($roles) { $g->condition('roles', $roles, 'IN'); }
+$ids = $q->condition($g)->sort('uid')->range(0, 51)->execute();
+$o = array();
+foreach ($s->loadMultiple($ids) as $u) { $o[] = array('id' => (int) $u->id(), 'login' => (string) $u->getAccountName()); }
+echo "\n" . json_encode(array('ok' => TRUE, 'users' => $o)) . "\n";"#;
+
+/// Checks one user (the id is prepended as `$uid = <number>;`) and reports
+/// the site's reset-link lifetime.
+const DRUPAL_CHECK_PHP: &str = r#"$say = static function ($v) { echo "\n" . json_encode($v) . "\n"; };
+$u = \Drupal\user\Entity\User::load($uid);
+if (!$u || $u->isAnonymous()) { $say(array('ok' => FALSE, 'error' => 'notFound')); return; }
+$admin = ((int) $u->id() === 1);
+foreach ($u->getRoles() as $rid) { $r = \Drupal\user\Entity\Role::load($rid); if ($r && $r->isAdmin()) { $admin = TRUE; } }
+if (!$u->isActive() || !$admin) { $say(array('ok' => FALSE, 'error' => 'notAdmin')); return; }
+$say(array('ok' => TRUE, 'login' => (string) $u->getAccountName(), 'timeout' => (int) \Drupal::config('user.settings')->get('password_reset_timeout')));"#;
+
+/// Exit status of the Drush selector when no Drush exists.
+const DRUSH_ABSENT: i32 = 97;
+
+/// Runs Drush as the site user from the project root: the project's own
+/// `vendor/bin/drush` first, `drush` on `PATH` as fallback. `sh` only selects
+/// the binary; every value reaches it as a positional parameter.
+fn run_drush(
+    ctx: &Context<'_>,
+    target: &Target,
+    drush_args: &[&str],
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, Error> {
+    let project = target.project_root.as_ref().ok_or(Error::BadOutput)?;
+    let mut args: Vec<String> = vec![
+        "exec".into(),
+        "--user".into(),
+        format!("{}:{}", target.uid, target.gid),
+        "-w".into(),
+        project.display().to_string(),
+        target.container.as_str().to_owned(),
+        "sh".into(),
+        "-c".into(),
+        format!(
+            "if [ -x ./vendor/bin/drush ]; then exec ./vendor/bin/drush \"$@\"; elif command -v drush >/dev/null 2>&1; then exec drush \"$@\"; else exit {DRUSH_ABSENT}; fi"
+        ),
+        "drush".into(),
+        format!("--root={}", target.root.display()),
+        "--no-interaction".into(),
+    ];
+    if let Some(url) = &target.site_url {
+        args.push(format!("--uri={}", url.trim_end_matches('/')));
+    }
+    args.extend(drush_args.iter().map(|arg| (*arg).to_owned()));
+    let output = process::run(
+        &ProcessRequest::new(ctx.docker_program).args(args),
+        &ProcessLimits {
+            timeout: TIMEOUT,
+            max_stdout_bytes: MAX_OUTPUT_BYTES,
+            max_stderr_bytes: MAX_OUTPUT_BYTES,
+        },
+        cancel,
+    )
+    .map_err(Error::Run)?;
+    match output.termination {
+        ProcessTermination::Exited { success: true, .. } => {}
+        ProcessTermination::Exited {
+            code: Some(DRUSH_ABSENT),
+            ..
+        } => return Err(Error::DrushMissing),
+        _ => {
+            return Err(Error::Rejected(SubprocessDiagnostics::from_output(
+                ctx.docker_program,
+                &output,
+            )));
+        }
+    }
+    if output.stdout.truncated || output.stderr.truncated {
+        return Err(Error::TooLarge);
+    }
+    Ok(output.stdout.bytes)
+}
+
+/// `{id}/{ts}/{hash}/login` out of a `drush uli` link whose base is `base`
+/// (no trailing slash). The link is the secret; only the timestamp is read.
+fn parse_uli(line: &str, base: &str, user_id: u64) -> Option<u64> {
+    let rest = line.strip_prefix(base)?;
+    let rest = rest.strip_prefix("/user/reset/")?;
+    let mut parts = rest.split('/');
+    let (id, ts, hash, tail) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let clean = !hash.is_empty()
+        && hash.len() <= 256
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    (parts.next().is_none()
+        && tail == "login"
+        && clean
+        && id.parse::<u64>().ok()? == user_id
+        && line.len() <= MAX_HOME_BYTES)
+        .then(|| ts.parse::<u64>().ok())
+        .flatten()
+}
+
+/// Drupal: the native `drush uli`. The link lives as long as the site's own
+/// `password_reset_timeout`; single use comes from Drupal's login timestamp,
+/// which is *not* race-free (parallel opens can each start a session until
+/// the first one finishes). Both are reported in `limits`.
+fn mint_drupal(
+    ctx: &Context<'_>,
+    req: &LoginRequest,
+    cancel: &CancellationToken,
+) -> Result<Minted, Error> {
+    let php = format!("$uid = {}; {DRUPAL_CHECK_PHP}", req.admin_user_id);
+    let bytes = run_drush(ctx, &req.target, &["php:eval", &php], cancel)?;
+    let answer = last_json(&bytes)?;
+    if answer.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+        let code = answer
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        return Err(reject(code));
+    }
+    let login = answer
+        .get("login")
+        .and_then(|value| value.as_str())
+        .filter(|value| valid_login(value))
+        .ok_or(Error::BadOutput)?
+        .to_owned();
+    let timeout = answer
+        .get("timeout")
+        .and_then(|value| value.as_u64())
+        .filter(|value| *value > 0)
+        .ok_or(Error::BadOutput)?;
+    let uid = req.admin_user_id.to_string();
+    let bytes = run_drush(
+        ctx,
+        &req.target,
+        &["user:login", "--no-browser", &format!("--uid={uid}")],
+        cancel,
+    )?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| Error::BadOutput)?;
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .ok_or(Error::BadOutput)?;
+    let base = req
+        .target
+        .site_url
+        .as_deref()
+        .ok_or(Error::BadOutput)?
+        .trim_end_matches('/');
+    let timestamp = parse_uli(line, base, req.admin_user_id).ok_or(Error::BadOutput)?;
+    Ok(Minted {
+        url: line.to_owned(),
+        login,
+        expires_at: timestamp.saturating_add(timeout),
+        limits: vec![
+            "ttlFromSiteSettings".to_owned(),
+            "singleUseNotRaceSafe".to_owned(),
+        ],
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UsersPlan {
@@ -171,6 +338,7 @@ struct UsersPlan {
     uid: u32,
     gid: u32,
     site_url: Option<String>,
+    project_root: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -182,6 +350,7 @@ struct LoginPlan {
     uid: u32,
     gid: u32,
     site_url: Option<String>,
+    project_root: Option<String>,
     admin_user_id: u64,
     ttl_seconds: Option<u64>,
 }
@@ -197,6 +366,10 @@ pub enum RequestError {
     InvalidSiteUrl,
     /// Joomla needs the public base URL to build the link.
     SiteUrlRequired,
+    /// Drupal links live as long as the site's own setting.
+    TtlNotSupported,
+    /// `projectRoot` is required for Drupal and refused otherwise.
+    InvalidProjectRoot,
     InvalidRequestId,
     InvalidIdempotencyKey,
     /// `site.adminLogin` mutates and must be replay-safe.
@@ -207,12 +380,16 @@ impl RequestError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::UnsupportedCms => {
-                "one-time admin login is implemented for WordPress and Joomla (cms \"wordpress\", \"joomla\"), not for this CMS"
+                "one-time admin login is implemented for WordPress, Joomla and Drupal, not for this CMS"
             }
             Self::InvalidSiteUrl => {
                 "siteUrl must be an http(s) base URL without query, fragment or credentials"
             }
-            Self::SiteUrlRequired => "siteUrl is required for Joomla",
+            Self::SiteUrlRequired => "siteUrl is required for Joomla and Drupal login",
+            Self::TtlNotSupported => {
+                "ttlSeconds is not supported for Drupal: the link lives as long as the site's password_reset_timeout"
+            }
+            Self::InvalidProjectRoot => "projectRoot is required for Drupal (and only for Drupal)",
             Self::IdempotencyKeyRequired => "site.adminLogin requires an idempotency key",
             Self::InvalidTtl => "ttlSeconds must be between 60 and 600",
             _ => "request-file is not a valid site admin plan",
@@ -224,10 +401,12 @@ impl RequestError {
 pub enum Cms {
     WordPress,
     Joomla,
+    Drupal,
 }
 
 struct Target {
     cms: Cms,
+    project_root: Option<PathBuf>,
     site_url: Option<String>,
     container: ContainerName,
     root: PathBuf,
@@ -268,6 +447,7 @@ fn base_url(value: &str) -> Option<String> {
     Some(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn target(
     cms: &str,
     container: &str,
@@ -275,19 +455,38 @@ fn target(
     uid: u32,
     gid: u32,
     site_url: Option<String>,
+    project_root: Option<String>,
     need_url: bool,
 ) -> Result<Target, RequestError> {
     let cms = match cms {
         "wordpress" => Cms::WordPress,
         "joomla" => Cms::Joomla,
+        "drupal" => Cms::Drupal,
         _ => return Err(RequestError::UnsupportedCms),
     };
     let site_url = match site_url {
         Some(value) => Some(base_url(&value).ok_or(RequestError::InvalidSiteUrl)?),
         None => None,
     };
-    if cms == Cms::Joomla && need_url && site_url.is_none() {
+    if cms != Cms::WordPress && need_url && site_url.is_none() {
         return Err(RequestError::SiteUrlRequired);
+    }
+    let plain = |value: &PathBuf| {
+        value.is_absolute()
+            && value.as_os_str().len() <= 4096
+            && !value.to_string_lossy().chars().any(char::is_control)
+            && !value
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+    };
+    let project_root = match (cms, project_root) {
+        (Cms::Drupal, Some(value)) => Some(PathBuf::from(value)),
+        (Cms::Drupal, None) => return Err(RequestError::InvalidProjectRoot),
+        (_, Some(_)) => return Err(RequestError::InvalidProjectRoot),
+        (_, None) => None,
+    };
+    if project_root.as_ref().is_some_and(|value| !plain(value)) {
+        return Err(RequestError::InvalidRoot);
     }
     let root = PathBuf::from(root);
     if !root.is_absolute()
@@ -300,6 +499,7 @@ fn target(
     }
     Ok(Target {
         cms,
+        project_root,
         site_url,
         container: ContainerName::parse(container)
             .map_err(|_: RestoreRequestError| RequestError::InvalidContainer)?,
@@ -355,6 +555,7 @@ impl UsersRequest {
                 plan.uid,
                 plan.gid,
                 plan.site_url,
+                plan.project_root,
                 false,
             )?,
         })
@@ -383,10 +584,14 @@ impl LoginRequest {
             plan.uid,
             plan.gid,
             plan.site_url,
+            plan.project_root,
             true,
         )?;
         if plan.admin_user_id == 0 || plan.admin_user_id > u64::from(u32::MAX) {
             return Err(RequestError::InvalidUserId);
+        }
+        if target.cms == Cms::Drupal && plan.ttl_seconds.is_some() {
+            return Err(RequestError::TtlNotSupported);
         }
         let ttl_seconds = plan.ttl_seconds.unwrap_or(DEFAULT_TTL_SECS);
         if !(MIN_TTL_SECS..=MAX_TTL_SECS).contains(&ttl_seconds) {
@@ -431,6 +636,9 @@ pub struct AdminLoginPublic {
     pub admin_login: String,
     pub issued_at_unix_secs: u64,
     pub expires_at_unix_secs: u64,
+    /// Honest caveats of the CMS mechanism (empty for WordPress and Joomla).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub limits: Vec<String>,
 }
 
 /// The one-time part. Only ever lives in the response.
@@ -461,6 +669,9 @@ pub enum Error {
     NotAnAdministrator,
     CannotWrite,
     TooManyLinks,
+    /// Drush is not installed for this site (`drupal.installDrush`).
+    DrushMissing,
+    UnsupportedVersion,
     /// The link was issued but the transaction record could not be saved.
     PostCommit(AdminLoginResult),
     Replayed {
@@ -511,6 +722,14 @@ impl Error {
             Self::TooManyLinks => fixed(
                 ErrorCode::Conflict,
                 "too many unexpired login links are outstanding; wait a few minutes",
+            ),
+            Self::DrushMissing => fixed(
+                ErrorCode::DependencyUnavailable,
+                "Drush is not installed for this site; run drupal.installDrush first",
+            ),
+            Self::UnsupportedVersion => fixed(
+                ErrorCode::InvalidInput,
+                "this Drupal version is not supported for one-time login",
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit(_) => {
@@ -700,6 +919,10 @@ pub fn list_users(
 ) -> Result<AdminUsersResult, Error> {
     let answer = match req.target.cms {
         Cms::WordPress => run_php(ctx, &req.target, USERS_PHP, None, cancel)?,
+        Cms::Drupal => {
+            let bytes = run_drush(ctx, &req.target, &["php:eval", DRUPAL_USERS_PHP], cancel)?;
+            last_json(&bytes)?
+        }
         Cms::Joomla => {
             let plan = serde_json::to_vec(&serde_json::json!({ "root": req.target.root }))
                 .map_err(|_| Error::BadOutput)?;
@@ -741,6 +964,110 @@ fn valid_home(value: &str) -> bool {
         && !value.contains(['?', '#', ' '])
         && !value.chars().any(char::is_control)
         && value.ends_with('/')
+}
+
+/// What a CMS-specific step produced: the link and its facts.
+struct Minted {
+    url: String,
+    login: String,
+    expires_at: u64,
+    limits: Vec<String>,
+}
+
+/// Validates the administrator and produces the one-time link for the
+/// request's CMS. Nothing here persists the link.
+fn mint(
+    ctx: &Context<'_>,
+    req: &LoginRequest,
+    issued_at: u64,
+    cancel: &CancellationToken,
+) -> Result<Minted, Error> {
+    if req.target.cms == Cms::Drupal {
+        return mint_drupal(ctx, req, cancel);
+    }
+    let expires_at = issued_at + req.ttl_seconds;
+    let token = new_token();
+    let hash = token_hash(&token);
+    let (plan, php, entry_file) = match req.target.cms {
+        // Drupal returned above, through `mint_drupal`.
+        Cms::Drupal => return Err(Error::BadOutput),
+        Cms::WordPress => (
+            serde_json::json!({
+                "userId": req.admin_user_id,
+                "expires": expires_at,
+                "source": mu_plugin_source(&hash, expires_at, req.admin_user_id),
+            }),
+            LOGIN_PHP.to_owned(),
+            None,
+        ),
+        Cms::Joomla => {
+            let site_url = req.target.site_url.as_deref().unwrap_or_default();
+            let name = format!("wcp-otl-{expires_at}-{}", &new_token()[..16]);
+            let name = format!("{name}.php");
+            (
+                serde_json::json!({
+                    "root": req.target.root,
+                    "userId": req.admin_user_id,
+                    "name": name,
+                    "source": joomla_entry_source(
+                        &hash,
+                        expires_at,
+                        req.admin_user_id,
+                        &format!("{site_url}administrator/index.php"),
+                    ),
+                }),
+                format!("{JOOMLA_BOOT_PHP}{JOOMLA_LOGIN_PHP}"),
+                Some(name),
+            )
+        }
+    };
+    let plan = serde_json::to_vec(&plan).unwrap();
+    let answer = run_php(ctx, &req.target, &php, Some(&plan), cancel)?;
+    if answer.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+        let code = answer
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        return Err(reject(code));
+    }
+    let home = match &entry_file {
+        // The Joomla entry file sits in the Joomla root, next to index.php.
+        Some(name) => req
+            .target
+            .site_url
+            .as_deref()
+            .map(|base| format!("{base}{name}")),
+        None => answer
+            .get("home")
+            .and_then(|value| value.as_str())
+            .filter(|value| valid_home(value))
+            .map(str::to_owned),
+    };
+    let login = answer
+        .get("login")
+        .and_then(|value| value.as_str())
+        .filter(|value| valid_login(value));
+    let (Some(home), Some(login)) = (home, login) else {
+        return Err(Error::BadOutput);
+    };
+
+    Ok(Minted {
+        url: format!("{home}?{TOKEN_PARAMETER}={token}"),
+        login: login.to_owned(),
+        expires_at,
+        limits: Vec::new(),
+    })
+}
+
+fn reject(code: &str) -> Error {
+    match code {
+        "notFound" => Error::UserNotFound,
+        "notAdmin" => Error::NotAnAdministrator,
+        "busy" => Error::TooManyLinks,
+        "cannotWrite" => Error::CannotWrite,
+        "unsupported" => Error::UnsupportedVersion,
+        _ => Error::BadOutput,
+    }
 }
 
 /// `site.adminLogin`. Returns the public record plus the one-time URL.
@@ -789,91 +1116,21 @@ pub fn issue_login(
         return Err(abort(state, Error::Cancelled));
     }
 
-    let token = new_token();
     let issued_at = now_secs();
-    let expires_at = issued_at + req.ttl_seconds;
-    let hash = token_hash(&token);
-    let (plan, php, entry_file) = match req.target.cms {
-        Cms::WordPress => (
-            serde_json::json!({
-                "userId": req.admin_user_id,
-                "expires": expires_at,
-                "source": mu_plugin_source(&hash, expires_at, req.admin_user_id),
-            }),
-            LOGIN_PHP.to_owned(),
-            None,
-        ),
-        Cms::Joomla => {
-            let site_url = req.target.site_url.as_deref().unwrap_or_default();
-            let name = format!("wcp-otl-{expires_at}-{}", &new_token()[..16]);
-            let name = format!("{name}.php");
-            (
-                serde_json::json!({
-                    "root": req.target.root,
-                    "userId": req.admin_user_id,
-                    "name": name,
-                    "source": joomla_entry_source(
-                        &hash,
-                        expires_at,
-                        req.admin_user_id,
-                        &format!("{site_url}administrator/index.php"),
-                    ),
-                }),
-                format!("{JOOMLA_BOOT_PHP}{JOOMLA_LOGIN_PHP}"),
-                Some(name),
-            )
-        }
-    };
-    let plan = serde_json::to_vec(&plan).unwrap();
-    let answer = match run_php(ctx, &req.target, &php, Some(&plan), cancel) {
+    let minted = match mint(ctx, req, issued_at, cancel) {
         Ok(value) => value,
         Err(error) => return Err(abort(state, error)),
-    };
-    let reject = |code: &str| match code {
-        "notFound" => Error::UserNotFound,
-        "notAdmin" => Error::NotAnAdministrator,
-        "busy" => Error::TooManyLinks,
-        "cannotWrite" => Error::CannotWrite,
-        _ => Error::BadOutput,
-    };
-    if answer.get("ok").and_then(|value| value.as_bool()) != Some(true) {
-        let code = answer
-            .get("error")
-            .and_then(|value| value.as_str())
-            .unwrap_or("");
-        return Err(abort(state, reject(code)));
-    }
-    let home = match &entry_file {
-        // The Joomla entry file sits in the Joomla root, next to index.php.
-        Some(name) => req
-            .target
-            .site_url
-            .as_deref()
-            .map(|base| format!("{base}{name}")),
-        None => answer
-            .get("home")
-            .and_then(|value| value.as_str())
-            .filter(|value| valid_home(value))
-            .map(str::to_owned),
-    };
-    let login = answer
-        .get("login")
-        .and_then(|value| value.as_str())
-        .filter(|value| valid_login(value));
-    let (Some(home), Some(login)) = (home, login) else {
-        return Err(abort(state, Error::BadOutput));
     };
 
     let result = SecretResult::new(
         AdminLoginPublic {
             admin_user_id: req.admin_user_id,
-            admin_login: login.to_owned(),
+            admin_login: minted.login,
             issued_at_unix_secs: issued_at,
-            expires_at_unix_secs: expires_at,
+            expires_at_unix_secs: minted.expires_at,
+            limits: minted.limits,
         },
-        AdminLoginSecret {
-            url: format!("{home}?{TOKEN_PARAMETER}={token}"),
-        },
+        AdminLoginSecret { url: minted.url },
     );
     // Only the public half is ever handed to storage.
     state
@@ -1024,7 +1281,7 @@ mod tests {
             );
         }
         assert_eq!(
-            LoginRequest::parse(&PLAN.replace("wordpress", "drupal"), ID_1, Some("k")).err(),
+            LoginRequest::parse(&PLAN.replace("wordpress", "typo3"), ID_1, Some("k")).err(),
             Some(RequestError::UnsupportedCms)
         );
         assert_eq!(
@@ -1403,5 +1660,130 @@ mod tests {
         assert!(stdin.contains("/var/www/site"));
         let argv = fs::read_to_string(work.join("argv.0")).unwrap();
         assert!(argv.contains("core.admin") && argv.contains("php\n-r"));
+    }
+
+    const DRUPAL_PLAN: &str = r#"{"cms":"drupal","container":"runtime-1","root":"/var/www/site/web","projectRoot":"/var/www/site","uid":1000,"gid":1001,"adminUserId":2,"siteUrl":"https://example.com"}"#;
+
+    /// A fake `docker` that tells the Drush calls apart by their last argument.
+    fn fake_drush_docker(directory: &Path, uli: &str, exit: i32) -> String {
+        let path = directory.join("fake-docker");
+        let body = format!(
+            "#!/bin/sh\nd='{d}'\nn=$(ls \"$d\" | grep -c '^argv\\.')\nprintf '%s\\n' \"$@\" > \"$d/argv.$n\"\ncase \"$*\" in\n*php:eval*) echo 'notice'; echo '{{\"ok\":true,\"login\":\"alice\",\"timeout\":86400}}' ;;\n*) [ {exit} -ne 0 ] && exit {exit}; echo '{uli}' ;;\nesac\n",
+            d = directory.display()
+        );
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn drupal_requests_need_a_project_root_and_refuse_a_ttl() {
+        assert!(LoginRequest::parse(DRUPAL_PLAN, ID_1, Some("k")).is_ok());
+        let no_project = DRUPAL_PLAN.replace("\"projectRoot\":\"/var/www/site\",", "");
+        assert_eq!(
+            LoginRequest::parse(&no_project, ID_1, Some("k")).err(),
+            Some(RequestError::InvalidProjectRoot)
+        );
+        let ttl = DRUPAL_PLAN.replace("\"adminUserId\":2", "\"adminUserId\":2,\"ttlSeconds\":120");
+        assert_eq!(
+            LoginRequest::parse(&ttl, ID_1, Some("k")).err(),
+            Some(RequestError::TtlNotSupported)
+        );
+        assert_eq!(
+            LoginRequest::parse(
+                &PLAN.replace("\"uid\"", "\"projectRoot\":\"/x\",\"uid\""),
+                ID_1,
+                Some("k")
+            )
+            .err(),
+            Some(RequestError::InvalidProjectRoot)
+        );
+        let nourl = DRUPAL_PLAN.replace(",\"siteUrl\":\"https://example.com\"", "");
+        assert_eq!(
+            LoginRequest::parse(&nourl, ID_1, Some("k")).err(),
+            Some(RequestError::SiteUrlRequired)
+        );
+    }
+
+    #[test]
+    fn the_drush_link_is_parsed_strictly() {
+        let base = "https://example.com";
+        let ok = "https://example.com/user/reset/2/1700000000/abc_DEF-123/login";
+        assert_eq!(parse_uli(ok, base, 2), Some(1_700_000_000));
+        assert_eq!(parse_uli(ok, base, 3), None);
+        assert_eq!(parse_uli(ok, "https://other.test", 2), None);
+        for bad in [
+            "https://example.com/user/reset/2/1700000000/abc/login?x=1",
+            "https://example.com/user/reset/2/1700000000/abc/edit",
+            "https://example.com/user/reset/2/x/abc/login",
+            "https://example.com/user/reset/2/1700000000/a b/login",
+            "http://default/user/reset/2/1700000000/abc/login",
+        ] {
+            assert_eq!(parse_uli(bad, base, 2), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn drupal_login_uses_drush_and_reports_the_site_lifetime() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let work = directory.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let link = "https://example.com/user/reset/2/1700000000/hashHASH/login";
+        let docker = fake_drush_docker(&work, link, 0);
+        let state = managed(&state_dir);
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+        };
+        let request = LoginRequest::parse(DRUPAL_PLAN, ID_1, Some("key-1")).unwrap();
+        let Issued::New(result) =
+            issue_login(&ctx, &request, &CancellationToken::default()).unwrap()
+        else {
+            panic!("expected a new link");
+        };
+        let response =
+            crate::protocol::Response::success_with_secret(LOGIN_OPERATION, result).unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["result"]["url"], link);
+        assert_eq!(json["result"]["expiresAtUnixSecs"], 1_700_086_400u64);
+        assert_eq!(json["result"]["limits"][0], "ttlFromSiteSettings");
+        assert_eq!(json["result"]["limits"][1], "singleUseNotRaceSafe");
+        let eval = fs::read_to_string(work.join("argv.0")).unwrap();
+        let uli = fs::read_to_string(work.join("argv.1")).unwrap();
+        assert!(eval.contains("-w\n/var/www/site\nruntime-1\nsh\n"));
+        assert!(
+            eval.contains("--root=/var/www/site/web")
+                && eval.contains("--uri=https://example.com\n")
+        );
+        assert!(eval.contains("php:eval") && eval.contains("$uid = 2;"));
+        assert!(uli.contains("user:login\n--no-browser\n--uid=2"));
+        // The link is never stored.
+        let mut persisted = String::new();
+        read_all(&state_dir, &mut persisted);
+        assert!(!persisted.contains("hashHASH") && !persisted.contains("/user/reset"));
+        assert!(persisted.contains("singleUseNotRaceSafe"));
+    }
+
+    #[test]
+    fn drupal_without_drush_is_a_dependency_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let work = directory.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let path = work.join("fake-docker");
+        fs::write(&path, "#!/bin/sh\nexit 97\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let state = managed(&state_dir);
+        let docker = path.to_string_lossy().into_owned();
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+        };
+        let request = LoginRequest::parse(DRUPAL_PLAN, ID_1, Some("key-1")).unwrap();
+        let error = issue_login(&ctx, &request, &CancellationToken::default()).unwrap_err();
+        assert_eq!(error.protocol().0, ErrorCode::DependencyUnavailable);
     }
 }
