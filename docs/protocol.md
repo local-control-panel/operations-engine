@@ -60,13 +60,17 @@ response). The rule, which clients must follow:
 ## `site.adminUsers`, `site.adminLogin`
 
 One-time administrator login. Implemented for WordPress (`"cms":
-"wordpress"`); `drupal` and `joomla` are refused with `INVALID_INPUT` until
-their follow-ups (Drupal `drush uli` needs Drush as an engine-managed tool,
-and its link lives 24 h by default, not minutes; Joomla needs a spike).
+"wordpress"`) and Joomla (`"cms": "joomla"`); `drupal` is refused with
+`INVALID_INPUT` until it is built on the engine-managed Drush (its
+`drush uli` link lives as long as the site's `password_reset_timeout`, 24 h
+by default, not minutes).
 
 Both take `--request-file`, a root-owned JSON plan:
 `{"cms","container","root","uid","gid"}` plus, for the login,
-`"adminUserId"` and an optional `"ttlSeconds"` (60 to 600, default 300). The
+`"adminUserId"` and an optional `"ttlSeconds"` (60 to 600, default 300).
+`"siteUrl"` (public base URL, `http(s)://host[:port][/path]`, no query,
+fragment or credentials) is **required for Joomla** (the engine cannot know
+the public address from inside the container) and ignored for WordPress. The
 root must lie under a configured content root; the CMS kind comes from the
 panel's `site.probe` result.
 
@@ -94,6 +98,28 @@ issue removes expired files. Not covered: a site-level two-factor plugin that
 only hooks the login form does not run, and the site's own web server access
 log records the request line of the spent link (the token is already invalid
 by then).
+
+How it works on Joomla: Joomla has neither a CLI login nor a must-use plugin
+directory, so the engine writes one minimal, self-deleting entry file
+`wcp-otl-<expiresAt>-<random>.php` (0600, tmp + rename, as the site user) into
+the Joomla root; the link is `<siteUrl>wcp-otl-...php?wcp_otl=<token>`. The
+file holds only the token hash, the expiry, the user id and the absolute
+administrator URL. The request is compared with `hash_equals`, the file is
+`unlink`ed before Joomla is loaded (atomic: of several concurrent requests
+exactly one continues, the rest get a plain 404), then Joomla's
+`AdministratorApplication` is booted and the official `onUserLogin` /
+`onUserAfterLogin` events run for the user (`core.login.admin`, blocked users
+refused, session forked by the `joomla` user plugin), followed by a redirect
+to `<siteUrl>administrator/index.php` with `no-store` and `Referrer-Policy:
+no-referrer`. The "administrator" of a Joomla site is an unblocked member of a
+group that holds `core.admin` (Super Users); `site.adminUsers` lists exactly
+those (found by booting Joomla in CLI with `php -r`, the plan on stdin).
+Expired files are removed on the next issue (at most 10 outstanding) or by
+their own next request. **Joomla multi-factor authentication is not
+bypassed**: a super user with a second factor lands on Joomla's MFA captive
+page and must still pass it. Not covered: a web-server rule that blocks
+unknown `.php` files in the root, or protection of `/administrator` (HTTP auth,
+secret-URL plugins), will stop the link.
 
 The panel records only the fact in the change journal
 (`site.changeLog.append`, action `cms.adminLogin`, `target` = admin login).
