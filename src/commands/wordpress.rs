@@ -3,12 +3,57 @@ use crate::{
     commands::read_root_owned_content_file,
     error::ErrorCode,
     protocol::{Response, ResponseBuildError},
-    wordpress, wordpress_bounded_action, wordpress_clone, wordpress_drop_tables, wordpress_import,
-    wordpress_install, wordpress_multisite_delete_site, wordpress_rotate_credentials,
+    tool_manage, wordpress, wordpress_bounded_action, wordpress_clone, wordpress_drop_tables,
+    wordpress_import, wordpress_install,
+    wordpress_migrate_export::EXPORT_OPERATION,
+    wordpress_migrate_import, wordpress_multisite_delete_site, wordpress_rotate_credentials,
     wordpress_smtp_relay, wordpress_update,
 };
 
+/// The operation name of a command that runs WP-CLI inside the site's
+/// container, or `None` for one that never does.
+fn wp_cli_operation(command: &WordpressCommand) -> Option<&'static str> {
+    Some(match command {
+        WordpressCommand::Import { .. } => wordpress_import::OPERATION,
+        WordpressCommand::Cleanup { .. } => wordpress::OPERATION,
+        WordpressCommand::Install { .. } => wordpress_install::OPERATION,
+        WordpressCommand::Clone { .. } => wordpress_clone::OPERATION,
+        WordpressCommand::MigrateExport { .. } => EXPORT_OPERATION,
+        WordpressCommand::MigrateImport { .. } => wordpress_migrate_import::OPERATION,
+        WordpressCommand::UpdateCore { .. } => wordpress_update::OPERATION,
+        WordpressCommand::UpdatePlugins { .. } => wordpress_update::PLUGINS_OPERATION,
+        WordpressCommand::UpdateThemes { .. } => wordpress_update::THEMES_OPERATION,
+        WordpressCommand::RotateCredentials { .. } => wordpress_rotate_credentials::OPERATION,
+        WordpressCommand::MultisiteDeleteSite { .. } => wordpress_multisite_delete_site::OPERATION,
+        WordpressCommand::DropTables { .. } => wordpress_drop_tables::OPERATION,
+        WordpressCommand::BoundedAction { .. } => wordpress_bounded_action::OPERATION,
+        WordpressCommand::SetSmtpRelay { .. } => wordpress_smtp_relay::OPERATION,
+        WordpressCommand::MigrateDiscard { .. } => return None,
+    })
+}
+
+/// The `DEPENDENCY_UNAVAILABLE` response for a command that needs the managed
+/// WP-CLI while `tools_dir` has none (WP-CLI is not part of the runtime
+/// images), or `None` when the command can go ahead.
+fn wp_cli_missing(
+    command: &WordpressCommand,
+    tools_dir: &std::path::Path,
+) -> Option<Result<Response, ResponseBuildError>> {
+    let operation = wp_cli_operation(command)?;
+    if tool_manage::wp_cli_installed(tools_dir) {
+        return None;
+    }
+    Some(Ok(Response::failure(
+        operation,
+        ErrorCode::DependencyUnavailable,
+        tool_manage::WP_CLI_MISSING_MESSAGE,
+    )))
+}
+
 pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
+    if let Some(response) = wp_cli_missing(&command, std::path::Path::new(tool_manage::TOOLS_DIR)) {
+        return response;
+    }
     match command {
         WordpressCommand::Import {
             request_file,
@@ -1310,5 +1355,51 @@ fn migrate_import(
             ErrorCode::UnsupportedPlatform,
             "wordpress.migrateImport requires a Unix host",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn command(name: &str) -> WordpressCommand {
+        let request_file = PathBuf::from("/nonexistent");
+        let request_id = "00000000-0000-4000-8000-000000000000".to_owned();
+        match name {
+            "drop" => WordpressCommand::DropTables {
+                request_file,
+                request_id,
+                idempotency_key: None,
+            },
+            "cleanup" => WordpressCommand::Cleanup { request_file },
+            _ => WordpressCommand::MigrateDiscard {
+                export_id: "x".into(),
+                request_id,
+            },
+        }
+    }
+
+    #[test]
+    fn wp_cli_commands_fail_clearly_while_the_managed_tool_is_missing() {
+        let tools = tempfile::tempdir().unwrap();
+        for name in ["drop", "cleanup"] {
+            let response = wp_cli_missing(&command(name), tools.path())
+                .expect("blocked")
+                .unwrap();
+            let json = serde_json::to_string(&response).unwrap();
+            assert!(json.contains("DEPENDENCY_UNAVAILABLE"), "{json}");
+            assert!(json.contains("tool.install --tool wp-cli"), "{json}");
+        }
+    }
+
+    #[test]
+    fn commands_proceed_once_wp_cli_is_installed_or_when_they_never_use_it() {
+        let tools = tempfile::tempdir().unwrap();
+        assert!(wp_cli_missing(&command("discard"), tools.path()).is_none());
+        std::fs::create_dir_all(tools.path().join("wp-cli/2.12.0")).unwrap();
+        std::fs::write(tools.path().join("wp-cli/2.12.0/wp.phar"), b"x").unwrap();
+        std::os::unix::fs::symlink("2.12.0", tools.path().join("wp-cli/current")).unwrap();
+        assert!(wp_cli_missing(&command("drop"), tools.path()).is_none());
     }
 }

@@ -73,6 +73,17 @@ mod unix {
                 ));
             }
         };
+        if request.uses_wp_cli()
+            && !crate::tool_manage::wp_cli_installed(std::path::Path::new(
+                crate::tool_manage::TOOLS_DIR,
+            ))
+        {
+            return Ok(fail(
+                USERS_OPERATION,
+                ErrorCode::DependencyUnavailable,
+                crate::tool_manage::WP_CLI_MISSING_MESSAGE,
+            ));
+        }
         if !inside_content_roots(&config, request.root()) {
             return Ok(fail(
                 USERS_OPERATION,
@@ -113,6 +124,17 @@ mod unix {
                     ));
                 }
             };
+        if request.uses_wp_cli()
+            && !crate::tool_manage::wp_cli_installed(std::path::Path::new(
+                crate::tool_manage::TOOLS_DIR,
+            ))
+        {
+            return Ok(fail(
+                LOGIN_OPERATION,
+                ErrorCode::DependencyUnavailable,
+                crate::tool_manage::WP_CLI_MISSING_MESSAGE,
+            ));
+        }
         if !inside_content_roots(&config, request.root()) {
             return Ok(fail(
                 LOGIN_OPERATION,
