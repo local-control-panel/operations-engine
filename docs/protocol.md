@@ -60,15 +60,16 @@ response). The rule, which clients must follow:
 ## `site.adminUsers`, `site.adminLogin`
 
 One-time administrator login. Implemented for WordPress (`"cms":
-"wordpress"`) and Joomla (`"cms": "joomla"`); `drupal` is refused with
-`INVALID_INPUT` until it is built on the engine-managed Drush (its
-`drush uli` link lives as long as the site's `password_reset_timeout`, 24 h
-by default, not minutes).
+"wordpress"`), Joomla (`"cms": "joomla"`) and Drupal (`"cms": "drupal"`,
+through the engine-managed Drush). Other kinds are refused with
+`INVALID_INPUT`.
 
 Both take `--request-file`, a root-owned JSON plan:
 `{"cms","container","root","uid","gid"}` plus, for the login,
 `"adminUserId"` and an optional `"ttlSeconds"` (60 to 600, default 300).
-`"siteUrl"` (public base URL, `http(s)://host[:port][/path]`, no query,
+For Drupal the plan also needs `"projectRoot"` (where `vendor/bin/drush`
+lives; `root` is the public document root, e.g. `.../web`), `"siteUrl"` is
+required, and `"ttlSeconds"` is **refused** (`INVALID_INPUT`). `"siteUrl"` (public base URL, `http(s)://host[:port][/path]`, no query,
 fragment or credentials) is **required for Joomla** (the engine cannot know
 the public address from inside the container) and ignored for WordPress. The
 root must lie under a configured content root; the CMS kind comes from the
@@ -120,6 +121,27 @@ bypassed**: a super user with a second factor lands on Joomla's MFA captive
 page and must still pass it. Not covered: a web-server rule that blocks
 unknown `.php` files in the root, or protection of `/administrator` (HTTP auth,
 secret-URL plugins), will stop the link.
+
+How it works on Drupal: nothing is written to the site. The engine runs, as
+the site user in the site's container from `projectRoot` (project
+`vendor/bin/drush` first, `drush` on `PATH` as fallback; **`DEPENDENCY_UNAVAILABLE`**
+when neither exists: run `drupal.installDrush`), a fixed `drush php:eval` that
+checks the user (exists, active, uid 1 or a role flagged `is_admin`;
+otherwise `NOT_FOUND` / `PERMISSION_DENIED`) and reads
+`user.settings:password_reset_timeout`, then `drush user:login --no-browser
+--uid=<id> --uri=<siteUrl>`. The returned Drupal reset link
+(`/user/reset/<uid>/<timestamp>/<hash>/login`) is the secret. **Honest
+limits, reported in the result as `limits`:** `ttlFromSiteSettings` - the link
+lives as long as the site's own `password_reset_timeout` (24 h by default), so
+`expiresAtUnixSecs` is that real expiry (timestamp + timeout), not a request
+TTL; the engine neither changes the site's configuration nor can shorten it
+for one link. `singleUseNotRaceSafe` - single use comes from Drupal's own
+login timestamp: after one successful open the link no longer works, but
+parallel opens before that completes can each get a session (8 simultaneous
+opens gave 8 sessions on Drupal 11.4 in testing). Landing is the user's
+edit form (Drupal's one-time-login flow), and a site with a two-factor module
+that hooks `hook_user_login` may redirect to it. The clients must show these
+limits before the link is used.
 
 The panel records only the fact in the change journal
 (`site.changeLog.append`, action `cms.adminLogin`, `target` = admin login).
