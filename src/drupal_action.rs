@@ -1,7 +1,10 @@
-//! Three small, typed Drupal mutations run through the site's Drush under one
+//! Four small, typed Drupal mutations run through the site's Drush under one
 //! lock/idempotency/transaction/audit-backed request:
 //! `drupal.cacheRebuild` (`drush cache:rebuild`), `drupal.cronRun`
-//! (`drush core:cron`) and `drupal.maintenance` (maintenance mode on/off).
+//! (`drush core:cron`), `drupal.maintenance` (maintenance mode on/off) and
+//! `drupal.installDrush` (`composer require drush/drush` in the project with
+//! the engine-managed Composer, so Drush lives in the project's
+//! `vendor/bin/drush`, never globally).
 //!
 //! There is deliberately no way to pass a Drush command or argument: the
 //! action selects a fixed argv, the only caller-controlled values are the
@@ -40,6 +43,14 @@ use std::{
 pub const CACHE_REBUILD: &str = "drupal.cacheRebuild";
 pub const CRON_RUN: &str = "drupal.cronRun";
 pub const MAINTENANCE: &str = "drupal.maintenance";
+pub const INSTALL_DRUSH: &str = "drupal.installDrush";
+
+/// Path of the engine-managed Composer inside runtime containers (the tools
+/// directory is mounted read-only at `/opt/wcp-tools`).
+const CONTAINER_COMPOSER: &str = "/opt/wcp-tools/composer/current/composer.phar";
+/// Writable by any site user; Composer's home and cache for one run.
+const COMPOSER_HOME: &str = "/tmp/wcp-composer";
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Drush's `cache:rebuild` and `core:cron` can legitimately take minutes on a
 /// large site; anything longer is a hang.
@@ -52,6 +63,7 @@ pub enum Action {
     CacheRebuild,
     CronRun,
     Maintenance { enabled: bool },
+    InstallDrush,
 }
 
 impl Action {
@@ -60,6 +72,7 @@ impl Action {
             Self::CacheRebuild => CACHE_REBUILD,
             Self::CronRun => CRON_RUN,
             Self::Maintenance { .. } => MAINTENANCE,
+            Self::InstallDrush => INSTALL_DRUSH,
         }
     }
 
@@ -68,6 +81,7 @@ impl Action {
             Self::CacheRebuild => "cacheRebuild",
             Self::CronRun => "cronRun",
             Self::Maintenance { .. } => "maintenance",
+            Self::InstallDrush => "installDrush",
         }
     }
 }
@@ -133,6 +147,7 @@ impl Request {
         let action = match (kind, plan.state.as_deref()) {
             ("cache-rebuild", None) => Action::CacheRebuild,
             ("cron-run", None) => Action::CronRun,
+            ("install-drush", None) => Action::InstallDrush,
             ("maintenance", Some("on")) => Action::Maintenance { enabled: true },
             ("maintenance", Some("off")) => Action::Maintenance { enabled: false },
             _ => return Err(RequestError::InvalidState),
@@ -174,12 +189,17 @@ pub struct ActionResult {
     /// For `maintenance`: the mode read back from Drupal after the change.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub maintenance_mode: Option<bool>,
+    /// For `installDrush`: `false` when the project already had Drush.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed: Option<bool>,
     pub completed_at_unix_secs: u64,
 }
 
 pub struct Context<'a> {
     pub engine_state: &'a ManagedRoot,
     pub docker_program: &'a str,
+    /// Host directory of the engine-managed tools ([`crate::tool_manage::TOOLS_DIR`]).
+    pub tools_dir: &'a std::path::Path,
 }
 
 #[derive(Debug)]
@@ -193,6 +213,11 @@ pub enum Error {
     Rejected(SubprocessDiagnostics),
     /// Drupal did not report the maintenance mode that was just set.
     StateMismatch,
+    /// The engine-managed Composer is not installed on the host.
+    ComposerMissing,
+    /// The project root has no `composer.json`: Drush is installed per
+    /// Composer project only.
+    NotAComposerProject,
     PostCommit {
         result: ActionResult,
     },
@@ -231,6 +256,14 @@ impl Error {
             Self::StateMismatch => (
                 ErrorCode::SubprocessFailed,
                 "Drupal did not report the requested maintenance mode".into(),
+            ),
+            Self::ComposerMissing => (
+                ErrorCode::DependencyUnavailable,
+                "the managed Composer tool is not installed".into(),
+            ),
+            Self::NotAComposerProject => (
+                ErrorCode::InvalidInput,
+                "the site has no composer.json, so Drush cannot be installed for it".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             Self::Io(_) | Self::Preflight(_) | Self::PostCommit { .. } => {
@@ -289,6 +322,116 @@ fn drush(
     Ok(output.stdout.bytes)
 }
 
+/// Runs a fixed `docker exec` as the site user in the project root. Used for
+/// the Composer step of `installDrush`; `program_and_args` never contains
+/// caller-controlled text.
+fn container_exec(
+    ctx: &Context<'_>,
+    req: &Request,
+    env: &[&str],
+    program_and_args: &[&str],
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<process::ProcessOutput, Error> {
+    let mut args: Vec<String> = vec![
+        "exec".into(),
+        "-i".into(),
+        "--user".into(),
+        format!("{}:{}", req.uid, req.gid),
+        "-w".into(),
+        req.project_root.display().to_string(),
+    ];
+    for value in env {
+        args.push("-e".into());
+        args.push((*value).to_owned());
+    }
+    args.push(req.container.as_str().to_owned());
+    args.extend(program_and_args.iter().map(|arg| (*arg).to_owned()));
+    process::run(
+        &ProcessRequest::new(ctx.docker_program).args(args),
+        &ProcessLimits {
+            timeout,
+            max_stdout_bytes: MAX_OUTPUT,
+            max_stderr_bytes: MAX_OUTPUT,
+        },
+        cancel,
+    )
+    .map_err(Error::Run)
+}
+
+fn exited_ok(output: &process::ProcessOutput) -> bool {
+    matches!(
+        output.termination,
+        ProcessTermination::Exited { success: true, .. }
+    )
+}
+
+/// Installs Drush into the project with the managed Composer. Returns
+/// whether anything changed.
+fn install_drush(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<bool, Error> {
+    // Already there: a Composer project whose vendor/bin/drush is executable.
+    if exited_ok(&container_exec(
+        ctx,
+        req,
+        &[],
+        &["test", "-x", "./vendor/bin/drush"],
+        READ_TIMEOUT,
+        cancel,
+    )?) {
+        return Ok(false);
+    }
+    if !exited_ok(&container_exec(
+        ctx,
+        req,
+        &[],
+        &["test", "-f", "./composer.json"],
+        READ_TIMEOUT,
+        cancel,
+    )?) {
+        return Err(Error::NotAComposerProject);
+    }
+    if !ctx
+        .tools_dir
+        .join("composer/current/composer.phar")
+        .is_file()
+    {
+        return Err(Error::ComposerMissing);
+    }
+    let home = format!("COMPOSER_HOME={COMPOSER_HOME}");
+    let cache = format!("COMPOSER_CACHE_DIR={COMPOSER_HOME}/cache");
+    let output = container_exec(
+        ctx,
+        req,
+        &[&home, &cache, "COMPOSER_NO_INTERACTION=1"],
+        &[
+            "php",
+            CONTAINER_COMPOSER,
+            "require",
+            "drush/drush",
+            "--no-interaction",
+            "--no-ansi",
+            "--no-progress",
+            "--no-scripts",
+            "--quiet",
+        ],
+        INSTALL_TIMEOUT,
+        cancel,
+    )?;
+    if !exited_ok(&output) {
+        return Err(Error::Rejected(SubprocessDiagnostics::from_output(
+            ctx.docker_program,
+            &output,
+        )));
+    }
+    // Prove the result works the way later operations will run it.
+    drush(ctx, req, &["--version"], READ_TIMEOUT, cancel)?;
+    Ok(true)
+}
+
 fn maintenance_flag(bytes: &[u8]) -> Option<bool> {
     match String::from_utf8_lossy(bytes).trim() {
         "1" | "true" | "TRUE" => Some(true),
@@ -301,8 +444,20 @@ fn run_action(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
+) -> Result<(Option<bool>, Option<bool>), Error> {
+    if req.action == Action::InstallDrush {
+        return install_drush(ctx, req, cancel).map(|changed| (None, Some(changed)));
+    }
+    run_drush_action(ctx, req, cancel).map(|mode| (mode, None))
+}
+
+fn run_drush_action(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
 ) -> Result<Option<bool>, Error> {
     match req.action {
+        Action::InstallDrush => unreachable!("handled by run_action"),
         Action::CacheRebuild => {
             drush(ctx, req, &["cache:rebuild"], RUN_TIMEOUT, cancel)?;
             Ok(None)
@@ -394,13 +549,14 @@ pub fn execute(
         ));
     }
 
-    let maintenance_mode = match run_action(ctx, req, cancel) {
+    let (maintenance_mode, changed) = match run_action(ctx, req, cancel) {
         Ok(value) => value,
         Err(error) => return Err(fail(&scope, &state_path, &audit_path, state, error)),
     };
     let result = ActionResult {
         action: req.action.name().into(),
         maintenance_mode,
+        changed,
         completed_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -578,6 +734,7 @@ exit 0
         let ctx = Context {
             engine_state: &state,
             docker_program: &docker,
+            tools_dir: dir.path(),
         };
         let req = request("cache-rebuild", None, ID, Some("cache-key"));
         let first = execute(&ctx, &req, &CancellationToken::default()).unwrap();
@@ -600,6 +757,7 @@ exit 0
         let ctx = Context {
             engine_state: &state,
             docker_program: &docker,
+            tools_dir: dir.path(),
         };
         let req = request("cron-run", None, ID, None);
         let result = execute(&ctx, &req, &CancellationToken::default()).unwrap();
@@ -615,6 +773,7 @@ exit 0
         let ctx = Context {
             engine_state: &state,
             docker_program: &docker,
+            tools_dir: dir.path(),
         };
         let on = request("maintenance", Some("on"), ID, None);
         let result = execute(&ctx, &on, &CancellationToken::default()).unwrap();
@@ -637,6 +796,7 @@ exit 0
         let ctx = Context {
             engine_state: &state,
             docker_program: &docker,
+            tools_dir: dir.path(),
         };
         let req = request("cache-rebuild", None, ID, Some("fail-key"));
         assert!(matches!(
@@ -649,6 +809,119 @@ exit 0
             Err(Error::Replayed { .. })
         ));
         assert_eq!(log(dir.path()).lines().count(), 1, "retry must not re-run");
+    }
+
+    /// A stand-in for the container: `test -x ./vendor/bin/drush` succeeds
+    /// once a Composer run created the marker; `composer.json` presence is
+    /// controlled by `has_composer_json`.
+    fn fake_composer_docker(directory: &std::path::Path, has_composer_json: bool) -> String {
+        let log = directory.join("drush.log");
+        let marker = directory.join("drush-installed");
+        let path = directory.join("fake-docker");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"test -x ./vendor/bin/drush"*) [ -e '{marker}' ]; exit $? ;;
+  *"test -f ./composer.json"*) exit {json} ;;
+  *"composer.phar require drush/drush"*) touch '{marker}'; exit 0 ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+                marker = marker.display(),
+                json = if has_composer_json { 0 } else { 1 },
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn with_composer(dir: &std::path::Path) {
+        let current = dir.join("tools/composer/current");
+        fs::create_dir_all(&current).unwrap();
+        fs::write(current.join("composer.phar"), b"x").unwrap();
+    }
+
+    #[test]
+    fn install_drush_requires_with_the_managed_composer_then_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        with_composer(dir.path());
+        let docker = fake_composer_docker(dir.path(), true);
+        let state = managed(dir.path());
+        let tools = dir.path().join("tools");
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: &tools,
+        };
+        let first = execute(
+            &ctx,
+            &request("install-drush", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(first.action, "installDrush");
+        assert_eq!(first.changed, Some(true));
+        let recorded = log(dir.path());
+        assert!(recorded.contains(
+            "-e COMPOSER_HOME=/tmp/wcp-composer -e COMPOSER_CACHE_DIR=/tmp/wcp-composer/cache"
+        ));
+        assert!(recorded.contains(
+            "runtime-1 php /opt/wcp-tools/composer/current/composer.phar require drush/drush"
+        ));
+        assert!(recorded.contains("--no-scripts"));
+        assert!(recorded.contains("--version"), "verifies Drush runs");
+
+        let second = execute(
+            &ctx,
+            &request("install-drush", None, ID2, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(second.changed, Some(false));
+        assert_eq!(recorded.matches("require drush/drush").count(), 1);
+        assert_eq!(log(dir.path()).matches("require drush/drush").count(), 1);
+    }
+
+    #[test]
+    fn install_drush_refuses_without_composer_or_a_composer_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = managed(dir.path());
+        let tools = dir.path().join("tools");
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &fake_composer_docker(dir.path(), true),
+            tools_dir: &tools,
+        };
+        assert!(matches!(
+            execute(
+                &ctx,
+                &request("install-drush", None, ID, None),
+                &CancellationToken::default()
+            ),
+            Err(Error::ComposerMissing)
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        with_composer(dir.path());
+        let state = managed(dir.path());
+        let tools = dir.path().join("tools");
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &fake_composer_docker(dir.path(), false),
+            tools_dir: &tools,
+        };
+        assert!(matches!(
+            execute(
+                &ctx,
+                &request("install-drush", None, ID, None),
+                &CancellationToken::default()
+            ),
+            Err(Error::NotAComposerProject)
+        ));
     }
 
     /// Real-host check against a live Drupal container; run manually with
@@ -672,6 +945,7 @@ exit 0
         let ctx = Context {
             engine_state: &state,
             docker_program: &docker,
+            tools_dir: dir.path(),
         };
         let make = |kind: &str, st: Option<&str>, id: &str| {
             let st = st.map_or(String::new(), |s| format!(r#","state":"{s}""#));
