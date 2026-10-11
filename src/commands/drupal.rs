@@ -30,6 +30,17 @@ pub fn run(command: DrupalCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        DrupalCommand::InstallDrush {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => action(
+            "install-drush",
+            drupal_action::INSTALL_DRUSH,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         DrupalCommand::Maintenance {
             request_file,
             request_id,
@@ -111,6 +122,7 @@ fn action(
         let context = drupal_action::Context {
             engine_state: &state,
             docker_program: "docker",
+            tools_dir: std::path::Path::new(crate::tool_manage::TOOLS_DIR),
         };
         match drupal_action::execute(
             &context,

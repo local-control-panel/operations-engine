@@ -299,6 +299,17 @@ pub enum DrupalCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Install Drush into the site's Composer project
+    /// (`composer require drush/drush` with the engine-managed Composer) as
+    /// the site user.
+    InstallDrush {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Turn maintenance mode on or off (explicit `state` in the request)
     /// and verify the mode Drupal reports afterwards.
     Maintenance {
@@ -317,6 +328,7 @@ impl DrupalCommand {
             Self::CacheRebuild { .. } => "drupal.cacheRebuild",
             Self::CronRun { .. } => "drupal.cronRun",
             Self::Maintenance { .. } => "drupal.maintenance",
+            Self::InstallDrush { .. } => "drupal.installDrush",
         }
     }
 }

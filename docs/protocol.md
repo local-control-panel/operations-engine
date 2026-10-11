@@ -585,6 +585,20 @@ maintenance mode read back (for `maintenance`) and the completion time. The
 operations are transaction/audit recorded and replay their outcome for a
 retried request with the same idempotency key.
 
+## `drupal.installDrush`
+
+`drupal install-drush` takes the same request as the other Drupal actions
+(without `state`). Drush is installed per project, never globally: when the
+project has no executable `vendor/bin/drush` but has a `composer.json`, the
+engine runs `php /opt/wcp-tools/composer/current/composer.phar require
+drush/drush` inside the site's container as the site user, with a fixed argv
+(`--no-interaction --no-ansi --no-progress --no-scripts --quiet`) and a
+throwaway `COMPOSER_HOME`/cache under `/tmp`. It then runs `drush --version`
+to prove the result works. The managed Composer (`tool.install --tool
+composer`) must be installed on the host first (`dependency_unavailable`
+otherwise); a project without `composer.json` is `invalid_input`. The result
+carries `changed: false` when Drush was already there (no Composer run).
+
 ## `agent.activateBruteforceConfig`
 
 `agent activate-bruteforce-config` accepts a root-owned JSON request with the
