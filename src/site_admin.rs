@@ -447,6 +447,7 @@ fn base_url(value: &str) -> Option<String> {
     Some(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn target(
     cms: &str,
     container: &str,
@@ -1021,10 +1022,7 @@ fn mint(
         }
     };
     let plan = serde_json::to_vec(&plan).unwrap();
-    let answer = match run_php(ctx, &req.target, &php, Some(&plan), cancel) {
-        Ok(value) => value,
-        Err(error) => return Err(error),
-    };
+    let answer = run_php(ctx, &req.target, &php, Some(&plan), cancel)?;
     if answer.get("ok").and_then(|value| value.as_bool()) != Some(true) {
         let code = answer
             .get("error")
