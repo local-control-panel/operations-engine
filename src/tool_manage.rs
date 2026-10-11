@@ -43,6 +43,7 @@ pub const STATUS: &str = "tool.status";
 /// Host directory that is bind-mounted read-only into runtime containers.
 pub const TOOLS_DIR: &str = "/var/lib/wcp/tools";
 pub const WP_CLI_VERSION: &str = "2.12.0";
+pub const COMPOSER_VERSION: &str = "2.10.3";
 /// The WP-CLI phar is ~7 MiB.
 pub const MAX_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -52,10 +53,11 @@ const CURRENT: &str = "current";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Tool {
     WpCli,
+    Composer,
 }
 
 impl Tool {
-    pub const ALL: &'static [Tool] = &[Tool::WpCli];
+    pub const ALL: &'static [Tool] = &[Tool::WpCli, Tool::Composer];
 
     pub fn parse(name: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|tool| tool.name() == name)
@@ -64,6 +66,7 @@ impl Tool {
     pub const fn name(self) -> &'static str {
         match self {
             Self::WpCli => "wp-cli",
+            Self::Composer => "composer",
         }
     }
 
@@ -71,6 +74,7 @@ impl Tool {
     pub const fn file(self) -> &'static str {
         match self {
             Self::WpCli => "wp.phar",
+            Self::Composer => "composer.phar",
         }
     }
 
@@ -86,6 +90,13 @@ impl Tool {
                 sha256: "ce34ddd838f7351d6759068d09793f26755463b4a4610a5a5c0a97b68220d85c"
                     .to_owned(),
             },
+            Self::Composer => Artifact {
+                version: COMPOSER_VERSION.to_owned(),
+                url: format!("https://getcomposer.org/download/{COMPOSER_VERSION}/composer.phar"),
+                // Matches https://getcomposer.org/download/2.10.3/composer.phar.sha256sum.
+                sha256: "7a2d379d5b8ffdaa028580ef26494c36d2feef4b178d3dd1473a4dbc5e17c8d6"
+                    .to_owned(),
+            },
         }
     }
 
@@ -94,7 +105,7 @@ impl Tool {
     /// unrelated file.
     fn looks_valid(self, bytes: &[u8]) -> bool {
         match self {
-            Self::WpCli => {
+            Self::WpCli | Self::Composer => {
                 bytes.starts_with(b"#!/usr/bin/env php")
                     && bytes
                         .windows(18)
@@ -641,11 +652,11 @@ mod tests {
             let artifact = tool.pinned();
             assert_eq!(artifact.sha256.len(), 64);
             assert!(artifact.sha256.bytes().all(|c| c.is_ascii_hexdigit()));
-            assert!(
-                artifact
-                    .url
-                    .starts_with("https://github.com/wp-cli/wp-cli/releases/")
-            );
+            let expected = match tool {
+                Tool::WpCli => "https://github.com/wp-cli/wp-cli/releases/",
+                Tool::Composer => "https://getcomposer.org/download/",
+            };
+            assert!(artifact.url.starts_with(expected));
             assert!(artifact.url.contains(&artifact.version));
             assert_eq!(Tool::parse(tool.name()), Some(*tool));
         }
@@ -684,13 +695,22 @@ mod tests {
         let report = host.status(&bytes);
         assert_eq!(
             report.tools,
-            vec![ToolStatus {
-                tool: "wp-cli".into(),
-                pinned_version: VERSION.into(),
-                installed_version: Some(VERSION.into()),
-                selected: true,
-                intact: true,
-            }]
+            vec![
+                ToolStatus {
+                    tool: "wp-cli".into(),
+                    pinned_version: VERSION.into(),
+                    installed_version: Some(VERSION.into()),
+                    selected: true,
+                    intact: true,
+                },
+                ToolStatus {
+                    tool: "composer".into(),
+                    pinned_version: VERSION.into(),
+                    installed_version: None,
+                    selected: false,
+                    intact: false,
+                },
+            ]
         );
     }
 
