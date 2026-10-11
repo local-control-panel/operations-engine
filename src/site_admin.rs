@@ -250,9 +250,9 @@ fn base_url(value: &str) -> Option<String> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
         && authority.matches(':').count() <= 1;
     let path_ok = path.len() <= 1024
-        && path
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'%' | b'/' | b'-'))
+        && path.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'%' | b'/' | b'-')
+        })
         && !path.split('/').any(|part| part == "..");
     if !host_ok || !path_ok || value.len() > MAX_HOME_BYTES {
         return None;
@@ -484,7 +484,7 @@ impl Error {
             Self::Cancelled => fixed(ErrorCode::Cancelled, "cancelled before a link was issued"),
             Self::Run(error) => fixed(
                 process::spawn_error_code(error),
-                "could not run WordPress for the admin login",
+                "could not run the CMS for the admin login",
             ),
             Self::Rejected(diagnostics) => fixed(
                 if diagnostics.timed_out {
@@ -494,12 +494,11 @@ impl Error {
                 } else {
                     ErrorCode::SubprocessFailed
                 },
-                "WordPress rejected the admin login request",
+                "the CMS rejected the admin login request",
             ),
-            Self::TooLarge | Self::BadOutput => fixed(
-                ErrorCode::Internal,
-                "WordPress returned an unexpected answer",
-            ),
+            Self::TooLarge | Self::BadOutput => {
+                fixed(ErrorCode::Internal, "the CMS returned an unexpected answer")
+            }
             Self::UserNotFound => fixed(ErrorCode::NotFound, "no such user on this site"),
             Self::NotAnAdministrator => fixed(
                 ErrorCode::PermissionDenied,
@@ -507,7 +506,7 @@ impl Error {
             ),
             Self::CannotWrite => fixed(
                 ErrorCode::SubprocessFailed,
-                "the site's mu-plugins directory is not writable",
+                "the site directory for the login file is not writable",
             ),
             Self::TooManyLinks => fixed(
                 ErrorCode::Conflict,
@@ -1258,5 +1257,151 @@ mod tests {
         let argv = fs::read_to_string(work.join("argv.0")).unwrap();
         assert!(argv.contains("get_users"));
         assert!(!argv.contains("user_email"));
+    }
+
+    const JOOMLA_PLAN: &str = r#"{"cms":"joomla","container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1001,"adminUserId":7,"siteUrl":"https://example.com"}"#;
+
+    fn joomla_answer() -> String {
+        "Deprecated: noise\n{\"ok\":true,\"login\":\"alice\",\"file\":\"x.php\"}\n".to_owned()
+    }
+
+    #[test]
+    fn joomla_requests_need_a_clean_site_url() {
+        assert!(LoginRequest::parse(JOOMLA_PLAN, ID_1, Some("k")).is_ok());
+        let without = JOOMLA_PLAN.replace(",\"siteUrl\":\"https://example.com\"", "");
+        assert_eq!(
+            LoginRequest::parse(&without, ID_1, Some("k")).err(),
+            Some(RequestError::SiteUrlRequired)
+        );
+        for bad in [
+            "ftp://example.com",
+            "https://user@example.com",
+            "https://example.com/?a=1",
+            "https://example.com/#x",
+            "https://example.com/a b",
+            "https://example.com/../x",
+            "https://example.com/'x",
+        ] {
+            assert_eq!(
+                LoginRequest::parse(
+                    &JOOMLA_PLAN.replace("https://example.com", bad),
+                    ID_1,
+                    Some("k")
+                )
+                .err(),
+                Some(RequestError::InvalidSiteUrl),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            base_url("http://h.test:8080/sub").as_deref(),
+            Some("http://h.test:8080/sub/")
+        );
+        assert_eq!(
+            base_url("https://h.test/").as_deref(),
+            Some("https://h.test/")
+        );
+        // Users listing does not need a URL.
+        assert!(UsersRequest::parse(
+            r#"{"cms":"joomla","container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1001}"#
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn the_joomla_entry_file_holds_only_a_hash_and_is_valid_php() {
+        let token = new_token();
+        let hash = token_hash(&token);
+        let source = joomla_entry_source(
+            &hash,
+            1_900_000_000,
+            7,
+            "https://e.com/administrator/index.php",
+        );
+        assert!(source.contains(&hash) && !source.contains(&token));
+        assert!(source.contains("hash_equals") && source.contains("@unlink(__FILE__)"));
+        assert!(source.contains("core.login.admin"));
+        // The file is deleted before Joomla is loaded.
+        assert!(source.find("@unlink(__FILE__)").unwrap() < source.find("_JEXEC").unwrap());
+        if let Ok(output) = std::process::Command::new("php").arg("-v").output() {
+            if output.status.success() {
+                let directory = tempfile::tempdir().unwrap();
+                let file = directory.path().join("p.php");
+                fs::write(&file, &source).unwrap();
+                let lint = std::process::Command::new("php")
+                    .arg("-l")
+                    .arg(&file)
+                    .output()
+                    .unwrap();
+                assert!(lint.status.success(), "{lint:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn joomla_login_runs_php_in_the_container_and_never_sends_the_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let work = directory.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let docker = fake_docker(&work, &joomla_answer());
+        let state = managed(&state_dir);
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+        };
+        let request = LoginRequest::parse(JOOMLA_PLAN, ID_1, Some("key-1")).unwrap();
+        let Issued::New(result) =
+            issue_login(&ctx, &request, &CancellationToken::default()).unwrap()
+        else {
+            panic!("expected a new link");
+        };
+        let response =
+            crate::protocol::Response::success_with_secret(LOGIN_OPERATION, result).unwrap();
+        let json = serde_json::to_value(&response).unwrap();
+        let url = json["result"]["url"].as_str().unwrap().to_owned();
+        let token = token_of(&url);
+        assert!(url.starts_with("https://example.com/wcp-otl-"), "{url}");
+        assert!(url.contains(".php?wcp_otl="));
+        assert_eq!(json["result"]["adminLogin"], "alice");
+        let argv = fs::read_to_string(work.join("argv.0")).unwrap();
+        let stdin = fs::read_to_string(work.join("stdin.0")).unwrap();
+        assert!(argv.contains("--user\n1000:1001\nruntime-1\nphp\n-r\n"));
+        assert!(!argv.contains(&token) && !stdin.contains(&token));
+        assert!(stdin.contains(&token_hash(&token)));
+        assert!(stdin.contains("administrator/index.php"));
+        let mut persisted = String::new();
+        read_all(&state_dir, &mut persisted);
+        assert!(!persisted.contains(&token) && !persisted.contains("wcp_otl"));
+    }
+
+    #[test]
+    fn joomla_lists_super_users_through_php_with_the_root_on_stdin() {
+        let directory = tempfile::tempdir().unwrap();
+        let state_dir = directory.path().join("state");
+        fs::create_dir(&state_dir).unwrap();
+        let work = directory.path().join("work");
+        fs::create_dir(&work).unwrap();
+        let docker = fake_docker(
+            &work,
+            "{\"ok\":true,\"users\":[{\"id\":936,\"login\":\"alice\"}]}\n",
+        );
+        let state = managed(&state_dir);
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+        };
+        let request = UsersRequest::parse(
+            r#"{"cms":"joomla","container":"runtime-1","root":"/var/www/site","uid":1000,"gid":1001}"#,
+        )
+        .unwrap();
+        let result = list_users(&ctx, &request, &CancellationToken::default()).unwrap();
+        assert_eq!(result.users[0].id, 936);
+        assert!(!result.truncated);
+        let stdin = fs::read_to_string(work.join("stdin.0")).unwrap();
+        assert!(stdin.contains("/var/www/site"));
+        let argv = fs::read_to_string(work.join("argv.0")).unwrap();
+        assert!(argv.contains("core.admin") && argv.contains("php\n-r"));
     }
 }
