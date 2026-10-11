@@ -77,7 +77,7 @@ mod unix {
             return Ok(fail(
                 USERS_OPERATION,
                 ErrorCode::InvalidInput,
-                "WordPress root is outside configured content roots",
+                "site root is outside configured content roots",
             ));
         }
         let context = site_admin::Context {
@@ -117,7 +117,7 @@ mod unix {
             return Ok(fail(
                 LOGIN_OPERATION,
                 ErrorCode::InvalidInput,
-                "WordPress root is outside configured content roots",
+                "site root is outside configured content roots",
             ));
         }
         let context = site_admin::Context {
