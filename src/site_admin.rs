@@ -1,8 +1,10 @@
 //! `site.adminUsers` and `site.adminLogin`: list a site's administrators and
 //! mint a short-lived, single-use login link for one of them.
 //!
-//! WordPress only for now (`cms: "wordpress"`); Drupal (`drush uli`) and
-//! Joomla are documented follow-ups and are refused with a clear error.
+//! WordPress (`cms: "wordpress"`) and Joomla (`cms: "joomla"`). Drupal is
+//! refused with a clear error: `drush uli` lives 24 h by default, cannot be
+//! made single-use under parallel opens and needs Drush as an engine-managed
+//! tool; see the ROADMAP.
 //!
 //! ## WordPress design (the "login broker")
 //!
@@ -20,6 +22,25 @@
 //!   redirected to the dashboard. Any other request does nothing, except that
 //!   an expired file deletes itself.
 //! - Each issue also deletes expired files; at most 10 can be outstanding.
+//! ## Joomla design
+//!
+//! Joomla has no CLI login and no must-use plugin directory, so the engine
+//! writes one minimal, self-deleting entry file `wcp-otl-<expiresAt>-<random>.php`
+//! into the Joomla root (as the site user, 0600, tmp + rename), holding only
+//! the token hash, the expiry, the user id and the absolute admin URL. A
+//! request with `?wcp_otl=<token>` is compared with `hash_equals`, the file is
+//! `unlink`ed (atomic: exactly one concurrent request wins; every other one
+//! gets a plain 404), then Joomla's `AdministratorApplication` is booted and,
+//! in `onAfterInitialise`, the official `onUserLogin` / `onUserAfterLogin`
+//! events run for the target user (`core.login.admin`, blocked users refused,
+//! the `joomla` user plugin forks the session and writes `#__session`).
+//! **Joomla multi-factor authentication is not bypassed**: the user lands on
+//! Joomla's own MFA captive page if they have a second factor. The target must
+//! be an unblocked member of a group with `core.admin` (Super Users).
+//! Issue time boots Joomla in CLI to check this and to list super users.
+//! Because the Joomla root is not behind a CLI that knows the public URL, the
+//! request carries `siteUrl` (public base URL, e.g. `https://example.com/`).
+//!
 //! - The link is returned through `secretResult` (`crate::secret_result`):
 //!   only `{adminUserId, adminLogin, issuedAt, expiresAt}` is stored in the
 //!   transaction state and returned by an idempotent replay.
@@ -94,6 +115,53 @@ if (file_put_contents($tmp, (string) $plan['source']) === false) { $say(array('o
 if (!rename($tmp, $dir . '/' . $name)) { @unlink($tmp); $say(array('ok' => false, 'error' => 'cannotWrite')); return; }
 $say(array('ok' => true, 'home' => home_url('/'), 'login' => (string) $user->user_login, 'file' => $name));"#;
 
+/// Boots Joomla's administrator application in CLI (no HTTP, no session
+/// output). The plan arrives on stdin as JSON; `root` is the Joomla root.
+const JOOMLA_BOOT_PHP: &str = r#"$say = function ($v) { echo "\n" . json_encode($v) . "\n"; };
+$plan = json_decode(stream_get_contents(STDIN), true);
+if (!is_array($plan) || !isset($plan['root']) || !is_string($plan['root'])) { $say(array('ok' => false, 'error' => 'badPlan')); return; }
+define('_JEXEC', 1); define('JPATH_BASE', $plan['root']);
+$_SERVER['HTTP_HOST'] = 'localhost';
+if (!is_file(JPATH_BASE . '/includes/framework.php') || !is_file(JPATH_BASE . '/configuration.php')) { $say(array('ok' => false, 'error' => 'notJoomla')); return; }
+require_once JPATH_BASE . '/includes/defines.php';
+require_once JPATH_BASE . '/includes/framework.php';
+$container = \Joomla\CMS\Factory::getContainer();
+$container->alias('session.web', 'session.web.administrator')->alias('session', 'session.web.administrator')->alias('JSession', 'session.web.administrator')->alias(\Joomla\CMS\Session\Session::class, 'session.web.administrator')->alias(\Joomla\Session\Session::class, 'session.web.administrator')->alias(\Joomla\Session\SessionInterface::class, 'session.web.administrator');
+\Joomla\CMS\Factory::$application = $container->get(\Joomla\CMS\Application\AdministratorApplication::class);
+$db = $container->get(\Joomla\Database\DatabaseInterface::class);
+$groups = array();
+foreach ($db->setQuery($db->getQuery(true)->select('id')->from('#__usergroups'))->loadColumn() as $g) { if (\Joomla\CMS\Access\Access::checkGroup((int) $g, 'core.admin')) { $groups[] = (int) $g; } }
+"#;
+
+/// Prints the unblocked super users (groups with `core.admin`).
+const JOOMLA_USERS_PHP: &str = r#"$o = array();
+if ($groups) {
+  $q = $db->getQuery(true)->select('DISTINCT u.id, u.username')->from('#__users AS u')->join('INNER', '#__user_usergroup_map AS m ON m.user_id = u.id')->where('u.block = 0')->where('m.group_id IN (' . implode(',', $groups) . ')')->order('u.id')->setLimit(51);
+  foreach ($db->setQuery($q)->loadAssocList() as $r) { $o[] = array('id' => (int) $r['id'], 'login' => (string) $r['username']); }
+}
+$say(array('ok' => true, 'users' => $o));"#;
+
+/// Validates the super user, removes expired entry files, writes the new one
+/// atomically and prints `{ok, login, file}`. Fixed text.
+const JOOMLA_LOGIN_PHP: &str = r#"if (!isset($plan['userId'], $plan['name'], $plan['source']) || !preg_match('/^wcp-otl-\d+-[0-9a-f]{16}\.php$/', (string) $plan['name'])) { $say(array('ok' => false, 'error' => 'badPlan')); return; }
+$q = $db->getQuery(true)->select('id, username, block')->from('#__users')->where('id = ' . (int) $plan['userId']);
+$u = $db->setQuery($q)->loadAssoc();
+if (!$u) { $say(array('ok' => false, 'error' => 'notFound')); return; }
+if ((int) $u['block'] !== 0) { $say(array('ok' => false, 'error' => 'notAdmin')); return; }
+$isAdmin = false;
+foreach ($db->setQuery($db->getQuery(true)->select('group_id')->from('#__user_usergroup_map')->where('user_id = ' . (int) $u['id']))->loadColumn() as $g) { if (in_array((int) $g, $groups, true)) { $isAdmin = true; } }
+if (!$isAdmin) { $say(array('ok' => false, 'error' => 'notAdmin')); return; }
+$dir = JPATH_BASE; $now = time(); $active = 0;
+foreach ((array) glob($dir . '/wcp-otl-*.php') as $f) {
+  if (preg_match('/^wcp-otl-(\d+)-[0-9a-f]{16}\.php$/', basename($f), $m)) { if ((int) $m[1] <= $now) { @unlink($f); } else { $active++; } }
+}
+if ($active >= 10) { $say(array('ok' => false, 'error' => 'busy')); return; }
+$tmp = $dir . '/.' . $plan['name'] . '.tmp';
+if (file_put_contents($tmp, (string) $plan['source']) === false) { $say(array('ok' => false, 'error' => 'cannotWrite')); return; }
+@chmod($tmp, 0600);
+if (!rename($tmp, $dir . '/' . $plan['name'])) { @unlink($tmp); $say(array('ok' => false, 'error' => 'cannotWrite')); return; }
+$say(array('ok' => true, 'login' => (string) $u['username'], 'file' => $plan['name']));"#;
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct UsersPlan {
@@ -102,6 +170,7 @@ struct UsersPlan {
     root: String,
     uid: u32,
     gid: u32,
+    site_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -112,6 +181,7 @@ struct LoginPlan {
     root: String,
     uid: u32,
     gid: u32,
+    site_url: Option<String>,
     admin_user_id: u64,
     ttl_seconds: Option<u64>,
 }
@@ -124,6 +194,9 @@ pub enum RequestError {
     InvalidContainer,
     InvalidUserId,
     InvalidTtl,
+    InvalidSiteUrl,
+    /// Joomla needs the public base URL to build the link.
+    SiteUrlRequired,
     InvalidRequestId,
     InvalidIdempotencyKey,
     /// `site.adminLogin` mutates and must be replay-safe.
@@ -134,8 +207,12 @@ impl RequestError {
     pub const fn message(self) -> &'static str {
         match self {
             Self::UnsupportedCms => {
-                "one-time admin login is only implemented for WordPress (cms \"wordpress\")"
+                "one-time admin login is implemented for WordPress and Joomla (cms \"wordpress\", \"joomla\"), not for this CMS"
             }
+            Self::InvalidSiteUrl => {
+                "siteUrl must be an http(s) base URL without query, fragment or credentials"
+            }
+            Self::SiteUrlRequired => "siteUrl is required for Joomla",
             Self::IdempotencyKeyRequired => "site.adminLogin requires an idempotency key",
             Self::InvalidTtl => "ttlSeconds must be between 60 and 600",
             _ => "request-file is not a valid site admin plan",
@@ -143,11 +220,52 @@ impl RequestError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Cms {
+    WordPress,
+    Joomla,
+}
+
 struct Target {
+    cms: Cms,
+    site_url: Option<String>,
     container: ContainerName,
     root: PathBuf,
     uid: u32,
     gid: u32,
+}
+
+/// A public base URL: scheme, host, optional port and plain path. It is
+/// embedded in a PHP string and in the returned link, so the charset is
+/// closed. Always ends with `/`.
+fn base_url(value: &str) -> Option<String> {
+    let rest = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))?;
+    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
+    let host_ok = !authority.is_empty()
+        && authority.len() <= 255
+        && authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+        && authority.matches(':').count() <= 1;
+    let path_ok = path.len() <= 1024
+        && path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'%' | b'/' | b'-'))
+        && !path.split('/').any(|part| part == "..");
+    if !host_ok || !path_ok || value.len() > MAX_HOME_BYTES {
+        return None;
+    }
+    let scheme_len = value.len() - rest.len();
+    let mut out = format!("{}{}/", &value[..scheme_len], authority);
+    if !path.is_empty() {
+        out.push_str(path);
+        if !path.ends_with('/') {
+            out.push('/');
+        }
+    }
+    Some(out)
 }
 
 fn target(
@@ -156,9 +274,20 @@ fn target(
     root: String,
     uid: u32,
     gid: u32,
+    site_url: Option<String>,
+    need_url: bool,
 ) -> Result<Target, RequestError> {
-    if cms != "wordpress" {
-        return Err(RequestError::UnsupportedCms);
+    let cms = match cms {
+        "wordpress" => Cms::WordPress,
+        "joomla" => Cms::Joomla,
+        _ => return Err(RequestError::UnsupportedCms),
+    };
+    let site_url = match site_url {
+        Some(value) => Some(base_url(&value).ok_or(RequestError::InvalidSiteUrl)?),
+        None => None,
+    };
+    if cms == Cms::Joomla && need_url && site_url.is_none() {
+        return Err(RequestError::SiteUrlRequired);
     }
     let root = PathBuf::from(root);
     if !root.is_absolute()
@@ -170,6 +299,8 @@ fn target(
         return Err(RequestError::InvalidRoot);
     }
     Ok(Target {
+        cms,
+        site_url,
         container: ContainerName::parse(container)
             .map_err(|_: RestoreRequestError| RequestError::InvalidContainer)?,
         root,
@@ -179,7 +310,21 @@ fn target(
 }
 
 impl Target {
-    fn wp_eval(&self, php: &str) -> Vec<String> {
+    /// `docker exec` argv that runs `php` inside the site's container as the
+    /// site user: `wp eval` for WordPress, `php -r` for Joomla.
+    fn exec_php(&self, php: &str) -> Vec<String> {
+        if self.cms == Cms::Joomla {
+            return vec![
+                "exec".to_owned(),
+                "-i".to_owned(),
+                "--user".to_owned(),
+                format!("{}:{}", self.uid, self.gid),
+                self.container.as_str().to_owned(),
+                "php".to_owned(),
+                "-r".to_owned(),
+                php.to_owned(),
+            ];
+        }
         vec![
             "exec".to_owned(),
             "-i".to_owned(),
@@ -203,7 +348,15 @@ impl UsersRequest {
     pub fn parse(json: &str) -> Result<Self, RequestError> {
         let plan: UsersPlan = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
         Ok(Self {
-            target: target(&plan.cms, &plan.container, plan.root, plan.uid, plan.gid)?,
+            target: target(
+                &plan.cms,
+                &plan.container,
+                plan.root,
+                plan.uid,
+                plan.gid,
+                plan.site_url,
+                false,
+            )?,
         })
     }
 
@@ -223,7 +376,15 @@ pub struct LoginRequest {
 impl LoginRequest {
     pub fn parse(json: &str, request_id: &str, key: Option<&str>) -> Result<Self, RequestError> {
         let plan: LoginPlan = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
-        let target = target(&plan.cms, &plan.container, plan.root, plan.uid, plan.gid)?;
+        let target = target(
+            &plan.cms,
+            &plan.container,
+            plan.root,
+            plan.uid,
+            plan.gid,
+            plan.site_url,
+            true,
+        )?;
         if plan.admin_user_id == 0 || plan.admin_user_id > u64::from(u32::MAX) {
             return Err(RequestError::InvalidUserId);
         }
@@ -420,6 +581,68 @@ defined('ABSPATH') || exit;
     )
 }
 
+/// The Joomla entry file. Only a hash, a timestamp, a user id and the
+/// validated admin URL are interpolated, each from a closed charset. Any
+/// request that does not carry the right token gets a plain 404 and leaves the
+/// file alone; the right token deletes the file first (atomic), so only one
+/// concurrent request can continue.
+pub fn joomla_entry_source(hash: &str, expires_at: u64, user_id: u64, admin_url: &str) -> String {
+    assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(!admin_url.contains(['\'', '\\', '\n']));
+    format!(
+        r#"<?php
+// Generated by operations-engine (site.adminLogin). One-time Joomla administrator
+// login: valid until {expires_at}, deletes itself on use or expiry. Safe to delete.
+(static function () {{
+    $hash = '{hash}'; $expires = {expires_at}; $user_id = {user_id}; $admin = '{admin_url}';
+    $notfound = static function () {{ http_response_code(404); header('Content-Type: text/plain'); echo 'Not found'; exit; }};
+    if (time() >= $expires) {{ @unlink(__FILE__); $notfound(); }}
+    $token = isset($_GET['{TOKEN_PARAMETER}']) ? $_GET['{TOKEN_PARAMETER}'] : null;
+    if (!is_string($token) || !preg_match('/^[0-9a-f]{{64}}$/', $token)) {{ $notfound(); }}
+    if (!hash_equals($hash, hash('sha256', $token))) {{ $notfound(); }}
+    if (!@unlink(__FILE__)) {{ $notfound(); }}
+    $deny = static function () {{ http_response_code(403); header('Content-Type: text/plain'); echo 'This login link is not valid.'; exit; }};
+    try {{
+        define('_JEXEC', 1);
+        define('JPATH_BASE', __DIR__ . '/administrator');
+        require_once JPATH_BASE . '/includes/defines.php';
+        require_once JPATH_BASE . '/includes/framework.php';
+        $container = \Joomla\CMS\Factory::getContainer();
+        $container->alias('session.web', 'session.web.administrator')
+            ->alias('session', 'session.web.administrator')
+            ->alias('JSession', 'session.web.administrator')
+            ->alias(\Joomla\CMS\Session\Session::class, 'session.web.administrator')
+            ->alias(\Joomla\Session\Session::class, 'session.web.administrator')
+            ->alias(\Joomla\Session\SessionInterface::class, 'session.web.administrator');
+        $app = $container->get(\Joomla\CMS\Application\AdministratorApplication::class);
+        \Joomla\CMS\Factory::$application = $app;
+        $app->getDispatcher()->addListener('onAfterInitialise', static function () use ($app, $user_id, $admin, $deny) {{
+            $user = \Joomla\CMS\User\User::getInstance($user_id);
+            if (!$user->id || (int) $user->block !== 0 || !$user->authorise('core.admin')) {{ $deny(); }}
+            $dispatcher = $app->getDispatcher();
+            \Joomla\CMS\Plugin\PluginHelper::importPlugin('user', null, true, $dispatcher);
+            $response = new \Joomla\CMS\Authentication\AuthenticationResponse();
+            $response->status = \Joomla\CMS\Authentication\Authentication::STATUS_SUCCESS;
+            $response->type = 'Joomla'; $response->username = $user->username; $response->fullname = $user->name; $response->email = $user->email;
+            $options = array('action' => 'core.login.admin', 'group' => 'Public Backend', 'autoregister' => false, 'remember' => false);
+            $login = new \Joomla\CMS\Event\User\LoginEvent('onUserLogin', array('subject' => (array) $response, 'options' => $options));
+            $dispatcher->dispatch('onUserLogin', $login);
+            if (in_array(false, $login['result'] ?? array(), true)) {{ $deny(); }}
+            $options['user'] = \Joomla\CMS\Factory::getUser(); $options['responseType'] = 'Joomla';
+            $dispatcher->dispatch('onUserAfterLogin', new \Joomla\CMS\Event\User\AfterLoginEvent('onUserAfterLogin', array('options' => $options, 'subject' => (array) $response)));
+            header('Cache-Control: no-store'); header('Referrer-Policy: no-referrer');
+            $app->redirect($admin);
+        }}, \Joomla\Event\Priority::MAX);
+        $app->execute();
+    }} catch (\Throwable $e) {{
+        $deny();
+    }}
+    exit;
+}})();
+"#
+    )
+}
+
 /// The last non-empty stdout line, parsed as JSON (WordPress may print
 /// notices before it).
 fn last_json(bytes: &[u8]) -> Result<serde_json::Value, Error> {
@@ -432,14 +655,14 @@ fn last_json(bytes: &[u8]) -> Result<serde_json::Value, Error> {
     serde_json::from_str(line).map_err(|_| Error::BadOutput)
 }
 
-fn run_wp(
+fn run_php(
     ctx: &Context<'_>,
     target: &Target,
     php: &str,
     stdin: Option<&[u8]>,
     cancel: &CancellationToken,
 ) -> Result<serde_json::Value, Error> {
-    let args = target.wp_eval(php);
+    let args = target.exec_php(php);
     let request = ProcessRequest::new(ctx.docker_program).args(&args);
     let limits = ProcessLimits {
         timeout: TIMEOUT,
@@ -476,7 +699,18 @@ pub fn list_users(
     req: &UsersRequest,
     cancel: &CancellationToken,
 ) -> Result<AdminUsersResult, Error> {
-    let answer = run_wp(ctx, &req.target, USERS_PHP, None, cancel)?;
+    let answer = match req.target.cms {
+        Cms::WordPress => run_php(ctx, &req.target, USERS_PHP, None, cancel)?,
+        Cms::Joomla => {
+            let plan = serde_json::to_vec(&serde_json::json!({ "root": req.target.root }))
+                .map_err(|_| Error::BadOutput)?;
+            let php = format!("{JOOMLA_BOOT_PHP}{JOOMLA_USERS_PHP}");
+            run_php(ctx, &req.target, &php, Some(&plan), cancel)?
+        }
+    };
+    if answer.get("ok").and_then(|value| value.as_bool()) != Some(true) {
+        return Err(Error::BadOutput);
+    }
     let rows = answer
         .get("users")
         .and_then(|value| value.as_array())
@@ -559,13 +793,40 @@ pub fn issue_login(
     let token = new_token();
     let issued_at = now_secs();
     let expires_at = issued_at + req.ttl_seconds;
-    let plan = serde_json::json!({
-        "userId": req.admin_user_id,
-        "expires": expires_at,
-        "source": mu_plugin_source(&token_hash(&token), expires_at, req.admin_user_id),
-    });
+    let hash = token_hash(&token);
+    let (plan, php, entry_file) = match req.target.cms {
+        Cms::WordPress => (
+            serde_json::json!({
+                "userId": req.admin_user_id,
+                "expires": expires_at,
+                "source": mu_plugin_source(&hash, expires_at, req.admin_user_id),
+            }),
+            LOGIN_PHP.to_owned(),
+            None,
+        ),
+        Cms::Joomla => {
+            let site_url = req.target.site_url.as_deref().unwrap_or_default();
+            let name = format!("wcp-otl-{expires_at}-{}", &new_token()[..16]);
+            let name = format!("{name}.php");
+            (
+                serde_json::json!({
+                    "root": req.target.root,
+                    "userId": req.admin_user_id,
+                    "name": name,
+                    "source": joomla_entry_source(
+                        &hash,
+                        expires_at,
+                        req.admin_user_id,
+                        &format!("{site_url}administrator/index.php"),
+                    ),
+                }),
+                format!("{JOOMLA_BOOT_PHP}{JOOMLA_LOGIN_PHP}"),
+                Some(name),
+            )
+        }
+    };
     let plan = serde_json::to_vec(&plan).unwrap();
-    let answer = match run_wp(ctx, &req.target, LOGIN_PHP, Some(&plan), cancel) {
+    let answer = match run_php(ctx, &req.target, &php, Some(&plan), cancel) {
         Ok(value) => value,
         Err(error) => return Err(abort(state, error)),
     };
@@ -583,10 +844,19 @@ pub fn issue_login(
             .unwrap_or("");
         return Err(abort(state, reject(code)));
     }
-    let home = answer
-        .get("home")
-        .and_then(|value| value.as_str())
-        .filter(|value| valid_home(value));
+    let home = match &entry_file {
+        // The Joomla entry file sits in the Joomla root, next to index.php.
+        Some(name) => req
+            .target
+            .site_url
+            .as_deref()
+            .map(|base| format!("{base}{name}")),
+        None => answer
+            .get("home")
+            .and_then(|value| value.as_str())
+            .filter(|value| valid_home(value))
+            .map(str::to_owned),
+    };
     let login = answer
         .get("login")
         .and_then(|value| value.as_str())
