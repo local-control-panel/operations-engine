@@ -182,6 +182,10 @@ fn capabilities_describe_only_implemented_operations() {
     assert_eq!(response["result"]["features"]["mutations"], true);
     assert_eq!(response["result"]["features"]["changeLog"], cfg!(unix));
     assert_eq!(
+        response["result"]["features"]["adminLoginCms"],
+        serde_json::json!(["wordpress", "joomla", "drupal"])
+    );
+    assert_eq!(
         response["result"]["features"]["agentHelpers"],
         serde_json::json!([
             "heartbeat",

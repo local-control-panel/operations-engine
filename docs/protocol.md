@@ -62,7 +62,9 @@ response). The rule, which clients must follow:
 One-time administrator login. Implemented for WordPress (`"cms":
 "wordpress"`), Joomla (`"cms": "joomla"`) and Drupal (`"cms": "drupal"`,
 through the engine-managed Drush). Other kinds are refused with
-`INVALID_INPUT`.
+`INVALID_INPUT`. `capabilities` lists the supported values in
+`features.adminLoginCms`; an engine without that field supports WordPress
+only.
 
 Both take `--request-file`, a root-owned JSON plan:
 `{"cms","container","root","uid","gid"}` plus, for the login,
