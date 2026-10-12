@@ -630,7 +630,7 @@ record. The root-owned request carries `container`, `projectRoot`,
 `severity` (`emergency`, `alert`, `critical`, `error`, `warning`, `notice`,
 `info`, `debug`) and `type` (a Drupal log channel: 1-64 characters of letters,
 digits, space, `.`, `_`, `-`). Unknown fields are rejected. The engine runs
-`drush watchdog:show --format=json --count=N [--severity=..] [--type=..]` as
+`drush watchdog:show --format=json --count=N [--severity=Level] [--type=..]` (Drush matches the capitalised level label and an existing log channel; an unknown `type` makes Drush fail, so the request fails with `SUBPROCESS_FAILED`) as
 the site user and returns `{"entries": [{id, date, type, severity, message,
 truncated?}]}`, newest first. Messages are redacted before they leave the
 engine: URLs lose credentials, query string and fragment (`?[redacted]`),

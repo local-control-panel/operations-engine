@@ -178,7 +178,12 @@ impl Request {
             format!("--count={}", self.count),
         ];
         if let Some(level) = self.severity {
-            args.push(format!("--severity={level}"));
+            // Drush compares against Drupal's capitalised level labels
+            // (`Error`), not the lowercase names the request uses; a
+            // numeric 0 (emergency) would be treated as "no filter".
+            let mut label = level.to_owned();
+            label[..1].make_ascii_uppercase();
+            args.push(format!("--severity={label}"));
         }
         if let Some(channel) = &self.channel {
             args.push(format!("--type={channel}"));
@@ -587,7 +592,7 @@ mod tests {
                 "watchdog:show",
                 "--format=json",
                 "--count=100",
-                "--severity=error",
+                "--severity=Error",
                 "--type=access denied"
             ]
         );
@@ -769,7 +774,7 @@ mod tests {
         assert_eq!(result.entries.len(), 1);
         let argv = fs::read_to_string(work.path().join("argv")).unwrap();
         assert!(argv.starts_with("exec\n--user\n1000:1001\n-w\n/var/www/site\nruntime-1\nsh\n"));
-        assert!(argv.contains("--root=/var/www/site/web\n--no-interaction\nwatchdog:show\n--format=json\n--count=5\n--severity=error\n"));
+        assert!(argv.contains("--root=/var/www/site/web\n--no-interaction\nwatchdog:show\n--format=json\n--count=5\n--severity=Error\n"));
     }
 
     #[test]
