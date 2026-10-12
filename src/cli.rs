@@ -320,6 +320,13 @@ pub enum DrupalCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Read the newest entries of Drupal's database log
+    /// (`drush watchdog:show`): bounded, optionally filtered by severity and
+    /// type, with messages redacted (read-only).
+    Watchdog {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+    },
 }
 
 impl DrupalCommand {
@@ -329,6 +336,7 @@ impl DrupalCommand {
             Self::CronRun { .. } => "drupal.cronRun",
             Self::Maintenance { .. } => "drupal.maintenance",
             Self::InstallDrush { .. } => "drupal.installDrush",
+            Self::Watchdog { .. } => "drupal.watchdog",
         }
     }
 }

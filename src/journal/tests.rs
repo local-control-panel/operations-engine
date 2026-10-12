@@ -790,3 +790,149 @@ fn environment_and_subsite_are_validated_stored_and_filterable() {
         .is_err()
     );
 }
+
+#[test]
+fn every_secret_prefix_word_and_separator_variant_is_rejected() {
+    for text in [
+        "gho_abc",
+        "github_pat_11ABC",
+        "xoxb-123-abc",
+        "xoxp-123-abc",
+        "rotated, ghp_abc123 was used",
+        "API-KEY = x",
+        "apikey:x",
+        "secret \"=x",
+        "passphrase: x",
+        "cookie : x",
+        "credential='x'",
+        "nonce=12",
+        "signature:abc",
+        "private key: x",
+        "BEARER abc",
+        "a=b?c=d",
+        "x &y=1",
+        "see /a?b.c-d_e=1",
+    ] {
+        let err = NewEntry::parse(RawEntry {
+            summary: Some(text),
+            ..raw("site.deploy")
+        })
+        .expect_err(text);
+        assert_eq!(err.message(), "summary is not allowed", "{text}");
+    }
+}
+
+#[test]
+fn ordinary_prose_with_secret_words_or_punctuation_is_kept() {
+    for text in [
+        "Rotated the token and the password",
+        "Why? Because.",
+        "a & b",
+        "price? 5=5",
+        "cookie banner updated",
+        "Updated 3 plugins: akismet, hello",
+        // 31 alphanumerics are below the opaque-run limit.
+        &"a".repeat(31),
+        &"y".repeat(31).replace('y', "Z"),
+    ] {
+        assert!(
+            NewEntry::parse(RawEntry {
+                summary: Some(text),
+                ..raw("site.deploy")
+            })
+            .is_ok(),
+            "{text}"
+        );
+    }
+    // 32 are rejected, and a separator resets the run.
+    assert!(
+        NewEntry::parse(RawEntry {
+            summary: Some(&"a".repeat(32)),
+            ..raw("site.deploy")
+        })
+        .is_err()
+    );
+    assert!(
+        NewEntry::parse(RawEntry {
+            summary: Some(&format!("{} {}", "a".repeat(31), "b".repeat(31))),
+            ..raw("site.deploy")
+        })
+        .is_ok()
+    );
+    // The character limit counts characters, not bytes.
+    let wide = "é".repeat(MAX_SUMMARY_CHARS);
+    assert!(
+        NewEntry::parse(RawEntry {
+            summary: Some(&wide),
+            ..raw("site.deploy")
+        })
+        .is_ok()
+    );
+    assert!(
+        NewEntry::parse(RawEntry {
+            summary: Some(&format!("{wide}é")),
+            ..raw("site.deploy")
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn action_names_error_codes_and_opaque_identifiers_are_strictly_shaped() {
+    for good in [
+        "site.deploy",
+        "cms.adminLogin",
+        "wordpress.updateCore",
+        "db.a.b.c",
+    ] {
+        assert!(NewEntry::parse(raw(good)).is_ok(), "{good}");
+    }
+    let too_long_segment = format!("site.a{}", "b".repeat(24));
+    for bad in [
+        "site",
+        "site.",
+        ".deploy",
+        "site..deploy",
+        "site.a.b.c.d",
+        "Site.deploy",
+        "site.Deploy",
+        "site.1deploy",
+        "site.dep-loy",
+        "site.dep_loy",
+        "unknown.deploy",
+        "",
+        too_long_segment.as_str(),
+    ] {
+        let err = NewEntry::parse(raw(bad)).expect_err(bad);
+        assert_eq!(err.message(), "action is invalid", "{bad}");
+    }
+    for (code, ok) in [
+        ("SITE_NOT_FOUND", true),
+        ("E2", true),
+        ("site_not_found", false),
+        ("BAD-CODE", false),
+        ("", false),
+    ] {
+        let parsed = NewEntry::parse(RawEntry {
+            error_code: Some(code),
+            ..raw("site.deploy")
+        });
+        assert_eq!(parsed.is_ok(), ok, "{code}");
+    }
+    // A target is a bounded identifier; a 40-character base64-like run is a
+    // token in disguise even when every character is otherwise allowed.
+    assert!(
+        NewEntry::parse(RawEntry {
+            target: Some(&"A".repeat(40)),
+            ..raw("site.deploy")
+        })
+        .is_err()
+    );
+    assert!(
+        NewEntry::parse(RawEntry {
+            target: Some("plugin.name_1-2"),
+            ..raw("site.deploy")
+        })
+        .is_ok()
+    );
+}

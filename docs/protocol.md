@@ -622,6 +622,26 @@ recorded, and replay their outcome for a retried request with the same
 idempotency key. The selection is recorded in the engine state root
 (`tools/selection.json`).
 
+## `drupal.watchdog`
+
+`drupal watchdog --request-file F` is read-only: no lock, transaction or audit
+record. The root-owned request carries `container`, `projectRoot`,
+`documentRoot`, `uid`, `gid` and optionally `count` (1-100, default 50),
+`severity` (`emergency`, `alert`, `critical`, `error`, `warning`, `notice`,
+`info`, `debug`) and `type` (a Drupal log channel: 1-64 characters of letters,
+digits, space, `.`, `_`, `-`). Unknown fields are rejected. The engine runs
+`drush watchdog:show --format=json --count=N [--severity=Level] [--type=..]` (Drush matches the capitalised level label and an existing log channel; an unknown `type` makes Drush fail, so the request fails with `SUBPROCESS_FAILED`) as
+the site user and returns `{"entries": [{id, date, type, severity, message,
+truncated?}]}`, newest first. Messages are redacted before they leave the
+engine: URLs lose credentials, query string and fragment (`?[redacted]`),
+`password=`/`token:`/`Bearer ...` values, e-mail addresses, long opaque
+strings and PEM blocks are replaced, markup and control characters removed,
+and a message is cut at 500 characters (`truncated: true`). Hostname, user name,
+referer and location are never returned. Without Drush the error is
+`DEPENDENCY_UNAVAILABLE`; a site without the Database Logging module fails
+with `SUBPROCESS_FAILED`. Advertised in `capabilities.operations` as
+`drupal.watchdog`.
+
 ## `drupal.cacheRebuild`, `drupal.cronRun`, `drupal.maintenance`
 
 `drupal cache-rebuild`, `drupal cron-run` and `drupal maintenance` each accept
