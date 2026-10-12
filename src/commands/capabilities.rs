@@ -22,6 +22,10 @@ struct Features {
     /// `engine.*` and `site.deploy`/`rollback`/`renameManifest`/`unenroll`
     /// operations (`source: "engine"`).
     change_log: bool,
+    /// The `cms` values `site.adminUsers`/`site.adminLogin` accept. Clients
+    /// show the one-time login only for a listed CMS; an engine without this
+    /// field supports WordPress only.
+    admin_login_cms: &'static [&'static str],
 }
 
 /// Every protocol operation this engine implements, as `capabilities`
@@ -170,6 +174,9 @@ pub const OPERATIONS: &[&str] = &[
     "site.adminLogin",
 ];
 
+/// CMS kinds the one-time admin login supports.
+pub const ADMIN_LOGIN_CMS: &[&str] = &["wordpress", "joomla", "drupal"];
+
 pub fn run() -> Result<Response, ResponseBuildError> {
     Response::success(
         "capabilities",
@@ -182,6 +189,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 mutations: true,
                 agent_helpers: crate::agent_lifecycle::AGENT_HELPERS,
                 change_log: cfg!(unix),
+                admin_login_cms: ADMIN_LOGIN_CMS,
             },
         },
     )
