@@ -211,6 +211,11 @@ pub enum Error {
     Cancelled,
     Run(process::ProcessRunError),
     Rejected(SubprocessDiagnostics),
+    /// The Composer step of `installDrush` failed. Kept apart from
+    /// `Rejected` so the message names Composer, not Drush.
+    ComposerFailed(SubprocessDiagnostics),
+    /// Composer added Drush but `drush --version` does not run.
+    DrushDoesNotRun(SubprocessDiagnostics),
     /// Drupal did not report the maintenance mode that was just set.
     StateMismatch,
     /// The engine-managed Composer is not installed on the host.
@@ -225,6 +230,30 @@ pub enum Error {
         code: ErrorCode,
         message: String,
     },
+}
+
+fn subprocess_code(diagnostics: &SubprocessDiagnostics) -> ErrorCode {
+    if diagnostics.timed_out {
+        ErrorCode::Timeout
+    } else if diagnostics.cancelled {
+        ErrorCode::Cancelled
+    } else {
+        ErrorCode::SubprocessFailed
+    }
+}
+
+/// How the child ended, from the runner's own bookkeeping only (never from
+/// what it printed): " (timed out)", " (cancelled)" or " (exit code N)".
+fn outcome_suffix(diagnostics: &SubprocessDiagnostics) -> String {
+    if diagnostics.timed_out {
+        " (timed out)".into()
+    } else if diagnostics.cancelled {
+        " (cancelled)".into()
+    } else if let Some(code) = diagnostics.exit_code {
+        format!(" (exit code {code})")
+    } else {
+        String::new()
+    }
 }
 
 impl Error {
@@ -244,14 +273,25 @@ impl Error {
                 "could not run Drush".into(),
             ),
             Self::Rejected(diagnostics) => (
-                if diagnostics.timed_out {
-                    ErrorCode::Timeout
-                } else if diagnostics.cancelled {
-                    ErrorCode::Cancelled
-                } else {
-                    ErrorCode::SubprocessFailed
-                },
-                "Drush reported an error".into(),
+                subprocess_code(diagnostics),
+                format!("Drush reported an error{}", outcome_suffix(diagnostics)),
+            ),
+            Self::ComposerFailed(diagnostics) => (
+                subprocess_code(diagnostics),
+                format!(
+                    "Composer could not add drush/drush to the project{}. Likely causes: no network \
+                     from the runtime container, or a PHP or package conflict in \
+                     composer.json. Run `composer require drush/drush` in the project \
+                     to see the exact reason",
+                    outcome_suffix(diagnostics)
+                ),
+            ),
+            Self::DrushDoesNotRun(diagnostics) => (
+                subprocess_code(diagnostics),
+                format!(
+                    "Drush was added to the project but does not run{}",
+                    outcome_suffix(diagnostics)
+                ),
             ),
             Self::StateMismatch => (
                 ErrorCode::SubprocessFailed,
@@ -422,13 +462,16 @@ fn install_drush(
         cancel,
     )?;
     if !exited_ok(&output) {
-        return Err(Error::Rejected(SubprocessDiagnostics::from_output(
+        return Err(Error::ComposerFailed(SubprocessDiagnostics::from_output(
             ctx.docker_program,
             &output,
         )));
     }
     // Prove the result works the way later operations will run it.
-    drush(ctx, req, &["--version"], READ_TIMEOUT, cancel)?;
+    drush(ctx, req, &["--version"], READ_TIMEOUT, cancel).map_err(|error| match error {
+        Error::Rejected(diagnostics) => Error::DrushDoesNotRun(diagnostics),
+        other => other,
+    })?;
     Ok(true)
 }
 
@@ -885,6 +928,81 @@ exit 0
         assert_eq!(second.changed, Some(false));
         assert_eq!(recorded.matches("require drush/drush").count(), 1);
         assert_eq!(log(dir.path()).matches("require drush/drush").count(), 1);
+    }
+
+    /// Like `fake_composer_docker`, but the Composer run exits with `code`.
+    fn failing_composer_docker(directory: &std::path::Path, code: i32) -> String {
+        let path = directory.join("fake-docker-failing");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"test -x ./vendor/bin/drush"*) exit 1 ;;
+  *"test -f ./composer.json"*) exit 0 ;;
+  *"composer.phar require drush/drush"*) echo 'SECRET-TOKEN-IN-STDERR' >&2; exit {code} ;;
+esac
+exit 0
+"#
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn a_failing_composer_step_is_reported_as_composer_with_its_exit_code_and_no_output() {
+        let dir = tempfile::tempdir().unwrap();
+        with_composer(dir.path());
+        let docker = failing_composer_docker(dir.path(), 3);
+        let state = managed(dir.path());
+        let tools = dir.path().join("tools");
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: &tools,
+        };
+        let error = execute(
+            &ctx,
+            &request("install-drush", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::ComposerFailed(_)), "{error:?}");
+        let (code, message) = error.protocol();
+        assert_eq!(code, ErrorCode::SubprocessFailed);
+        assert!(message.starts_with("Composer could not add drush/drush"));
+        assert!(message.contains("(exit code 3)"), "{message}");
+        assert!(
+            !message.contains("SECRET"),
+            "what the child printed never reaches the message"
+        );
+    }
+
+    #[test]
+    fn subprocess_outcomes_read_plainly() {
+        let base = SubprocessDiagnostics {
+            program: "docker".into(),
+            exit_code: Some(2),
+            timed_out: false,
+            cancelled: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        assert_eq!(outcome_suffix(&base), " (exit code 2)");
+        let timed_out = SubprocessDiagnostics {
+            exit_code: None,
+            timed_out: true,
+            ..base
+        };
+        assert_eq!(outcome_suffix(&timed_out), " (timed out)");
+        assert_eq!(subprocess_code(&timed_out), ErrorCode::Timeout);
+        let (_, message) = Error::DrushDoesNotRun(timed_out).protocol();
+        assert_eq!(
+            message,
+            "Drush was added to the project but does not run (timed out)"
+        );
     }
 
     #[test]
