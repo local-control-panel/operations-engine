@@ -119,6 +119,7 @@ pub const OPERATIONS: &[&str] = &[
     "drupal.cronRun",
     "drupal.installDrush",
     "drupal.maintenance",
+    "drupal.watchdog",
     "tool.install",
     "tool.remove",
     "tool.status",

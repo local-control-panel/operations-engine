@@ -52,6 +52,80 @@ pub fn run(command: DrupalCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        DrupalCommand::Watchdog { request_file } => watchdog(&request_file),
+    }
+}
+
+fn watchdog(path: &std::path::Path) -> Result<Response, ResponseBuildError> {
+    use crate::drupal_watchdog::{self as wd, OPERATION};
+    #[cfg(unix)]
+    {
+        let config = match crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match wd::Request::parse(&json) {
+            Ok(v) => v,
+            Err(error) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        if !config
+            .content_roots
+            .iter()
+            .any(|root| request.root().starts_with(root.as_path()))
+        {
+            return Ok(Response::failure(
+                OPERATION,
+                ErrorCode::InvalidInput,
+                "Drupal root is outside configured content roots",
+            ));
+        }
+        let context = wd::Context {
+            docker_program: "docker",
+        };
+        match wd::read(
+            &context,
+            &request,
+            &crate::process::CancellationToken::default(),
+        ) {
+            Ok(value) => Response::success(OPERATION, value),
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(OPERATION, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(Response::failure(
+            OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "Drupal actions require a Unix host",
+        ))
     }
 }
 

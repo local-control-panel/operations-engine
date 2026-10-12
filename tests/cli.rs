@@ -124,6 +124,7 @@ fn capabilities_describe_only_implemented_operations() {
             "drupal.cronRun",
             "drupal.installDrush",
             "drupal.maintenance",
+            "drupal.watchdog",
             "tool.install",
             "tool.remove",
             "tool.status",
@@ -581,5 +582,9 @@ fn admin_login_requires_an_idempotency_key_and_never_returns_a_secret_on_failure
 
     let response = journal_failure(&["site", "admin-users", "--request-file", "/nonexistent"]);
     assert_eq!(response["operation"], "site.adminUsers");
+    assert_eq!(response["ok"], false);
+
+    let response = journal_failure(&["drupal", "watchdog", "--request-file", "/nonexistent"]);
+    assert_eq!(response["operation"], "drupal.watchdog");
     assert_eq!(response["ok"], false);
 }

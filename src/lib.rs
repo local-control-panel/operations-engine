@@ -37,6 +37,8 @@ pub mod docker_container;
 pub mod docker_prune;
 pub mod docker_resource;
 pub mod drupal_action;
+#[cfg(unix)]
+pub mod drupal_watchdog;
 pub mod engine;
 pub mod error;
 pub mod failpoint;
