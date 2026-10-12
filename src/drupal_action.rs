@@ -279,9 +279,9 @@ impl Error {
             Self::ComposerFailed(diagnostics) => (
                 subprocess_code(diagnostics),
                 format!(
-                    "Composer could not add drush/drush to the project{}. Likely causes: no network \
-                     from the runtime container, or a PHP or package conflict in \
-                     composer.json. Run `composer require drush/drush` in the project \
+                    "Composer could not add drush/drush to the project{}. Likely causes: the project is \
+                     not writable by the site user, no network from the runtime \
+                     container, or a PHP or package conflict in composer.json. Run `composer require drush/drush` in the project \
                      to see the exact reason",
                     outcome_suffix(diagnostics)
                 ),
