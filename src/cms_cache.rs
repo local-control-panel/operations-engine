@@ -5,13 +5,16 @@
 //! * `laravel`: `php artisan optimize:clear --no-interaction` (the compiled
 //!   files, config, route, view and event caches, and the application cache
 //!   store). Sessions kept in the cache store are cleared with it.
-//! * `joomla`: `php cli/joomla.php cache:clear --no-interaction` (Joomla 4
-//!   and later; the native console command).
+//!
+//! Joomla is deliberately not a kind: its only native console command,
+//! `cache:clean`, cleans just the default cache group and cannot be told to
+//! clean all of them (that needs Joomla's admin UI), so a "clear cache"
+//! button over it would leave page and component caches behind.
 //!
 //! The argv is fixed per kind; the caller supplies only the kind and the
 //! validated container/root/UID/GID. The command runs as the site user, never
 //! root, inside the site's runtime container from the project root, and only
-//! when the CMS entry point (`artisan`, `cli/joomla.php`) exists there. The
+//! when the CMS entry point (`artisan`) exists there. The
 //! result carries no command output. Same lock/idempotency/transaction/audit
 //! as the Drupal actions.
 
@@ -47,14 +50,12 @@ const MAX_OUTPUT: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Kind {
     Laravel,
-    Joomla,
 }
 
 impl Kind {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "laravel" => Some(Self::Laravel),
-            "joomla" => Some(Self::Joomla),
             _ => None,
         }
     }
@@ -62,7 +63,6 @@ impl Kind {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Laravel => "laravel",
-            Self::Joomla => "joomla",
         }
     }
 
@@ -70,14 +70,12 @@ impl Kind {
     const fn entry_point(self) -> &'static str {
         match self {
             Self::Laravel => "./artisan",
-            Self::Joomla => "./cli/joomla.php",
         }
     }
 
     const fn argv(self) -> &'static [&'static str] {
         match self {
             Self::Laravel => &["php", "artisan", "optimize:clear", "--no-interaction"],
-            Self::Joomla => &["php", "cli/joomla.php", "cache:clear", "--no-interaction"],
         }
     }
 }
@@ -167,7 +165,7 @@ pub enum Error {
     ResourceBusy,
     Cancelled,
     Run(process::ProcessRunError),
-    /// The project root has no `artisan` / `cli/joomla.php`.
+    /// The project root has no `artisan`.
     NotThisCms(Kind),
     Rejected(SubprocessDiagnostics),
     PostCommit {
@@ -458,10 +456,13 @@ esac
                 r#"{{"kind":"{kind}","container":"runtime-1","projectRoot":"/var/www/site","uid":1,"gid":1{extra}}}"#
             )
         };
-        assert_eq!(
-            Request::parse(&with("wordpress", ""), ID, None).unwrap_err(),
-            RequestError::InvalidKind
-        );
+        // Joomla's only native command cleans one cache group, so it is not a kind.
+        for kind in ["wordpress", "joomla", "drupal"] {
+            assert_eq!(
+                Request::parse(&with(kind, ""), ID, None).unwrap_err(),
+                RequestError::InvalidKind
+            );
+        }
         assert_eq!(
             Request::parse(&with("laravel", r#","command":"tinker""#), ID, None).unwrap_err(),
             RequestError::InvalidJson
@@ -480,7 +481,7 @@ esac
     }
 
     #[test]
-    fn runs_the_fixed_argv_per_kind_as_the_site_user_and_replays() {
+    fn runs_the_fixed_argv_as_the_site_user_and_replays() {
         let dir = tempfile::tempdir().unwrap();
         let docker = fake_docker(dir.path(), true, false);
         let state = managed(dir.path());
@@ -501,12 +502,6 @@ esac
             replayed.completed_at_unix_secs
         );
         assert_eq!(log(dir.path()).lines().count(), 2, "replay must not re-run");
-
-        let joomla = request("joomla", ID2, None);
-        execute(&ctx, &joomla, &CancellationToken::default()).unwrap();
-        assert!(
-            log(dir.path()).contains("runtime-1 php cli/joomla.php cache:clear --no-interaction")
-        );
     }
 
     #[test]
@@ -520,11 +515,11 @@ esac
         };
         let error = execute(
             &ctx,
-            &request("joomla", ID, None),
+            &request("laravel", ID, None),
             &CancellationToken::default(),
         )
         .unwrap_err();
-        assert!(matches!(error, Error::NotThisCms(Kind::Joomla)));
+        assert!(matches!(error, Error::NotThisCms(Kind::Laravel)));
         assert_eq!(error.protocol().0, ErrorCode::InvalidInput);
         assert_eq!(log(dir.path()).lines().count(), 1, "only the check ran");
     }

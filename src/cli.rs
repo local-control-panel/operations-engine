@@ -362,8 +362,8 @@ impl DrupalCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum CmsCommand {
-    /// Clear the application caches of a Laravel or Joomla project with
-    /// the CMS's own console command (fixed argv, site user).
+    /// Clear the application caches of a Laravel project with artisan's
+    /// own `optimize:clear` (fixed argv, site user).
     ClearCache {
         #[arg(long = "request-file")]
         request_file: PathBuf,

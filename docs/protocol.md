@@ -681,15 +681,16 @@ caller's business: the engine does not toggle maintenance or back up.
 ## `cms.clearCache`
 
 `cms clear-cache` takes a root-owned JSON request `{kind, container,
-projectRoot, uid, gid}` where `kind` is `laravel` or `joomla`; unknown fields
-are rejected. After checking that the entry point exists (`artisan`,
-`cli/joomla.php`; `invalid_input` otherwise) the engine runs a fixed argv as
-the site user inside the site's container from the project root: `php artisan
-optimize:clear --no-interaction` for Laravel (compiled files, config, route,
-view and event caches and the application cache store, so sessions kept in
-the cache store are dropped), `php cli/joomla.php cache:clear
---no-interaction` for Joomla 4 and later. WordPress and Drupal keep
-`wordpress.boundedAction` (`cacheFlush`) and `drupal.cacheRebuild`. Lock,
+projectRoot, uid, gid}` where `kind` is `laravel`; unknown fields and other
+kinds are rejected. After checking that `artisan` exists in the project root
+(`invalid_input` otherwise) the engine runs a fixed argv as the site user
+inside the site's container from the project root: `php artisan optimize:clear
+--no-interaction` (compiled files, config, route, view and event caches and
+the application cache store, so sessions kept in the cache store are dropped).
+WordPress and Drupal keep `wordpress.boundedAction` (`cacheFlush`) and
+`drupal.cacheRebuild`. Joomla is not a kind: its only native console command,
+`cache:clean`, cleans just the default cache group and cannot be told to clean
+all of them, so it would leave page and component caches behind. Lock,
 idempotency, transaction and audit as for the Drupal actions; the result is
 `{kind, completedAtUnixSecs}` with no command output. Advertised as
 `cms.clearCache`.
