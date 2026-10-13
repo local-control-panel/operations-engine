@@ -626,9 +626,10 @@ idempotency key. The selection is recorded in the engine state root
 
 `drupal watchdog --request-file F` is read-only: no lock, transaction or audit
 record. The root-owned request carries `container`, `projectRoot`,
-`documentRoot`, `uid`, `gid` and optionally `count` (1-100, default 50),
+`documentRoot`, `uid`, `gid` and optionally `count` (1-200, default 50),
 `severity` (`emergency`, `alert`, `critical`, `error`, `warning`, `notice`,
-`info`, `debug`) and `type` (a Drupal log channel: 1-64 characters of letters,
+`info`, `debug`; exactly that level) or `severityMin` (the same names; that
+level and every more severe one, `--severity-min`; not both) and `type` (a Drupal log channel: 1-64 characters of letters,
 digits, space, `.`, `_`, `-`). Unknown fields are rejected. The engine runs
 `drush watchdog:show --format=json --count=N [--severity=Level] [--type=..]` (Drush matches the capitalised level label and an existing log channel; an unknown `type` makes Drush fail, so the request fails with `SUBPROCESS_FAILED`) as
 the site user and returns `{"entries": [{id, date, type, severity, message,
