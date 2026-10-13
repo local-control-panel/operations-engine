@@ -626,9 +626,10 @@ idempotency key. The selection is recorded in the engine state root
 
 `drupal watchdog --request-file F` is read-only: no lock, transaction or audit
 record. The root-owned request carries `container`, `projectRoot`,
-`documentRoot`, `uid`, `gid` and optionally `count` (1-100, default 50),
+`documentRoot`, `uid`, `gid` and optionally `count` (1-200, default 50),
 `severity` (`emergency`, `alert`, `critical`, `error`, `warning`, `notice`,
-`info`, `debug`) and `type` (a Drupal log channel: 1-64 characters of letters,
+`info`, `debug`; exactly that level) or `severityMin` (the same names; that
+level and every more severe one, `--severity-min`; not both) and `type` (a Drupal log channel: 1-64 characters of letters,
 digits, space, `.`, `_`, `-`). Unknown fields are rejected. The engine runs
 `drush watchdog:show --format=json --count=N [--severity=Level] [--type=..]` (Drush matches the capitalised level label and an existing log channel; an unknown `type` makes Drush fail, so the request fails with `SUBPROCESS_FAILED`) as
 the site user and returns `{"entries": [{id, date, type, severity, message,
@@ -662,6 +663,37 @@ bounded and the response carries no Drush output, only the action, the
 maintenance mode read back (for `maintenance`) and the completion time. The
 operations are transaction/audit recorded and replay their outcome for a
 retried request with the same idempotency key.
+
+## `drupal.updateDb`
+
+`drupal update-db` takes the same request as the other Drupal actions
+(without `state`). Under the per-site lock the engine first runs `drush
+updatedb:status --format=json` as the site user. When no update is pending it
+stops there (`changed: false`, `updatesPending: 0`): nothing is mutated. When
+updates are pending it runs `drush updatedb --no-interaction` (30 minute
+limit) and reads `updatedb:status` again; the request fails with
+`SUBPROCESS_FAILED` if any update is still listed. Status output that is not
+a JSON list or object is refused rather than guessed at. The result carries
+`changed`, `updatesPending` (before) and `updatesRemaining` (after, `0` on
+success) and no Drush output. Maintenance mode and the backup are the
+caller's business: the engine does not toggle maintenance or back up.
+
+## `cms.clearCache`
+
+`cms clear-cache` takes a root-owned JSON request `{kind, container,
+projectRoot, uid, gid}` where `kind` is `laravel`; unknown fields and other
+kinds are rejected. After checking that `artisan` exists in the project root
+(`invalid_input` otherwise) the engine runs a fixed argv as the site user
+inside the site's container from the project root: `php artisan optimize:clear
+--no-interaction` (compiled files, config, route, view and event caches and
+the application cache store, so sessions kept in the cache store are dropped).
+WordPress and Drupal keep `wordpress.boundedAction` (`cacheFlush`) and
+`drupal.cacheRebuild`. Joomla is not a kind: its only native console command,
+`cache:clean`, cleans just the default cache group and cannot be told to clean
+all of them, so it would leave page and component caches behind. Lock,
+idempotency, transaction and audit as for the Drupal actions; the result is
+`{kind, completedAtUnixSecs}` with no command output. Advertised as
+`cms.clearCache`.
 
 ## `drupal.installDrush`
 

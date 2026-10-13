@@ -19,6 +19,7 @@ pub mod backup_install_rclone;
 pub mod backup_schedule;
 pub mod backup_trigger;
 pub mod cli;
+pub mod cms_cache;
 pub mod commands;
 pub mod compose;
 #[cfg(unix)]
@@ -135,6 +136,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Permissions { command } => commands::permissions::run(command),
         Command::Wordpress { command } => commands::wordpress::run(command),
         Command::Drupal { command } => commands::drupal::run(command),
+        Command::Cms { command } => commands::cms::run(command),
         Command::Tool { command } => commands::tool::run(command),
         Command::Agent { command } => commands::agent::run(command),
         Command::System { command } => commands::system::run(command),

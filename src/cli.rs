@@ -105,6 +105,13 @@ pub enum Command {
         command: DrupalCommand,
     },
 
+    /// Typed CMS application operations that are not tied to one CMS's own
+    /// command group.
+    Cms {
+        #[command(subcommand)]
+        command: CmsCommand,
+    },
+
     /// Host-managed tools (pinned, SHA-256-verified) mounted into runtime
     /// containers.
     Tool {
@@ -158,6 +165,7 @@ impl Command {
             Self::Permissions { command } => command.operation(),
             Self::Wordpress { command } => command.operation(),
             Self::Drupal { command } => command.operation(),
+            Self::Cms { command } => command.operation(),
             Self::Tool { command } => command.operation(),
             Self::Agent { command } => command.operation(),
             Self::System { command } => command.operation(),
@@ -310,6 +318,16 @@ pub enum DrupalCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Apply pending database updates (`drush updatedb`) when
+    /// `updatedb:status` lists any, and verify none remain.
+    UpdateDb {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Turn maintenance mode on or off (explicit `state` in the request)
     /// and verify the mode Drupal reports afterwards.
     Maintenance {
@@ -336,7 +354,30 @@ impl DrupalCommand {
             Self::CronRun { .. } => "drupal.cronRun",
             Self::Maintenance { .. } => "drupal.maintenance",
             Self::InstallDrush { .. } => "drupal.installDrush",
+            Self::UpdateDb { .. } => "drupal.updateDb",
             Self::Watchdog { .. } => "drupal.watchdog",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CmsCommand {
+    /// Clear the application caches of a Laravel project with artisan's
+    /// own `optimize:clear` (fixed argv, site user).
+    ClearCache {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl CmsCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::ClearCache { .. } => "cms.clearCache",
         }
     }
 }

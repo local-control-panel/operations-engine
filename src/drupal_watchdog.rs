@@ -2,7 +2,7 @@
 //! database log (`drush watchdog:show`).
 //!
 //! The Drush argv is fixed: `watchdog:show --format=json --count=N` plus an
-//! optional `--severity=<level name>` and `--type=<channel>`. The only
+//! optional `--severity=<level name>` (or `--severity-min=`) and `--type=<channel>`. The only
 //! caller-controlled values are a count (1..=100), one of eight severity
 //! names and a short channel name from a closed charset; each is a single
 //! argv element and nothing goes through a shell. Drush runs as the site
@@ -32,7 +32,7 @@ use std::{path::PathBuf, time::Duration};
 pub const OPERATION: &str = "drupal.watchdog";
 
 pub const DEFAULT_COUNT: u32 = 50;
-pub const MAX_COUNT: u32 = 100;
+pub const MAX_COUNT: u32 = 200;
 pub const MAX_MESSAGE_CHARS: usize = 500;
 const MAX_TYPE_LEN: usize = 64;
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -62,6 +62,8 @@ struct Plan {
     gid: u32,
     count: Option<u32>,
     severity: Option<String>,
+    /// At least this severe (`--severity-min`); exclusive with `severity`.
+    severity_min: Option<String>,
     #[serde(rename = "type")]
     channel: Option<String>,
 }
@@ -75,6 +77,7 @@ pub struct Request {
     gid: u32,
     count: u32,
     severity: Option<&'static str>,
+    severity_min: Option<&'static str>,
     channel: Option<String>,
 }
 
@@ -96,9 +99,9 @@ impl RequestError {
                 "projectRoot and documentRoot must be plain absolute paths, documentRoot inside projectRoot"
             }
             Self::InvalidContainer => "container is not a valid container name",
-            Self::InvalidCount => "count must be between 1 and 100",
+            Self::InvalidCount => "count must be between 1 and 200",
             Self::InvalidSeverity => {
-                "severity must be one of emergency, alert, critical, error, warning, notice, info, debug"
+                "severity and severityMin must each be one of emergency, alert, critical, error, warning, notice, info, debug, and not both"
             }
             Self::InvalidType => {
                 "type must be 1-64 characters of letters, digits, space, dot, underscore or hyphen"
@@ -141,16 +144,22 @@ impl Request {
         if !(1..=MAX_COUNT).contains(&count) {
             return Err(RequestError::InvalidCount);
         }
-        let severity = match plan.severity.as_deref() {
-            None => None,
-            Some(value) => Some(
-                SEVERITIES
+        let level = |value: Option<&str>| -> Result<Option<&'static str>, RequestError> {
+            match value {
+                None => Ok(None),
+                Some(value) => SEVERITIES
                     .iter()
                     .copied()
                     .find(|level| *level == value)
-                    .ok_or(RequestError::InvalidSeverity)?,
-            ),
+                    .map(Some)
+                    .ok_or(RequestError::InvalidSeverity),
+            }
         };
+        let severity = level(plan.severity.as_deref())?;
+        let severity_min = level(plan.severity_min.as_deref())?;
+        if severity.is_some() && severity_min.is_some() {
+            return Err(RequestError::InvalidSeverity);
+        }
         if plan.channel.as_deref().is_some_and(|v| !valid_channel(v)) {
             return Err(RequestError::InvalidType);
         }
@@ -163,6 +172,7 @@ impl Request {
             gid: plan.gid,
             count,
             severity,
+            severity_min,
             channel: plan.channel,
         })
     }
@@ -184,6 +194,11 @@ impl Request {
             let mut label = level.to_owned();
             label[..1].make_ascii_uppercase();
             args.push(format!("--severity={label}"));
+        }
+        if let Some(level) = self.severity_min {
+            let mut label = level.to_owned();
+            label[..1].make_ascii_uppercase();
+            args.push(format!("--severity-min={label}"));
         }
         if let Some(channel) = &self.channel {
             args.push(format!("--type={channel}"));
@@ -583,7 +598,7 @@ mod tests {
             ["watchdog:show", "--format=json", "--count=50"]
         );
         let full = Request::parse(&plan_with(
-            r#""count":100,"severity":"error","type":"access denied""#,
+            r#""count":200,"severity":"error","type":"access denied""#,
         ))
         .unwrap();
         assert_eq!(
@@ -591,7 +606,7 @@ mod tests {
             [
                 "watchdog:show",
                 "--format=json",
-                "--count=100",
+                "--count=200",
                 "--severity=Error",
                 "--type=access denied"
             ]
@@ -604,7 +619,22 @@ mod tests {
             );
         };
         check(r#""count":0"#, RequestError::InvalidCount);
-        check(r#""count":101"#, RequestError::InvalidCount);
+        check(r#""count":201"#, RequestError::InvalidCount);
+        check(
+            r#""severity":"error","severityMin":"warning""#,
+            RequestError::InvalidSeverity,
+        );
+        check(r#""severityMin":"Warning""#, RequestError::InvalidSeverity);
+        let min = Request::parse(&plan_with(r#""severityMin":"warning""#)).unwrap();
+        assert_eq!(
+            min.drush_args(),
+            [
+                "watchdog:show",
+                "--format=json",
+                "--count=50",
+                "--severity-min=Warning"
+            ]
+        );
         check(r#""severity":"Error""#, RequestError::InvalidSeverity);
         check(r#""severity":"--root=/""#, RequestError::InvalidSeverity);
         check(r#""type":"""#, RequestError::InvalidType);

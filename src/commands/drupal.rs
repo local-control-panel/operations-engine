@@ -41,6 +41,17 @@ pub fn run(command: DrupalCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        DrupalCommand::UpdateDb {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => action(
+            "update-db",
+            drupal_action::UPDATE_DB,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         DrupalCommand::Maintenance {
             request_file,
             request_id,
