@@ -44,6 +44,7 @@ pub const CACHE_REBUILD: &str = "drupal.cacheRebuild";
 pub const CRON_RUN: &str = "drupal.cronRun";
 pub const MAINTENANCE: &str = "drupal.maintenance";
 pub const INSTALL_DRUSH: &str = "drupal.installDrush";
+pub const UPDATE_DB: &str = "drupal.updateDb";
 
 /// Path of the engine-managed Composer inside runtime containers (the tools
 /// directory is mounted read-only at `/opt/wcp-tools`).
@@ -55,6 +56,9 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// Drush's `cache:rebuild` and `core:cron` can legitimately take minutes on a
 /// large site; anything longer is a hang.
 const RUN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Database updates (`hook_update_N`, post-updates) can legitimately run
+/// long on a big site.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_OUTPUT: usize = 64 * 1024;
 
@@ -64,6 +68,7 @@ pub enum Action {
     CronRun,
     Maintenance { enabled: bool },
     InstallDrush,
+    UpdateDb,
 }
 
 impl Action {
@@ -73,6 +78,7 @@ impl Action {
             Self::CronRun => CRON_RUN,
             Self::Maintenance { .. } => MAINTENANCE,
             Self::InstallDrush => INSTALL_DRUSH,
+            Self::UpdateDb => UPDATE_DB,
         }
     }
 
@@ -82,6 +88,7 @@ impl Action {
             Self::CronRun => "cronRun",
             Self::Maintenance { .. } => "maintenance",
             Self::InstallDrush => "installDrush",
+            Self::UpdateDb => "updateDb",
         }
     }
 }
@@ -148,6 +155,7 @@ impl Request {
             ("cache-rebuild", None) => Action::CacheRebuild,
             ("cron-run", None) => Action::CronRun,
             ("install-drush", None) => Action::InstallDrush,
+            ("update-db", None) => Action::UpdateDb,
             ("maintenance", Some("on")) => Action::Maintenance { enabled: true },
             ("maintenance", Some("off")) => Action::Maintenance { enabled: false },
             _ => return Err(RequestError::InvalidState),
@@ -192,6 +200,14 @@ pub struct ActionResult {
     /// For `installDrush`: `false` when the project already had Drush.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed: Option<bool>,
+    /// For `updateDb`: how many database updates `updatedb:status` listed
+    /// before the run (`0` means nothing was run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates_pending: Option<u32>,
+    /// For `updateDb`: how many were still listed after the run (`0` on
+    /// success; the request fails otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updates_remaining: Option<u32>,
     pub completed_at_unix_secs: u64,
 }
 
@@ -218,6 +234,11 @@ pub enum Error {
     DrushDoesNotRun(SubprocessDiagnostics),
     /// Drupal did not report the maintenance mode that was just set.
     StateMismatch,
+    /// `updatedb:status` printed something that is not the JSON list of
+    /// pending updates, so the engine does not run an update blind.
+    UpdateStatusUnreadable,
+    /// Updates were still listed after `updatedb` finished.
+    UpdatesRemain(u32),
     /// The engine-managed Composer is not installed on the host.
     ComposerMissing,
     /// The project root has no `composer.json`: Drush is installed per
@@ -296,6 +317,14 @@ impl Error {
             Self::StateMismatch => (
                 ErrorCode::SubprocessFailed,
                 "Drupal did not report the requested maintenance mode".into(),
+            ),
+            Self::UpdateStatusUnreadable => (
+                ErrorCode::SubprocessFailed,
+                "Drush did not report the pending database updates in a readable form".into(),
+            ),
+            Self::UpdatesRemain(count) => (
+                ErrorCode::SubprocessFailed,
+                format!("{count} database update(s) are still pending after the run"),
             ),
             Self::ComposerMissing => (
                 ErrorCode::DependencyUnavailable,
@@ -483,15 +512,92 @@ fn maintenance_flag(bytes: &[u8]) -> Option<bool> {
     }
 }
 
+/// What one action reports besides its name.
+#[derive(Default)]
+struct Outcome {
+    maintenance_mode: Option<bool>,
+    changed: Option<bool>,
+    updates_pending: Option<u32>,
+    updates_remaining: Option<u32>,
+}
+
+/// Number of pending updates in `drush updatedb:status --format=json`
+/// output: empty output and an empty list/object mean none, a JSON array or
+/// object counts its entries, anything else is unreadable.
+fn pending_updates(bytes: &[u8]) -> Option<u32> {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(0);
+    }
+    match serde_json::from_str::<serde_json::Value>(text).ok()? {
+        serde_json::Value::Array(items) => u32::try_from(items.len()).ok(),
+        serde_json::Value::Object(items) => u32::try_from(items.len()).ok(),
+        serde_json::Value::Null => Some(0),
+        _ => None,
+    }
+}
+
+fn update_status(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<u32, Error> {
+    let bytes = drush(
+        ctx,
+        req,
+        &["updatedb:status", "--format=json"],
+        READ_TIMEOUT,
+        cancel,
+    )?;
+    pending_updates(&bytes).ok_or(Error::UpdateStatusUnreadable)
+}
+
+/// `updatedb:status` first; nothing is run when nothing is pending. After
+/// `updatedb` the status is read again and must be empty.
+fn update_db(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<Outcome, Error> {
+    let pending = update_status(ctx, req, cancel)?;
+    if pending == 0 {
+        return Ok(Outcome {
+            changed: Some(false),
+            updates_pending: Some(0),
+            updates_remaining: Some(0),
+            ..Outcome::default()
+        });
+    }
+    drush(ctx, req, &["updatedb"], UPDATE_TIMEOUT, cancel)?;
+    let remaining = update_status(ctx, req, cancel)?;
+    if remaining > 0 {
+        return Err(Error::UpdatesRemain(remaining));
+    }
+    Ok(Outcome {
+        changed: Some(true),
+        updates_pending: Some(pending),
+        updates_remaining: Some(0),
+        ..Outcome::default()
+    })
+}
+
 fn run_action(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
-) -> Result<(Option<bool>, Option<bool>), Error> {
-    if req.action == Action::InstallDrush {
-        return install_drush(ctx, req, cancel).map(|changed| (None, Some(changed)));
+) -> Result<Outcome, Error> {
+    match req.action {
+        Action::InstallDrush => install_drush(ctx, req, cancel).map(|changed| Outcome {
+            changed: Some(changed),
+            ..Outcome::default()
+        }),
+        Action::UpdateDb => update_db(ctx, req, cancel),
+        _ => run_drush_action(ctx, req, cancel).map(|maintenance_mode| Outcome {
+            maintenance_mode,
+            ..Outcome::default()
+        }),
     }
-    run_drush_action(ctx, req, cancel).map(|mode| (mode, None))
 }
 
 fn run_drush_action(
@@ -500,7 +606,7 @@ fn run_drush_action(
     cancel: &CancellationToken,
 ) -> Result<Option<bool>, Error> {
     match req.action {
-        Action::InstallDrush => unreachable!("handled by run_action"),
+        Action::InstallDrush | Action::UpdateDb => unreachable!("handled by run_action"),
         Action::CacheRebuild => {
             drush(ctx, req, &["cache:rebuild"], RUN_TIMEOUT, cancel)?;
             Ok(None)
@@ -592,14 +698,16 @@ pub fn execute(
         ));
     }
 
-    let (maintenance_mode, changed) = match run_action(ctx, req, cancel) {
+    let outcome = match run_action(ctx, req, cancel) {
         Ok(value) => value,
         Err(error) => return Err(fail(&scope, &state_path, &audit_path, state, error)),
     };
     let result = ActionResult {
         action: req.action.name().into(),
-        maintenance_mode,
-        changed,
+        maintenance_mode: outcome.maintenance_mode,
+        changed: outcome.changed,
+        updates_pending: outcome.updates_pending,
+        updates_remaining: outcome.updates_remaining,
         completed_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -852,6 +960,110 @@ exit 0
             Err(Error::Replayed { .. })
         ));
         assert_eq!(log(dir.path()).lines().count(), 1, "retry must not re-run");
+    }
+
+    /// `updatedb:status` lists `pending` entries until `updatedb` ran, then
+    /// none (or, with `sticky`, still the same after it).
+    fn fake_updatedb_docker(directory: &std::path::Path, pending: u32, sticky: bool) -> String {
+        let log = directory.join("drush.log");
+        let done = directory.join("updated");
+        let path = directory.join("fake-docker");
+        let list = (0..pending)
+            .map(|n| format!(r#""hook_{n}":{{"module":"m"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"updatedb:status"*)
+    if [ -e '{done}' ] && [ "{sticky}" = false ]; then echo '[]'; else echo '{{{list}}}'; fi ;;
+  *" updatedb"*) touch '{done}' ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+                done = done.display(),
+                sticky = sticky,
+                list = list,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn update_db_runs_updatedb_only_when_updates_are_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_updatedb_docker(dir.path(), 3, false);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+        };
+        let result = execute(
+            &ctx,
+            &request("update-db", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(result.action, "updateDb");
+        assert_eq!(result.changed, Some(true));
+        assert_eq!(result.updates_pending, Some(3));
+        assert_eq!(result.updates_remaining, Some(0));
+        let recorded = log(dir.path());
+        assert!(recorded.contains("--no-interaction updatedb:status --format=json"));
+        assert!(
+            recorded.contains("--no-interaction updatedb\n"),
+            "{recorded}"
+        );
+        assert_eq!(recorded.lines().count(), 3, "status, updatedb, status");
+
+        // nothing pending now: status only, no mutation
+        let again = execute(
+            &ctx,
+            &request("update-db", None, ID2, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(again.changed, Some(false));
+        assert_eq!(again.updates_pending, Some(0));
+        assert_eq!(log(dir.path()).lines().count(), 4);
+    }
+
+    #[test]
+    fn update_db_fails_when_updates_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_updatedb_docker(dir.path(), 2, true);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+        };
+        let error = execute(
+            &ctx,
+            &request("update-db", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::UpdatesRemain(2)));
+        assert_eq!(error.protocol().0, ErrorCode::SubprocessFailed);
+    }
+
+    #[test]
+    fn pending_updates_counts_entries_and_refuses_garbage() {
+        assert_eq!(pending_updates(b""), Some(0));
+        assert_eq!(pending_updates(b"  []\n"), Some(0));
+        assert_eq!(pending_updates(b"{}"), Some(0));
+        assert_eq!(pending_updates(br#"{"a":{},"b":{}}"#), Some(2));
+        assert_eq!(pending_updates(br#"[{"a":1}]"#), Some(1));
+        assert_eq!(pending_updates(b"No database updates required"), None);
+        assert_eq!(pending_updates(b"7"), None);
     }
 
     /// A stand-in for the container: `test -x ./vendor/bin/drush` succeeds

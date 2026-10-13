@@ -663,6 +663,36 @@ maintenance mode read back (for `maintenance`) and the completion time. The
 operations are transaction/audit recorded and replay their outcome for a
 retried request with the same idempotency key.
 
+## `drupal.updateDb`
+
+`drupal update-db` takes the same request as the other Drupal actions
+(without `state`). Under the per-site lock the engine first runs `drush
+updatedb:status --format=json` as the site user. When no update is pending it
+stops there (`changed: false`, `updatesPending: 0`): nothing is mutated. When
+updates are pending it runs `drush updatedb --no-interaction` (30 minute
+limit) and reads `updatedb:status` again; the request fails with
+`SUBPROCESS_FAILED` if any update is still listed. Status output that is not
+a JSON list or object is refused rather than guessed at. The result carries
+`changed`, `updatesPending` (before) and `updatesRemaining` (after, `0` on
+success) and no Drush output. Maintenance mode and the backup are the
+caller's business: the engine does not toggle maintenance or back up.
+
+## `cms.clearCache`
+
+`cms clear-cache` takes a root-owned JSON request `{kind, container,
+projectRoot, uid, gid}` where `kind` is `laravel` or `joomla`; unknown fields
+are rejected. After checking that the entry point exists (`artisan`,
+`cli/joomla.php`; `invalid_input` otherwise) the engine runs a fixed argv as
+the site user inside the site's container from the project root: `php artisan
+optimize:clear --no-interaction` for Laravel (compiled files, config, route,
+view and event caches and the application cache store, so sessions kept in
+the cache store are dropped), `php cli/joomla.php cache:clear
+--no-interaction` for Joomla 4 and later. WordPress and Drupal keep
+`wordpress.boundedAction` (`cacheFlush`) and `drupal.cacheRebuild`. Lock,
+idempotency, transaction and audit as for the Drupal actions; the result is
+`{kind, completedAtUnixSecs}` with no command output. Advertised as
+`cms.clearCache`.
+
 ## `drupal.installDrush`
 
 `drupal install-drush` takes the same request as the other Drupal actions

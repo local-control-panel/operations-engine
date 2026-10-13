@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod backup;
 pub mod capabilities;
+pub mod cms;
 pub mod compose_config;
 pub mod cron;
 pub mod db_restore;
