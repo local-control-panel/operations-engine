@@ -523,6 +523,41 @@ it does not, the clone fails and is rolled back rather than reporting a copy
 that can still mail or charge customers. `capabilities` reports
 `features.cloneStagingDefaults`; an engine without it rejects the key.
 
+## `joomla.clone`
+
+`joomla clone` accepts a root-owned JSON request naming the source and staging
+Joomla roots (each beneath a configured content root, neither nested inside
+the other), the staging runtime container and UID/GID, the MariaDB container,
+the already-provisioned staging database, its user and password, and the
+MariaDB root password. The source must be a Joomla 4 or later site (it needs
+`cli/joomla.php`) whose `configuration.php` uses `mysqli`/`pdomysql` against
+that same MariaDB container; anything else is refused before the staging site
+is touched.
+
+Under a lock scoped to the staging root the engine snapshots the staging
+database and any existing staging files, (re)creates the staging directory
+with a bounded `cp -a`, and rewrites only the copy's `configuration.php`: `db`,
+`user`, `password`, `host`, a freshly generated 32-character `secret`, and
+`log_path`/`tmp_path`/`cache_path` when they point into the source root; a
+non-empty `live_site` is emptied. Each of those lines must exist exactly once
+in the plain `public $name = value;` shape Joomla writes, otherwise the
+operation fails closed. A symlinked `configuration.php` is refused, the file is
+replaced with a temporary file and a rename, and nothing is evaluated. The
+source database is dumped with `mariadb-dump` (read only, `--single-transaction`)
+and imported into the staging database with the `db.restore` client, the copy
+is re-chowned to the staging site's UID/GID, and finally Joomla's own console
+(`php cli/joomla.php extension:list`) is run as the site user: it must boot
+with the new credentials and read the copied tables. Any failure restores the
+staging database and files; an interrupted run leaves `pending.json` that
+`site.reconcile` rolls back, like `wordpress.clone`. Idempotent and
+transaction/audit recorded; the source site is never written.
+
+An optional `stagingDefaults` list, from a closed set (anything else is
+rejected): `noindex` (`robots` = `noindex, nofollow`) and `blockMail`
+(`mailonline` = false). The copy's database content is not search-replaced:
+Joomla keeps few absolute URLs and a blind replace could damage serialized
+data.
+
 ## `wordpress.updateCore`
 
 `wordpress update-core` accepts a root-owned typed request containing the

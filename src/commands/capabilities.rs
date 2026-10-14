@@ -103,6 +103,7 @@ pub const OPERATIONS: &[&str] = &[
     "wordpress.install",
     "wordpress.import",
     "wordpress.clone",
+    "joomla.clone",
     "wordpress.migrateExport",
     "wordpress.migrateDiscard",
     "wordpress.migrateImport",

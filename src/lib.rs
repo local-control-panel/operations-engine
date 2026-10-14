@@ -45,6 +45,7 @@ pub mod error;
 pub mod failpoint;
 pub mod filesystem;
 pub mod ingress;
+pub mod joomla_clone;
 #[cfg(unix)]
 pub mod journal;
 pub mod maria_drop;
@@ -136,6 +137,7 @@ pub fn execute(cli: Cli) -> Response {
         Command::Permissions { command } => commands::permissions::run(command),
         Command::Wordpress { command } => commands::wordpress::run(command),
         Command::Drupal { command } => commands::drupal::run(command),
+        Command::Joomla { command } => commands::joomla::run(command),
         Command::Cms { command } => commands::cms::run(command),
         Command::Tool { command } => commands::tool::run(command),
         Command::Agent { command } => commands::agent::run(command),
