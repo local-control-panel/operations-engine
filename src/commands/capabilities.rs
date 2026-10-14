@@ -26,6 +26,10 @@ struct Features {
     /// show the one-time login only for a listed CMS; an engine without this
     /// field supports WordPress only.
     admin_login_cms: &'static [&'static str],
+    /// `wordpress.clone` accepts `stagingDefaults` (a closed list of safety
+    /// settings applied to the copy). Without this field the engine rejects
+    /// the key, so clients send it only when this is true.
+    clone_staging_defaults: bool,
 }
 
 /// Every protocol operation this engine implements, as `capabilities`
@@ -193,6 +197,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 agent_helpers: crate::agent_lifecycle::AGENT_HELPERS,
                 change_log: cfg!(unix),
                 admin_login_cms: ADMIN_LOGIN_CMS,
+                clone_staging_defaults: true,
             },
         },
     )
