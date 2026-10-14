@@ -1,6 +1,7 @@
 pub mod delete;
 pub mod flush;
 pub mod flush_all;
+pub mod site_access;
 
 use crate::{
     db_restore::ContainerName,
@@ -12,6 +13,12 @@ pub const DELETE_OPERATION: &str = "db.deleteValkeyKey";
 pub const FLUSH_DB_OPERATION: &str = "db.flushValkeyDb";
 pub const FLUSH_ALL_OPERATION: &str = "db.flushAllValkey";
 pub const MAX_KEY_BYTES: usize = 4096;
+/// `valkey-cli` as the administrator, shipped with the Valkey image config
+/// (`images/valkey`). Every operation runs `docker exec <container> sh
+/// ADMIN_CLI <command>`: the `default` user is off, and the administrator's
+/// password is read from the container's own environment, never from a
+/// request, an argv or a log.
+pub const ADMIN_CLI: &str = "/etc/valkey/wcp-valkey-cli.sh";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
