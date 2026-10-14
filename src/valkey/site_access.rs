@@ -1,7 +1,8 @@
-//! Per-site access to the shared Valkey instance. Valkey runs with its
-//! `default` user off; each site gets its own ACL user that can only touch
-//! keys under `wcp:<domain>:` and cannot run administrative commands
-//! (`FLUSHALL`, `FLUSHDB`, `KEYS`, `SCAN`, `CONFIG`, `ACL`, ...).
+//! Per-site access to the shared Valkey instance (Valkey 9). Valkey runs with
+//! its `default` user off; each site gets its own ACL user and its own numbered
+//! database. The user can read and write only that database (ACL `db=<n>`), may
+//! `FLUSHDB` and `SCAN` it, and cannot select another database or run
+//! administrative commands (`FLUSHALL`, `KEYS`, `CONFIG`, `ACL`, ...).
 //!
 //! Three operations, all through the administrator wrapper of the Valkey
 //! image (see [`crate::valkey::ADMIN_CLI`]):
@@ -10,8 +11,11 @@
 //!   password. The password is generated here, goes to Valkey only as a
 //!   SHA-256 hash, and comes back once as a secret result; it is never
 //!   stored, logged or replayed.
-//! - `db.revokeValkeySite` removes the site's keys and then its user.
-//! - `db.flushValkeySite` removes the site's keys only.
+//! - `db.revokeValkeySite` empties the site's database and removes its user.
+//! - `db.flushValkeySite` empties the site's database only.
+//!
+//! The database of a site is read from its ACL user, never from the caller of
+//! flush or revoke, so a wrong request cannot empty another site's database.
 //!
 //! Users are persisted with `ACL SAVE` into the ACL file the image keeps on
 //! its data volume, so they survive a restart.
@@ -44,24 +48,26 @@ pub const FLUSH_OPERATION: &str = "db.flushValkeySite";
 
 const PASSWORD_LEN: usize = 32;
 
-/// Removes the keys of one site. `UNLINK` frees memory in the background;
-/// the pattern is passed as `ARGV[1]`, never spliced into the script.
-const REMOVE_KEYS_SCRIPT: &str = "local removed = 0 local cursor = '0' repeat \
-local reply = redis.call('SCAN', cursor, 'MATCH', ARGV[1], 'COUNT', 1000) \
-cursor = reply[1] for _, key in ipairs(reply[2]) do redis.call('UNLINK', key) \
-removed = removed + 1 end until cursor == '0' return removed";
+/// Site databases are 1..=MAX_DATABASE; 0 stays with the administrator. The
+/// image sets `databases 256`.
+pub const MAX_DATABASE: u16 = 255;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Plan {
     container: String,
     domain: String,
+    /// Only `db.provisionValkeySite` takes it; the others read it from the user.
+    #[serde(default)]
+    database: Option<u16>,
 }
 
 #[derive(Debug)]
 pub struct SiteRequest {
     pub container: ContainerName,
     pub domain: Domain,
+    /// The site's database (provisioning only).
+    pub database: Option<u16>,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -71,6 +77,7 @@ pub enum RequestError {
     InvalidJson,
     InvalidContainer,
     InvalidDomain,
+    InvalidDatabase,
     InvalidRequestId,
     InvalidIdempotencyKey,
 }
@@ -82,6 +89,11 @@ impl SiteRequest {
             container: ContainerName::parse(&plan.container)
                 .map_err(|_| RequestError::InvalidContainer)?,
             domain: Domain::parse(&plan.domain).map_err(|_| RequestError::InvalidDomain)?,
+            database: match plan.database {
+                Some(n) if (1..=MAX_DATABASE).contains(&n) => Some(n),
+                Some(_) => return Err(RequestError::InvalidDatabase),
+                None => None,
+            },
             request_id: RequestId::parse(request_id).map_err(|_| RequestError::InvalidRequestId)?,
             idempotency_key: key
                 .map(IdempotencyKey::parse)
@@ -93,11 +105,6 @@ impl SiteRequest {
     fn username(&self) -> String {
         format!("site_{}", self.domain)
     }
-
-    /// The key prefix the site must use (and is limited to).
-    fn prefix(&self) -> String {
-        format!("wcp:{}:", self.domain)
-    }
 }
 
 /// The part of a provisioning result that is safe to keep and to replay.
@@ -105,7 +112,7 @@ impl SiteRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ProvisionPublic {
     pub username: String,
-    pub prefix: String,
+    pub database: u16,
     pub completed_at_unix_secs: u64,
 }
 
@@ -120,6 +127,7 @@ pub type ProvisionResult = SecretResult<ProvisionPublic, ProvisionSecret>;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlushSiteResult {
+    pub database: u16,
     pub keys_removed: u64,
     pub completed_at_unix_secs: u64,
 }
@@ -148,10 +156,17 @@ pub enum Error {
     MalformedOutput,
     Cancelled,
     Entropy,
+    /// The site has no Valkey user (or one without exactly one database).
+    NotProvisioned,
+    /// Provisioning needs a database number.
+    MissingDatabase,
     PostCommitProvision(Box<ProvisionResult>),
     PostCommitFlush(FlushSiteResult),
     PostCommitRevoke(RevokeResult),
-    Replayed { code: ErrorCode, message: String },
+    Replayed {
+        code: ErrorCode,
+        message: String,
+    },
 }
 
 impl Error {
@@ -186,6 +201,14 @@ impl Error {
             Self::Cancelled => (
                 ErrorCode::Cancelled,
                 "cancelled before the Valkey site operation ran".into(),
+            ),
+            Self::NotProvisioned => (
+                ErrorCode::InvalidInput,
+                "the site has no Valkey user with exactly one database".into(),
+            ),
+            Self::MissingDatabase => (
+                ErrorCode::InvalidInput,
+                "a database number from 1 to 255 is required".into(),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
             _ => (
@@ -231,18 +254,21 @@ fn sha256_hex(value: &str) -> String {
 }
 
 /// The ACL rules of a site user, as separate arguments. Only the hash of the
-/// password is here. `-select` keeps the site in database 0, where the prefix
-/// rule applies; scripts are allowed because Valkey checks every command (and
-/// key) inside them against this same user.
-fn acl_rules(username: &str, prefix: &str, password_hash: &str) -> Vec<String> {
+/// password is here. `db=<n>` limits every command, `SELECT` included, to the
+/// site's own database; `FLUSHDB` is allowed back after `-@dangerous` because
+/// in that database it only empties the site's own data. No channels: the
+/// object caches do not use Pub/Sub. Scripts are allowed because Valkey checks
+/// every command inside them against this same user.
+fn acl_rules(username: &str, database: u16, password_hash: &str) -> Vec<String> {
     let mut args: Vec<String> = ["ACL", "SETUSER", username, "reset", "on"]
         .map(String::from)
         .to_vec();
     args.push(format!("#{password_hash}"));
     args.extend(
-        ["resetkeys".to_owned(), format!("~{prefix}*")]
+        ["resetkeys", "~*", "resetchannels"]
+            .map(String::from)
             .into_iter()
-            .chain(["resetchannels".to_owned(), format!("&{prefix}*")]),
+            .chain([format!("db={database}")]),
     );
     args.extend(
         [
@@ -257,13 +283,9 @@ fn acl_rules(username: &str, prefix: &str, password_hash: &str) -> Vec<String> {
             "+@string",
             "+@transaction",
             "+@connection",
-            "+@pubsub",
             "-@dangerous",
             "-@admin",
-            "-scan",
-            "-randomkey",
-            "-dbsize",
-            "-select",
+            "+flushdb",
             "+eval",
             "+evalsha",
             "+eval_ro",
@@ -274,6 +296,23 @@ fn acl_rules(username: &str, prefix: &str, password_hash: &str) -> Vec<String> {
         .map(String::from),
     );
     args
+}
+
+/// The single database a site user is limited to, from `ACL GETUSER`'s reply
+/// (`... databases` followed by a line such as `db=3`). `None` for a missing
+/// user, no database, several databases or anything unexpected.
+fn parse_user_database(reply: &[u8]) -> Option<u16> {
+    let text = std::str::from_utf8(reply).ok()?;
+    let mut lines = text.lines().map(str::trim);
+    lines.find(|line| *line == "databases")?;
+    let value = lines.next()?.strip_prefix("db=")?;
+    if value.contains(',') || value.contains('-') {
+        return None;
+    }
+    value
+        .parse()
+        .ok()
+        .filter(|n| (1..=MAX_DATABASE).contains(n))
 }
 
 /// One administrator command; the standard output of a successful run.
@@ -323,23 +362,36 @@ fn expect_count(output: &[u8]) -> Result<u64, Error> {
         .ok_or(Error::MalformedOutput)
 }
 
-fn remove_keys(
+/// Empties the database of the site's user and returns how many keys it held.
+/// The database comes from the user, never from the request.
+fn empty_database(
     ctx: &Context<'_>,
     req: &SiteRequest,
     cancel: &CancellationToken,
-) -> Result<u64, Error> {
-    let output = admin(
+) -> Result<(u16, u64), Error> {
+    let reply = admin(
         ctx,
         &req.container,
-        &[
-            "EVAL".into(),
-            REMOVE_KEYS_SCRIPT.into(),
-            "0".into(),
-            format!("{}*", req.prefix()),
-        ],
+        &["ACL".into(), "GETUSER".into(), req.username()],
         cancel,
     )?;
-    expect_count(&output)
+    let database = parse_user_database(&reply).ok_or(Error::NotProvisioned)?;
+    let select = ["-n".to_owned(), database.to_string()];
+    let count = |command: &[&str]| -> Vec<String> {
+        select
+            .iter()
+            .cloned()
+            .chain(command.iter().map(|part| (*part).to_owned()))
+            .collect()
+    };
+    let keys = expect_count(&admin(ctx, &req.container, &count(&["DBSIZE"]), cancel)?)?;
+    expect_ok(&admin(
+        ctx,
+        &req.container,
+        &count(&["FLUSHDB", "ASYNC"]),
+        cancel,
+    )?)?;
+    Ok((database, keys))
 }
 
 /// What an operation needs from the transaction machinery.
@@ -482,13 +534,16 @@ pub fn provision(
     if cancel.is_cancelled() {
         return Err(abort(&begun, Error::Cancelled));
     }
+    let Some(database) = req.database else {
+        return Err(abort(&begun, Error::MissingDatabase));
+    };
     let password = match new_password() {
         Ok(value) => value,
         Err(error) => return Err(abort(&begun, error)),
     };
     let steps = (|| {
         // The rules go as separate arguments of one ACL SETUSER.
-        let rules = acl_rules(&req.username(), &req.prefix(), &sha256_hex(&password));
+        let rules = acl_rules(&req.username(), database, &sha256_hex(&password));
         expect_ok(&admin(ctx, &req.container, &rules, cancel)?)?;
         expect_ok(&admin(
             ctx,
@@ -503,7 +558,7 @@ pub fn provision(
     let result = SecretResult::new(
         ProvisionPublic {
             username: req.username(),
-            prefix: req.prefix(),
+            database,
             completed_at_unix_secs: now_secs(),
         },
         ProvisionSecret { password },
@@ -536,11 +591,12 @@ pub fn flush(
     if cancel.is_cancelled() {
         return Err(abort(&begun, Error::Cancelled));
     }
-    let keys_removed = match remove_keys(ctx, req, cancel) {
+    let (database, keys_removed) = match empty_database(ctx, req, cancel) {
         Ok(value) => value,
         Err(error) => return Err(abort(&begun, error)),
     };
     let result = FlushSiteResult {
+        database,
         keys_removed,
         completed_at_unix_secs: now_secs(),
     };
@@ -573,7 +629,12 @@ pub fn revoke(
         return Err(abort(&begun, Error::Cancelled));
     }
     let steps = (|| {
-        let keys_removed = remove_keys(ctx, req, cancel)?;
+        // A site that has no user has nothing to empty; the revoke is a success.
+        let keys_removed = match empty_database(ctx, req, cancel) {
+            Ok((_, keys)) => keys,
+            Err(Error::NotProvisioned) => 0,
+            Err(error) => return Err(error),
+        };
         // DELUSER also drops the user's open connections.
         let deleted = expect_count(&admin(
             ctx,
@@ -619,7 +680,11 @@ mod tests {
     const ID2: &str = "123e4567-e89b-12d3-a456-426614174001";
 
     fn plan(domain: &str) -> String {
-        serde_json::json!({"container":"valkey-8","domain":domain}).to_string()
+        serde_json::json!({"container":"valkey-9","domain":domain}).to_string()
+    }
+
+    fn plan_with_database(domain: &str, database: u64) -> String {
+        serde_json::json!({"container":"valkey-9","domain":domain,"database":database}).to_string()
     }
 
     struct Fixture {
@@ -630,7 +695,7 @@ mod tests {
 
     impl Fixture {
         /// Logs every call as one line; answers like Valkey does. Marker files
-        /// make single steps fail.
+        /// make single steps fail or change an answer.
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
             let state_path = directory.path().join("state");
@@ -645,7 +710,12 @@ case "$*" in
   *"ACL SETUSER"*) test -f "$base/REJECT_SETUSER" && exit 1; echo OK ;;
   *"ACL SAVE"*) test -f "$base/REJECT_SAVE" && exit 1; echo OK ;;
   *"ACL DELUSER"*) cat "$base/DELUSER_REPLY" 2>/dev/null || echo 1 ;;
-  *" EVAL "*) cat "$base/EVAL_REPLY" 2>/dev/null || echo 3 ;;
+  *"ACL GETUSER"*)
+    if test -f "$base/NO_USER"; then echo; else
+      printf 'flags\non\npasswords\nabc\ncommands\n-@all\nkeys\n~*\nchannels\n\ndatabases\n%s\nselectors\n' "$(cat "$base/USER_DB" 2>/dev/null || echo db=7)"
+    fi ;;
+  *" DBSIZE"*) cat "$base/DBSIZE_REPLY" 2>/dev/null || echo 3 ;;
+  *"FLUSHDB ASYNC"*) test -f "$base/REJECT_FLUSH" && exit 1; echo OK ;;
   *) exit 2 ;;
 esac
 "#,
@@ -702,8 +772,12 @@ esac
         SiteRequest::parse(&plan(domain), id, key).unwrap()
     }
 
+    fn provisioning(domain: &str, database: u64, id: &str, key: &str) -> SiteRequest {
+        SiteRequest::parse(&plan_with_database(domain, database), id, Some(key)).unwrap()
+    }
+
     #[test]
-    fn requests_accept_only_a_container_and_a_plain_domain() {
+    fn requests_accept_only_a_container_a_plain_domain_and_a_site_database() {
         assert!(SiteRequest::parse(&plan("a.example.com"), ID, None).is_ok());
         for domain in [
             "",
@@ -720,7 +794,7 @@ esac
                 "{domain:?}"
             );
         }
-        let extra = r#"{"container":"valkey-8","domain":"a.test","password":"x"}"#;
+        let extra = r#"{"container":"valkey-9","domain":"a.test","password":"x"}"#;
         assert_eq!(
             SiteRequest::parse(extra, ID, None).unwrap_err(),
             RequestError::InvalidJson
@@ -730,31 +804,80 @@ esac
             SiteRequest::parse(bad, ID, None).unwrap_err(),
             RequestError::InvalidContainer
         );
+        for database in [0u64, 256, 1000, 70000] {
+            assert!(
+                SiteRequest::parse(&plan_with_database("a.test", database), ID, None).is_err(),
+                "{database}"
+            );
+        }
+        for database in [1u64, 15, 255] {
+            assert_eq!(
+                SiteRequest::parse(&plan_with_database("a.test", database), ID, None)
+                    .unwrap()
+                    .database,
+                Some(database as u16)
+            );
+        }
     }
 
     #[test]
-    fn the_site_user_is_limited_to_its_prefix_and_gets_only_a_hash() {
-        let rules = acl_rules("site_a.test", "wcp:a.test:", &sha256_hex("pw"));
+    fn the_site_user_is_limited_to_its_database_and_gets_only_a_hash() {
+        let rules = acl_rules("site_a.test", 7, &sha256_hex("pw"));
         let text = rules.join(" ");
         assert!(text.starts_with("ACL SETUSER site_a.test reset on #"));
-        assert!(text.contains(" resetkeys ~wcp:a.test:* resetchannels &wcp:a.test:* -@all "));
-        for denied in ["-@dangerous", "-@admin", "-scan", "-select"] {
+        assert!(text.contains(" resetkeys ~* resetchannels db=7 -@all "));
+        for denied in ["-@dangerous", "-@admin"] {
             assert!(rules.iter().any(|rule| rule == denied), "{denied}");
         }
-        for never in ["+@all", "+@admin", "+@dangerous", "allkeys", "~*", "nopass"] {
+        for never in [
+            "+@all",
+            "+@admin",
+            "+@dangerous",
+            "allkeys",
+            "nopass",
+            "alldbs",
+            "+@pubsub",
+            "+flushall",
+            "+keys",
+            "+config",
+            "+acl",
+        ] {
             assert!(!rules.iter().any(|rule| rule == never), "{never}");
         }
-        // The deny rules come after the broad allows, so they win.
+        // Exactly one database rule.
+        assert_eq!(rules.iter().filter(|r| r.starts_with("db=")).count(), 1);
+        // FLUSHDB comes back after the broad deny, so it is allowed.
         let position = |rule: &str| rules.iter().position(|r| r == rule).unwrap();
+        assert!(position("-@dangerous") < position("+flushdb"));
         assert!(position("+@write") < position("-@dangerous"));
-        assert!(position("+@keyspace") < position("-scan"));
         assert!(!text.contains("pw"));
+    }
+
+    #[test]
+    fn the_database_is_read_from_the_user_and_only_when_it_is_exactly_one() {
+        let reply = |db: &str| {
+            format!(
+                "flags\non\ncommands\n-@all\nkeys\n~*\nchannels\n\ndatabases\n{db}\nselectors\n"
+            )
+        };
+        assert_eq!(parse_user_database(reply("db=7").as_bytes()), Some(7));
+        assert_eq!(parse_user_database(reply("db=255").as_bytes()), Some(255));
+        for bad in ["db=0", "db=256", "db=3,4", "db=3-5", "alldbs", "", "db=x"] {
+            assert_eq!(parse_user_database(reply(bad).as_bytes()), None, "{bad}");
+        }
+        assert_eq!(parse_user_database(b"\n"), None, "a missing user");
+        assert_eq!(parse_user_database(b""), None);
+        assert_eq!(
+            parse_user_database(b"flags\non\n"),
+            None,
+            "no databases section"
+        );
     }
 
     #[test]
     fn provisioning_creates_the_user_saves_it_and_returns_the_password_once() {
         let fx = Fixture::new();
-        let request = req("a.test", ID, Some("key-1"));
+        let request = provisioning("a.test", 7, ID, "key-1");
         let Provisioned::New(result) =
             provision(&fx.context(), &request, &CancellationToken::default()).unwrap()
         else {
@@ -763,16 +886,17 @@ esac
         let calls = fx.calls();
         assert_eq!(calls.len(), 2);
         assert!(calls[0].starts_with(
-            "exec valkey-8 sh /etc/valkey/wcp-valkey-cli.sh ACL SETUSER site_a.test reset on #"
+            "exec valkey-9 sh /etc/valkey/wcp-valkey-cli.sh ACL SETUSER site_a.test reset on #"
         ));
+        assert!(calls[0].contains(" db=7 "));
         assert_eq!(
             calls[1],
-            "exec valkey-8 sh /etc/valkey/wcp-valkey-cli.sh ACL SAVE"
+            "exec valkey-9 sh /etc/valkey/wcp-valkey-cli.sh ACL SAVE"
         );
 
         let response = result.public_value().unwrap();
         assert_eq!(response["username"], "site_a.test");
-        assert_eq!(response["prefix"], "wcp:a.test:");
+        assert_eq!(response["database"], 7);
         // The password is in the secret half only; Valkey got just its hash.
         let secret = (*result).into_response_value().unwrap();
         let password = secret["password"].as_str().unwrap().to_owned();
@@ -786,11 +910,24 @@ esac
     }
 
     #[test]
+    fn provisioning_without_a_database_is_refused_before_anything_runs() {
+        let fx = Fixture::new();
+        let request = SiteRequest::parse(&plan("a.test"), ID, Some("key-1")).unwrap();
+        let result = provision(&fx.context(), &request, &CancellationToken::default());
+        assert!(matches!(result, Err(Error::MissingDatabase)));
+        assert!(fx.calls().is_empty());
+    }
+
+    #[test]
     fn a_replay_returns_the_public_record_and_no_password_and_runs_nothing() {
         let fx = Fixture::new();
-        let request = req("a.test", ID, Some("key-1"));
-        provision(&fx.context(), &request, &CancellationToken::default()).unwrap();
-        let again = req("a.test", ID2, Some("key-1"));
+        provision(
+            &fx.context(),
+            &provisioning("a.test", 7, ID, "key-1"),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let again = provisioning("a.test", 7, ID2, "key-1");
         match provision(&fx.context(), &again, &CancellationToken::default()).unwrap() {
             Provisioned::AlreadyIssued(public) => {
                 assert_eq!(public["username"], "site_a.test");
@@ -807,7 +944,7 @@ esac
         for (id, key) in [(ID, "key-1"), (ID2, "key-2")] {
             provision(
                 &fx.context(),
-                &req("a.test", id, Some(key)),
+                &provisioning("a.test", 7, id, key),
                 &CancellationToken::default(),
             )
             .unwrap();
@@ -825,7 +962,7 @@ esac
             fx.mark(marker, "");
             let result = provision(
                 &fx.context(),
-                &req("a.test", ID, Some("key-1")),
+                &provisioning("a.test", 7, ID, "key-1"),
                 &CancellationToken::default(),
             );
             assert!(matches!(result, Err(Error::Rejected(_))), "{marker}");
@@ -833,26 +970,67 @@ esac
     }
 
     #[test]
-    fn flushing_a_site_removes_only_its_prefix_through_the_script_argument() {
+    fn flushing_empties_the_database_the_user_is_limited_to_and_no_other() {
         let fx = Fixture::new();
-        fx.mark("EVAL_REPLY", "42\n");
+        fx.mark("USER_DB", "db=12");
+        fx.mark("DBSIZE_REPLY", "42\n");
         let result = flush(
             &fx.context(),
             &req("a.test", ID, None),
             &CancellationToken::default(),
         )
         .unwrap();
-        assert_eq!(result.keys_removed, 42);
+        assert_eq!((result.database, result.keys_removed), (12, 42));
         let calls = fx.calls();
-        assert_eq!(calls.len(), 1);
-        // The pattern is ARGV[1]: after the key count, never inside the script.
-        assert!(calls[0].ends_with(" 0 wcp:a.test:*"));
-        assert!(!REMOVE_KEYS_SCRIPT.contains("wcp:"));
-        assert!(REMOVE_KEYS_SCRIPT.contains("UNLINK"));
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].ends_with("ACL GETUSER site_a.test"));
+        assert!(calls[1].ends_with("-n 12 DBSIZE"));
+        assert!(calls[2].ends_with("-n 12 FLUSHDB ASYNC"));
+        assert!(
+            calls.iter().all(|c| !c.contains("FLUSHALL")),
+            "never the whole instance"
+        );
     }
 
     #[test]
-    fn revoking_removes_the_keys_then_the_user_then_saves() {
+    fn a_request_cannot_aim_a_flush_at_another_database() {
+        // A caller-supplied number is ignored: the user's own database is used.
+        let fx = Fixture::new();
+        fx.mark("USER_DB", "db=5");
+        let request = SiteRequest::parse(&plan_with_database("a.test", 9), ID, None).unwrap();
+        let result = flush(&fx.context(), &request, &CancellationToken::default()).unwrap();
+        assert_eq!(result.database, 5);
+        assert!(fx.calls().iter().all(|c| !c.contains("-n 9")));
+    }
+
+    #[test]
+    fn flushing_a_site_without_a_user_is_an_error_and_touches_nothing() {
+        let fx = Fixture::new();
+        fx.mark("NO_USER", "");
+        let result = flush(
+            &fx.context(),
+            &req("a.test", ID, None),
+            &CancellationToken::default(),
+        );
+        assert!(matches!(result, Err(Error::NotProvisioned)));
+        assert_eq!(fx.calls().len(), 1, "only the lookup ran");
+    }
+
+    #[test]
+    fn a_user_limited_to_several_databases_is_not_flushed() {
+        let fx = Fixture::new();
+        fx.mark("USER_DB", "db=3,4");
+        let result = flush(
+            &fx.context(),
+            &req("a.test", ID, None),
+            &CancellationToken::default(),
+        );
+        assert!(matches!(result, Err(Error::NotProvisioned)));
+        assert_eq!(fx.calls().len(), 1);
+    }
+
+    #[test]
+    fn revoking_empties_the_database_then_removes_the_user_then_saves() {
         let fx = Fixture::new();
         let result = revoke(
             &fx.context(),
@@ -861,16 +1039,19 @@ esac
         )
         .unwrap();
         assert!(result.revoked);
+        assert_eq!(result.keys_removed, 3);
         let calls = fx.calls();
-        assert_eq!(calls.len(), 3);
-        assert!(calls[0].contains(" EVAL "));
-        assert!(calls[1].ends_with("ACL DELUSER site_a.test"));
-        assert!(calls[2].ends_with("ACL SAVE"));
+        assert_eq!(calls.len(), 5);
+        assert!(calls[0].ends_with("ACL GETUSER site_a.test"));
+        assert!(calls[2].ends_with("-n 7 FLUSHDB ASYNC"));
+        assert!(calls[3].ends_with("ACL DELUSER site_a.test"));
+        assert!(calls[4].ends_with("ACL SAVE"));
     }
 
     #[test]
-    fn revoking_a_site_that_has_no_user_still_succeeds() {
+    fn revoking_a_site_that_has_no_user_still_succeeds_and_flushes_nothing() {
         let fx = Fixture::new();
+        fx.mark("NO_USER", "");
         fx.mark("DELUSER_REPLY", "0\n");
         let result = revoke(
             &fx.context(),
@@ -879,12 +1060,14 @@ esac
         )
         .unwrap();
         assert!(!result.revoked);
+        assert_eq!(result.keys_removed, 0);
+        assert!(fx.calls().iter().all(|c| !c.contains("FLUSHDB")));
     }
 
     #[test]
     fn an_unexpected_answer_is_an_error_not_a_guess() {
         let fx = Fixture::new();
-        fx.mark("EVAL_REPLY", "not a number\n");
+        fx.mark("DBSIZE_REPLY", "not a number\n");
         let result = flush(
             &fx.context(),
             &req("a.test", ID, None),
