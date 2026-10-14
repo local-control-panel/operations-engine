@@ -510,9 +510,18 @@ client `db.restore` uses, deleting the dump immediately afterward either
 way; and finally re-chowns the copied tree to the staging site's own
 UID/GID with `permissions.fixOwnership`'s own fd-relative repair walk. Any
 failure removes the staging directory this request itself (re)created. The
-operation is idempotent and transaction/audit recorded; `wp-config.php`'s
-DB credentials and the source→staging domain search-replace remain outside
-it, run by the client afterward.
+operation is idempotent and transaction/audit recorded.
+
+An optional `stagingDefaults` list makes the copy safe, from a closed set
+(anything else is rejected): `noindex` (`blog_public` = 0), `disableCron`
+(`DISABLE_WP_CRON`), `blockMail` (a must-use plugin short-circuits `wp_mail`)
+and `blockPayments` (the same plugin hides every WooCommerce payment gateway).
+They apply to the copy only, after the domain replacement. The plugin is
+written to `wp-content/mu-plugins/wcp-staging-safety.php` (refused through a
+symlinked `wp-content`/`mu-plugins`) and the clone verifies that it loads; if
+it does not, the clone fails and is rolled back rather than reporting a copy
+that can still mail or charge customers. `capabilities` reports
+`features.cloneStagingDefaults`; an engine without it rejects the key.
 
 ## `wordpress.updateCore`
 

@@ -51,6 +51,47 @@ struct Plan {
     mariadb_container: String,
     db_name: String,
     db_root_password: String,
+    /// Safety defaults for the copy; empty for a plain clone. Closed set, see
+    /// [`StagingDefaults`].
+    #[serde(default)]
+    staging_defaults: Vec<String>,
+}
+
+/// What the copy is made safe against, chosen by the caller from a closed set
+/// (`noindex`, `disableCron`, `blockMail`, `blockPayments`). Nothing here
+/// changes the source site.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StagingDefaults {
+    /// `blog_public = 0`: ask search engines not to index the copy.
+    pub noindex: bool,
+    /// `DISABLE_WP_CRON`: scheduled tasks (mails, imports, renewals) do not
+    /// run on the copy.
+    pub disable_cron: bool,
+    /// A must-use plugin short-circuits `wp_mail`.
+    pub block_mail: bool,
+    /// The same must-use plugin hides every WooCommerce payment gateway.
+    pub block_payments: bool,
+}
+
+impl StagingDefaults {
+    fn parse(values: &[String]) -> Result<Self, RequestError> {
+        let mut out = Self::default();
+        for value in values {
+            let flag = match value.as_str() {
+                "noindex" => &mut out.noindex,
+                "disableCron" => &mut out.disable_cron,
+                "blockMail" => &mut out.block_mail,
+                "blockPayments" => &mut out.block_payments,
+                _ => return Err(RequestError),
+            };
+            *flag = true;
+        }
+        Ok(out)
+    }
+
+    fn needs_plugin(self) -> bool {
+        self.block_mail || self.block_payments
+    }
 }
 
 pub struct Request {
@@ -69,6 +110,7 @@ pub struct Request {
     mariadb_container: ContainerName,
     db_name: DatabaseName,
     db_root_password: String,
+    staging_defaults: StagingDefaults,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -145,6 +187,7 @@ impl Request {
             db_name: DatabaseName::parse(&plan.db_name)
                 .map_err(|_: RestoreRequestError| RequestError)?,
             db_root_password: plan.db_root_password,
+            staging_defaults: StagingDefaults::parse(&plan.staging_defaults)?,
             request_id: RequestId::parse(request_id).map_err(|_| RequestError)?,
             idempotency_key: key
                 .map(IdempotencyKey::parse)
@@ -403,6 +446,60 @@ fn wp_command(ctx: &Context<'_>, req: &Request, source: bool) -> ProcessRequest 
     ])
 }
 
+const SAFETY_PLUGIN: &str = "wcp-staging-safety.php";
+
+/// Writes the must-use plugin that blocks mail and/or payments on the copy.
+/// The copy's `wp-content` came from the source with `cp -a`, so a symlinked
+/// `wp-content` or `mu-plugins` could aim the write outside the staging site:
+/// both must be real directories, and an existing file of the same name is
+/// replaced, never followed.
+fn write_safety_plugin(root: &std::path::Path, defaults: StagingDefaults) -> Result<(), Error> {
+    use std::io::Write;
+    let real_dir = |path: &std::path::Path| -> Result<(), Error> {
+        let meta = std::fs::symlink_metadata(path).map_err(Error::Io)?;
+        if meta.is_dir() {
+            Ok(())
+        } else {
+            Err(Error::UnsafeTarget)
+        }
+    };
+    let content = root.join("wp-content");
+    real_dir(&content)?;
+    let mu = content.join("mu-plugins");
+    match std::fs::symlink_metadata(&mu) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&mu).map_err(Error::Io)?;
+        }
+        Err(e) => return Err(Error::Io(e)),
+    }
+    real_dir(&mu)?;
+    let file = mu.join(SAFETY_PLUGIN);
+    match std::fs::symlink_metadata(&file) {
+        Ok(_) => std::fs::remove_file(&file).map_err(Error::Io)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e)),
+    }
+    let mut body = String::from(
+        "<?php\n/**\n * Plugin Name: WCP staging safety\n * Description: Written by Website Control Panel when this copy was cloned, so it cannot mail or charge real customers. Delete this file to turn it off.\n */\ndefined('ABSPATH') || exit;\ndefine('WCP_STAGING_SAFETY', true);\n",
+    );
+    if defaults.block_mail {
+        body.push_str("add_filter('pre_wp_mail', '__return_false', PHP_INT_MAX);\n");
+    }
+    if defaults.block_payments {
+        body.push_str(
+            "add_filter('woocommerce_available_payment_gateways', '__return_empty_array', PHP_INT_MAX);\n",
+        );
+    }
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file)
+        .map_err(Error::Io)?;
+    out.write_all(body.as_bytes()).map_err(Error::Io)?;
+    Ok(())
+}
+
 // The bounded process runner deliberately excludes argv/output from errors.
 fn wp_step(
     ctx: &Context<'_>,
@@ -581,6 +678,10 @@ fn clone_with_recovery(
         if !config.is_file() {
             return Err(Error::UnsafeTarget);
         }
+        if req.staging_defaults.needs_plugin() {
+            // Before the ownership repair below, so the new file is the site user's.
+            write_safety_plugin(&absolute, req.staging_defaults)?;
+        }
         repair_tree(&absolute, req.staging_uid, req.staging_gid, &[]).map_err(Error::Io)?;
         for (key, value) in [
             ("DB_NAME", req.db_name.as_str()),
@@ -631,6 +732,34 @@ fn clone_with_recovery(
             ],
             cancel,
         )?;
+        if req.staging_defaults.noindex {
+            wp_step(ctx, req, &["option", "update", "blog_public", "0"], cancel)?;
+        }
+        if req.staging_defaults.disable_cron {
+            wp_step(
+                ctx,
+                req,
+                &[
+                    "config",
+                    "set",
+                    "DISABLE_WP_CRON",
+                    "true",
+                    "--raw",
+                    "--type=constant",
+                ],
+                cancel,
+            )?;
+        }
+        if req.staging_defaults.needs_plugin() {
+            // Fail closed: a copy whose safety plugin does not load (a
+            // relocated wp-content) must not be reported as safe.
+            wp_step(
+                ctx,
+                req,
+                &["eval", "if (!defined('WCP_STAGING_SAFETY')) { exit(1); }"],
+                cancel,
+            )?;
+        }
         wp_step(ctx, req, &["core", "is-installed"], cancel)?;
         Ok(())
     })();
@@ -825,6 +954,185 @@ mod tests {
         assert!(Request::parse(&json, REQUEST_ID, None).is_err());
     }
 
+    fn request_with_defaults(fx: &Fixture, defaults: &str) -> Result<Request, RequestError> {
+        let json = valid_json(&fx.source_root, &fx.staging_root).replace(
+            r#""dbRootPassword": "rootpw""#,
+            &format!(r#""dbRootPassword": "rootpw", "stagingDefaults": {defaults}"#),
+        );
+        Request::parse(&json, REQUEST_ID, None)
+    }
+
+    #[test]
+    fn staging_defaults_are_a_closed_set_and_optional() {
+        let fx = fixture(&fake_docker(false), None);
+        let none = request_for(&fx, REQUEST_ID, None);
+        assert_eq!(none.staging_defaults, StagingDefaults::default());
+        let all = request_with_defaults(
+            &fx,
+            r#"["noindex","disableCron","blockMail","blockPayments","noindex"]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            all.staging_defaults,
+            StagingDefaults {
+                noindex: true,
+                disable_cron: true,
+                block_mail: true,
+                block_payments: true
+            }
+        );
+        assert!(request_with_defaults(&fx, r#"["sanitize"]"#).is_err());
+        assert!(request_with_defaults(&fx, r#"["noindex; rm -rf /"]"#).is_err());
+        assert!(request_with_defaults(&fx, r#"[1]"#).is_err());
+    }
+
+    #[test]
+    fn a_clone_with_defaults_sets_them_on_the_copy_only_and_in_order() {
+        let fx = fixture(&fake_docker(false), None);
+        let req = request_with_defaults(
+            &fx,
+            r#"["noindex","disableCron","blockMail","blockPayments"]"#,
+        )
+        .unwrap();
+        execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &req,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let log = fs::read_to_string(fx.docker.parent().unwrap().join("docker-calls.log")).unwrap();
+        assert!(log.contains("runtime-staging wp"));
+        assert!(!log.contains("runtime-source wp --path=/var/www/source.example.com --skip-plugins --skip-themes option update"));
+        assert!(log.contains("option update blog_public 0"));
+        assert!(log.contains("config set DISABLE_WP_CRON true --raw --type=constant"));
+        assert!(
+            log.find("search-replace").unwrap() < log.find("option update blog_public").unwrap()
+        );
+        assert!(log.find("eval").unwrap() < log.find("core is-installed").unwrap());
+        let plugin = fs::read_to_string(
+            fx.staging_root
+                .join("wp-content/mu-plugins")
+                .join(SAFETY_PLUGIN),
+        )
+        .unwrap();
+        assert!(plugin.contains("pre_wp_mail"));
+        assert!(plugin.contains("woocommerce_available_payment_gateways"));
+        assert!(plugin.contains("WCP_STAGING_SAFETY"));
+        assert!(
+            !fx.source_root.join("wp-content/mu-plugins").exists(),
+            "the source site is never touched"
+        );
+    }
+
+    #[test]
+    fn only_the_asked_defaults_are_applied() {
+        let fx = fixture(&fake_docker(false), None);
+        let req = request_with_defaults(&fx, r#"["blockMail"]"#).unwrap();
+        execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &req,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let log = fs::read_to_string(fx.docker.parent().unwrap().join("docker-calls.log")).unwrap();
+        assert!(!log.contains("blog_public"));
+        assert!(!log.contains("DISABLE_WP_CRON"));
+        let plugin = fs::read_to_string(
+            fx.staging_root
+                .join("wp-content/mu-plugins")
+                .join(SAFETY_PLUGIN),
+        )
+        .unwrap();
+        assert!(plugin.contains("pre_wp_mail"));
+        assert!(!plugin.contains("woocommerce"));
+    }
+
+    #[test]
+    fn a_plain_clone_writes_nothing_extra() {
+        let fx = fixture(&fake_docker(false), None);
+        let req = request_for(&fx, REQUEST_ID, None);
+        execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &req,
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(!fx.staging_root.join("wp-content/mu-plugins").exists());
+        let log = fs::read_to_string(fx.docker.parent().unwrap().join("docker-calls.log")).unwrap();
+        assert!(!log.contains("blog_public") && !log.contains(" eval "));
+    }
+
+    #[test]
+    fn a_copy_whose_safety_plugin_does_not_load_fails_closed_and_is_rolled_back() {
+        let fx = fixture(&fake_docker(false), None);
+        fs::write(fx.docker.parent().unwrap().join("REJECT_SAFETY"), "").unwrap();
+        let req = request_with_defaults(&fx, r#"["blockMail"]"#).unwrap();
+        let result = execute(
+            &context(&fx),
+            &fx.content_root,
+            &fx.content_root,
+            &req,
+            &CancellationToken::default(),
+        );
+        assert!(
+            result.is_err(),
+            "an unverified safety plugin must not be reported as done"
+        );
+        assert!(!fx.staging_root.exists(), "the half-built copy is removed");
+    }
+
+    #[test]
+    fn the_safety_plugin_is_never_written_through_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let root = directory.path().join("site");
+        fs::create_dir_all(&root).unwrap();
+        // wp-content is a symlink out of the site.
+        std::os::unix::fs::symlink(&outside, root.join("wp-content")).unwrap();
+        let defaults = StagingDefaults {
+            block_mail: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            write_safety_plugin(&root, defaults),
+            Err(Error::UnsafeTarget)
+        ));
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        // mu-plugins is a symlink out of the site.
+        fs::remove_file(root.join("wp-content")).unwrap();
+        fs::create_dir_all(root.join("wp-content")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("wp-content/mu-plugins")).unwrap();
+        assert!(matches!(
+            write_safety_plugin(&root, defaults),
+            Err(Error::UnsafeTarget)
+        ));
+        assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        // An existing symlink with the plugin's name is replaced, not followed.
+        fs::remove_file(root.join("wp-content/mu-plugins")).unwrap();
+        fs::create_dir_all(root.join("wp-content/mu-plugins")).unwrap();
+        let victim = outside.join("victim.php");
+        fs::write(&victim, "keep").unwrap();
+        std::os::unix::fs::symlink(
+            &victim,
+            root.join("wp-content/mu-plugins").join(SAFETY_PLUGIN),
+        )
+        .unwrap();
+        write_safety_plugin(&root, defaults).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert!(
+            fs::read_to_string(root.join("wp-content/mu-plugins").join(SAFETY_PLUGIN))
+                .unwrap()
+                .contains("pre_wp_mail")
+        );
+    }
+
     #[test]
     fn rejects_a_malformed_container_name() {
         let json = valid_json(
@@ -873,6 +1181,8 @@ case "$*" in
   *"db export"*) printf '%s\n' '-- dump --' "INSERT INTO wp_options VALUES (1,'x');" ;;
   *"search-replace"*) test ! -f "$base/REJECT_REPLACE" ;;
   *"core is-installed"*) test ! -f "$base/REJECT_HEALTH" ;;
+  *"option update"*) exit 0 ;;
+  *" eval "*) test ! -f "$base/REJECT_SAFETY" ;;
   *"mariadb "*)
     cat > "$base/last-import.sql"
     if grep -q 'original target' "$base/last-import.sql"; then
