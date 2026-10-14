@@ -69,13 +69,15 @@ pub const ENV_FILE: &str = ".env";
 
 /// Every file a deploy writes, relative to the stack directory. A request
 /// must supply exactly these.
-pub const FILES: [&str; 8] = [
+pub const FILES: [&str; 10] = [
     COMPOSE_FILE,
     "frankenphp/Caddyfile.ingress",
     "frankenphp/Caddyfile.runtime",
     "frankenphp/php.ini",
     "mariadb/conf.d/wp-performance.cnf",
     "valkey/valkey.conf",
+    "valkey/wcp-valkey-start.sh",
+    "valkey/wcp-valkey-cli.sh",
     "postgres/postgresql.conf",
     ENV_FILE,
 ];
