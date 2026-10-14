@@ -30,6 +30,7 @@ fn request_message(error: site_access::RequestError) -> &'static str {
         InvalidJson => "request-file is not a valid Valkey site plan",
         InvalidContainer => "container is invalid",
         InvalidDomain => "domain is invalid",
+        InvalidDatabase => "database must be a number from 1 to 255",
         InvalidRequestId => "request-id is not a canonical UUID",
         InvalidIdempotencyKey => "idempotency-key is invalid",
     }

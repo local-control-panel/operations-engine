@@ -402,31 +402,37 @@ log. An older Valkey container without the wrapper makes these operations fail
 ## `db.provisionValkeySite`
 
 `db provision-valkey-site` accepts a root-owned request with a validated
-container and a site `domain` (lowercase letters, digits, hyphens and dots) and
-requires an idempotency key. The engine creates the ACL user `site_<domain>`, or
-replaces its password: `ACL SETUSER ... reset on #<sha256> resetkeys
-~wcp:<domain>:* resetchannels &wcp:<domain>:*`, all commands off, then only the
-read/write/keyspace/data-type/transaction/connection/pubsub categories, with
-`@dangerous`, `@admin`, `SCAN`, `RANDOMKEY`, `DBSIZE` and `SELECT` removed and
-`EVAL`/`EVALSHA` allowed (Valkey checks every command and key inside a script
-against the same user). `ACL SAVE` persists it. The password is generated here
-(32 alphanumeric characters), reaches Valkey only as a SHA-256 hash and is
-returned once as a secret result together with `username` and `prefix`
-(`wcp:<domain>:`). The transaction state keeps only the public part; a replay
-returns it with `alreadyIssued: true` and no password.
+container, a site `domain` (lowercase letters, digits, hyphens and dots) and the
+site's `database` (1 to 255; the image sets `databases 256`, database 0 stays
+with the administrator), and requires an idempotency key. It needs Valkey 9.
+The engine creates the ACL user `site_<domain>`, or replaces its password:
+`ACL SETUSER ... reset on #<sha256> resetkeys ~* resetchannels db=<n>`, all
+commands off, then the read/write/keyspace/data-type/transaction/connection
+categories with `@dangerous` and `@admin` removed, and `FLUSHDB`,
+`EVAL`/`EVALSHA` allowed back. `db=<n>` limits every command, `SELECT`
+included, to the site's own database, so `FLUSHDB` there empties only the
+site's data (Valkey checks every command and key inside a script against the
+same user). No Pub/Sub channels. `ACL SAVE` persists the user. The password is
+generated here (32 alphanumeric characters), reaches Valkey only as a SHA-256
+hash and is returned once as a secret result together with `username` and
+`database`. The transaction state keeps only the public part; a replay returns
+it with `alreadyIssued: true` and no password.
 
 ## `db.revokeValkeySite`
 
-`db revoke-valkey-site` removes the site's keys (a script that `SCAN`s and
-`UNLINK`s the prefix, the pattern passed as `ARGV[1]`), deletes the user (which
-also closes its connections) and runs `ACL SAVE`. A site without a user is a
-success with `revoked: false`.
+`db revoke-valkey-site` empties the site's database (`DBSIZE`, then `FLUSHDB
+ASYNC`), deletes the user (which also closes its connections) and runs `ACL
+SAVE`. The database is read from the user's own ACL (`ACL GETUSER`), never from
+the request. A site without a user is a success with `revoked: false` and
+nothing flushed.
 
 ## `db.flushValkeySite`
 
-`db flush-valkey-site` removes the keys under `wcp:<domain>:` only and reports
-`keysRemoved`. The user stays. It is the flush a site-limited user cannot run
-itself.
+`db flush-valkey-site` empties the site's database and reports `keysRemoved`
+and `database`; the user stays. The database comes from the user's ACL, so a
+wrong request cannot empty another site's database, and a site without a user
+is refused. The same flush is also available to the site itself (its user may
+`FLUSHDB` its own database), without the panel.
 
 ## `backup.delete`
 
