@@ -253,10 +253,11 @@ pub struct IncompleteOperation {
 }
 
 /// Operations whose interrupted runs `site.reconcile` rolls back.
-const RECONCILED: [&str; 4] = [
+const RECONCILED: [&str; 5] = [
     "site.importArchive",
     "wordpress.migrateImport",
     "wordpress.clone",
+    "joomla.clone",
     "site.migrateRuntime",
 ];
 

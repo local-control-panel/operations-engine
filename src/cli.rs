@@ -105,6 +105,12 @@ pub enum Command {
         command: DrupalCommand,
     },
 
+    /// Typed Joomla application operations.
+    Joomla {
+        #[command(subcommand)]
+        command: JoomlaCommand,
+    },
+
     /// Typed CMS application operations that are not tied to one CMS's own
     /// command group.
     Cms {
@@ -165,6 +171,7 @@ impl Command {
             Self::Permissions { command } => command.operation(),
             Self::Wordpress { command } => command.operation(),
             Self::Drupal { command } => command.operation(),
+            Self::Joomla { command } => command.operation(),
             Self::Cms { command } => command.operation(),
             Self::Tool { command } => command.operation(),
             Self::Agent { command } => command.operation(),
@@ -356,6 +363,30 @@ impl DrupalCommand {
             Self::InstallDrush { .. } => "drupal.installDrush",
             Self::UpdateDb { .. } => "drupal.updateDb",
             Self::Watchdog { .. } => "drupal.watchdog",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum JoomlaCommand {
+    /// Clone a Joomla 4+ site's files and database into a staging directory
+    /// on the same server, with its own database credentials, a new secret
+    /// and the chosen safety defaults, under one lock/idempotency/
+    /// transaction/audit-backed request.
+    Clone {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+}
+
+impl JoomlaCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::Clone { .. } => "joomla.clone",
         }
     }
 }
