@@ -106,7 +106,8 @@ pub fn execute(
     let args = [
         "exec",
         req.container.as_str(),
-        "valkey-cli",
+        "sh",
+        crate::valkey::ADMIN_CLI,
         "FLUSHALL",
         "ASYNC",
     ];
@@ -273,7 +274,7 @@ mod tests {
         assert!(result.accepted);
         assert_eq!(
             fs::read_to_string(argv_path).unwrap(),
-            "exec\nvalkey-8\nvalkey-cli\nFLUSHALL\nASYNC\n"
+            "exec\nvalkey-8\nsh\n/etc/valkey/wcp-valkey-cli.sh\nFLUSHALL\nASYNC\n"
         );
     }
 }

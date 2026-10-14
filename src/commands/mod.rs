@@ -20,6 +20,7 @@ pub mod site_admin;
 pub mod stack;
 pub mod system;
 pub mod tool;
+pub mod valkey_site;
 pub mod version;
 pub mod wordpress;
 

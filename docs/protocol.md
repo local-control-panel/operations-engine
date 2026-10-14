@@ -368,7 +368,7 @@ The fixed MariaDB argv runs under the same per-container lock namespace as
 
 `db delete-valkey-key` accepts a root-owned JSON request containing a validated
 container name and one non-empty Valkey key of at most 4096 UTF-8 bytes. The
-key is sent verbatim over stdin to the fixed `valkey-cli -x DEL` invocation and
+key is sent verbatim over stdin to the fixed `-x DEL` invocation and
 never appears in process argv, transaction results or audit records. Lock and
 transaction state are scoped by the key's SHA-256 digest. The result reports
 whether the key existed and was deleted.
@@ -378,7 +378,7 @@ whether the key existed and was deleted.
 `db flush-valkey-db` accepts a root-owned JSON request containing a validated
 container name and the exact confirmation token `FLUSHDB`. The engine rejects
 missing, differently-cased or broader tokens before execution, then invokes
-only the fixed `valkey-cli FLUSHDB ASYNC` argv. Per-container locking,
+only the fixed `FLUSHDB ASYNC` command. Per-container locking,
 idempotency, transaction state and audit records prevent overlapping or
 ambiguous retries. The operation never exposes a generic Valkey command.
 
@@ -387,8 +387,46 @@ ambiguous retries. The operation never exposes a generic Valkey command.
 `db flush-all-valkey` accepts a root-owned JSON request containing a validated
 container name and the exact confirmation token `FLUSHALL`. `FLUSHDB` and all
 other variants are rejected before execution. The engine invokes only the
-fixed `valkey-cli FLUSHALL ASYNC` argv and serializes the host-wide mutation
+fixed `FLUSHALL ASYNC` command and serializes the host-wide mutation
 with its own per-container lock, idempotency state and audit trail.
+
+## Valkey access control and the administrator wrapper
+
+Valkey runs with its `default` user off (see the `images` repository). Every
+Valkey operation runs `docker exec <container> sh /etc/valkey/wcp-valkey-cli.sh
+<command>`: the wrapper reads the administrator's password from the container's
+own environment, so no Valkey credential appears in a request, an argv or a
+log. An older Valkey container without the wrapper makes these operations fail
+(`SUBPROCESS_FAILED`) rather than fall back to an unauthenticated client.
+
+## `db.provisionValkeySite`
+
+`db provision-valkey-site` accepts a root-owned request with a validated
+container and a site `domain` (lowercase letters, digits, hyphens and dots) and
+requires an idempotency key. The engine creates the ACL user `site_<domain>`, or
+replaces its password: `ACL SETUSER ... reset on #<sha256> resetkeys
+~wcp:<domain>:* resetchannels &wcp:<domain>:*`, all commands off, then only the
+read/write/keyspace/data-type/transaction/connection/pubsub categories, with
+`@dangerous`, `@admin`, `SCAN`, `RANDOMKEY`, `DBSIZE` and `SELECT` removed and
+`EVAL`/`EVALSHA` allowed (Valkey checks every command and key inside a script
+against the same user). `ACL SAVE` persists it. The password is generated here
+(32 alphanumeric characters), reaches Valkey only as a SHA-256 hash and is
+returned once as a secret result together with `username` and `prefix`
+(`wcp:<domain>:`). The transaction state keeps only the public part; a replay
+returns it with `alreadyIssued: true` and no password.
+
+## `db.revokeValkeySite`
+
+`db revoke-valkey-site` removes the site's keys (a script that `SCAN`s and
+`UNLINK`s the prefix, the pattern passed as `ARGV[1]`), deletes the user (which
+also closes its connections) and runs `ACL SAVE`. A site without a user is a
+success with `revoked: false`.
+
+## `db.flushValkeySite`
+
+`db flush-valkey-site` removes the keys under `wcp:<domain>:` only and reports
+`keysRemoved`. The user stays. It is the flush a site-limited user cannot run
+itself.
 
 ## `backup.delete`
 

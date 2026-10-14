@@ -111,7 +111,8 @@ pub fn execute(
         "exec",
         "-i",
         req.container.as_str(),
-        "valkey-cli",
+        "sh",
+        crate::valkey::ADMIN_CLI,
         "-x",
         "DEL",
     ];
@@ -291,7 +292,7 @@ mod tests {
         assert!(result.deleted);
         assert_eq!(fs::read(stdin_path).unwrap(), key.as_bytes());
         let argv = fs::read_to_string(argv_path).unwrap();
-        assert!(argv.contains("valkey-cli\n-x\nDEL"));
+        assert!(argv.contains("sh\n/etc/valkey/wcp-valkey-cli.sh\n-x\nDEL"));
         assert!(!argv.contains("cache key"));
     }
 }

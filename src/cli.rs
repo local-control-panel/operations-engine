@@ -2478,6 +2478,34 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Create a site's Valkey user (or give it a new password). The password
+    /// is returned once as a secret result.
+    ProvisionValkeySite {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Remove a site's Valkey keys and its user.
+    RevokeValkeySite {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove a site's Valkey keys (the user stays).
+    FlushValkeySite {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Asynchronously flush every Valkey database after explicit confirmation.
     FlushAllValkey {
         #[arg(long = "request-file")]
@@ -2578,6 +2606,9 @@ impl DbCommand {
             Self::DeleteValkeyKey { .. } => "db.deleteValkeyKey",
             Self::FlushValkeyDb { .. } => "db.flushValkeyDb",
             Self::FlushAllValkey { .. } => "db.flushAllValkey",
+            Self::ProvisionValkeySite { .. } => "db.provisionValkeySite",
+            Self::RevokeValkeySite { .. } => "db.revokeValkeySite",
+            Self::FlushValkeySite { .. } => "db.flushValkeySite",
             Self::ProvisionPostgres { .. } => "db.provisionPostgres",
             Self::DropPostgres { .. } => "db.dropPostgres",
             Self::ProvisionPostgresUser { .. } => "db.provisionPostgresUser",

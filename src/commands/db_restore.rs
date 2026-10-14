@@ -131,6 +131,36 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => flush_all_valkey(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::ProvisionValkeySite {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::valkey_site::run(
+            crate::commands::valkey_site::Action::Provision,
+            &request_file,
+            &request_id,
+            Some(&idempotency_key),
+        ),
+        DbCommand::RevokeValkeySite {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::valkey_site::run(
+            crate::commands::valkey_site::Action::Revoke,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        DbCommand::FlushValkeySite {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::valkey_site::run(
+            crate::commands::valkey_site::Action::Flush,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         DbCommand::ProvisionPostgres {
             request_file,
             request_id,
