@@ -91,6 +91,7 @@ pub const OPERATIONS: &[&str] = &[
     "db.provisionValkeySite",
     "db.revokeValkeySite",
     "db.flushValkeySite",
+    "db.renameValkeySite",
     "db.provisionPostgres",
     "db.dropPostgres",
     "db.provisionPostgresUser",

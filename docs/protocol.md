@@ -426,6 +426,19 @@ SAVE`. The database is read from the user's own ACL (`ACL GETUSER`), never from
 the request. A site without a user is a success with `revoked: false` and
 nothing flushed.
 
+## `db.renameValkeySite`
+
+`db rename-valkey-site` moves a site's Valkey user to a new domain name. The
+request names the container, the new `domain` and the previous domain as
+`from`. The engine reads the old user (`ACL GETUSER`: its single database and its
+single SHA-256 password hash), creates `site_<new>` with the same database and
+the same hash, deletes `site_<old>` (closing its connections) and runs `ACL
+SAVE`. The password and the data stay as they were; only the user name changes.
+A site whose old domain has no user is a success with `renamed: false`; a
+different existing user under the new name is refused with `CONFLICT` and
+nothing changes; a retry after a partial run (both users present and equal)
+finishes the move.
+
 ## `db.flushValkeySite`
 
 `db flush-valkey-site` empties the site's database and reports `keysRemoved`

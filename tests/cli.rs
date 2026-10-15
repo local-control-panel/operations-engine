@@ -96,6 +96,7 @@ fn capabilities_describe_only_implemented_operations() {
             "db.provisionValkeySite",
             "db.revokeValkeySite",
             "db.flushValkeySite",
+            "db.renameValkeySite",
             "db.provisionPostgres",
             "db.dropPostgres",
             "db.provisionPostgresUser",

@@ -151,6 +151,16 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        DbCommand::RenameValkeySite {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::valkey_site::run(
+            crate::commands::valkey_site::Action::Rename,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         DbCommand::FlushValkeySite {
             request_file,
             request_id,

@@ -2497,6 +2497,16 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Move a site's Valkey user to a new domain name: same database, same
+    /// password, new user name.
+    RenameValkeySite {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Remove a site's Valkey keys (the user stays).
     FlushValkeySite {
         #[arg(long = "request-file")]
@@ -2609,6 +2619,7 @@ impl DbCommand {
             Self::ProvisionValkeySite { .. } => "db.provisionValkeySite",
             Self::RevokeValkeySite { .. } => "db.revokeValkeySite",
             Self::FlushValkeySite { .. } => "db.flushValkeySite",
+            Self::RenameValkeySite { .. } => "db.renameValkeySite",
             Self::ProvisionPostgres { .. } => "db.provisionPostgres",
             Self::DropPostgres { .. } => "db.dropPostgres",
             Self::ProvisionPostgresUser { .. } => "db.provisionPostgresUser",
