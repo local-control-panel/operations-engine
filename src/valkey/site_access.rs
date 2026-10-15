@@ -45,6 +45,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const PROVISION_OPERATION: &str = "db.provisionValkeySite";
 pub const REVOKE_OPERATION: &str = "db.revokeValkeySite";
 pub const FLUSH_OPERATION: &str = "db.flushValkeySite";
+pub const RENAME_OPERATION: &str = "db.renameValkeySite";
 
 const PASSWORD_LEN: usize = 32;
 
@@ -60,6 +61,9 @@ struct Plan {
     /// Only `db.provisionValkeySite` takes it; the others read it from the user.
     #[serde(default)]
     database: Option<u16>,
+    /// Only `db.renameValkeySite`: the domain the site had (`domain` is the new one).
+    #[serde(default)]
+    from: Option<String>,
 }
 
 #[derive(Debug)]
@@ -68,6 +72,8 @@ pub struct SiteRequest {
     pub domain: Domain,
     /// The site's database (provisioning only).
     pub database: Option<u16>,
+    /// The previous domain (renaming only).
+    pub from: Option<Domain>,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -94,6 +100,10 @@ impl SiteRequest {
                 Some(_) => return Err(RequestError::InvalidDatabase),
                 None => None,
             },
+            from: plan
+                .from
+                .map(|value| Domain::parse(&value).map_err(|_| RequestError::InvalidDomain))
+                .transpose()?,
             request_id: RequestId::parse(request_id).map_err(|_| RequestError::InvalidRequestId)?,
             idempotency_key: key
                 .map(IdempotencyKey::parse)
@@ -134,6 +144,15 @@ pub struct FlushSiteResult {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RenameResult {
+    /// `false` when the old domain had no user (nothing to move).
+    pub renamed: bool,
+    pub username: String,
+    pub completed_at_unix_secs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RevokeResult {
     /// `false` when the site had no user (the operation is still a success).
     pub revoked: bool,
@@ -163,6 +182,11 @@ pub enum Error {
     PostCommitProvision(Box<ProvisionResult>),
     PostCommitFlush(FlushSiteResult),
     PostCommitRevoke(RevokeResult),
+    PostCommitRename(RenameResult),
+    /// Renaming needs the previous domain.
+    MissingFrom,
+    /// The new domain already has a different Valkey user.
+    TargetExists,
     Replayed {
         code: ErrorCode,
         message: String,
@@ -205,6 +229,14 @@ impl Error {
             Self::NotProvisioned => (
                 ErrorCode::InvalidInput,
                 "the site has no Valkey user with exactly one database".into(),
+            ),
+            Self::MissingFrom => (
+                ErrorCode::InvalidInput,
+                "the previous domain is required".into(),
+            ),
+            Self::TargetExists => (
+                ErrorCode::Conflict,
+                "the new domain already has a different Valkey user".into(),
             ),
             Self::MissingDatabase => (
                 ErrorCode::InvalidInput,
@@ -360,6 +392,24 @@ fn expect_count(output: &[u8]) -> Result<u64, Error> {
         .ok()
         .and_then(|text| text.trim().parse().ok())
         .ok_or(Error::MalformedOutput)
+}
+
+/// The one SHA-256 password hash of a user, from `ACL GETUSER`'s reply (the
+/// lines after `passwords`). `None` unless there is exactly one, 64 hex digits.
+fn parse_user_hash(reply: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(reply).ok()?;
+    let mut lines = text.lines().map(str::trim);
+    lines.find(|line| *line == "passwords")?;
+    let hashes: Vec<&str> = lines
+        .take_while(|line| *line != "commands")
+        .filter(|line| !line.is_empty())
+        .collect();
+    match hashes.as_slice() {
+        [hash] if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Some(hash.to_ascii_lowercase())
+        }
+        _ => None,
+    }
 }
 
 /// Empties the database of the site's user and returns how many keys it held.
@@ -671,6 +721,90 @@ pub fn revoke(
     Ok(result)
 }
 
+pub fn rename(
+    ctx: &Context<'_>,
+    req: &SiteRequest,
+    cancel: &CancellationToken,
+) -> Result<RenameResult, Error> {
+    let scope = open_scope(ctx, req, "valkey-site-rename")?;
+    let mut begun = match begin(&scope, req, RENAME_OPERATION)? {
+        Admission::Replay(value) => {
+            return serde_json::from_value(value)
+                .map_err(|error| Error::Io(std::io::Error::other(error)));
+        }
+        Admission::Run(begun) => begun,
+    };
+    let Some(from) = req.from.as_ref() else {
+        return Err(abort(&begun, Error::MissingFrom));
+    };
+    if cancel.is_cancelled() {
+        return Err(abort(&begun, Error::Cancelled));
+    }
+    let old_user = format!("site_{from}");
+    let steps = (|| {
+        let get = |user: &str| {
+            admin(
+                ctx,
+                &req.container,
+                &["ACL".into(), "GETUSER".into(), user.to_owned()],
+                cancel,
+            )
+        };
+        let old = get(&old_user)?;
+        let (Some(database), Some(hash)) = (parse_user_database(&old), parse_user_hash(&old))
+        else {
+            // The old domain has no (usable) user: nothing to move.
+            return Ok::<_, Error>(false);
+        };
+        // An existing user under the new name is fine only when it is the same
+        // one (a retry after a partial run); anything else is never overwritten.
+        let target = get(&req.username())?;
+        if !target.iter().all(u8::is_ascii_whitespace)
+            && (parse_user_database(&target) != Some(database)
+                || parse_user_hash(&target).as_deref() != Some(hash.as_str()))
+        {
+            return Err(Error::TargetExists);
+        }
+        // Same database and same password hash, new name: the site keeps its
+        // password and only its user name changes.
+        let rules = acl_rules(&req.username(), database, &hash);
+        expect_ok(&admin(ctx, &req.container, &rules, cancel)?)?;
+        // DELUSER also closes the old user's connections.
+        expect_count(&admin(
+            ctx,
+            &req.container,
+            &["ACL".into(), "DELUSER".into(), old_user.clone()],
+            cancel,
+        )?)?;
+        expect_ok(&admin(
+            ctx,
+            &req.container,
+            &["ACL".into(), "SAVE".into()],
+            cancel,
+        )?)?;
+        Ok(true)
+    })();
+    let renamed = match steps {
+        Ok(value) => value,
+        Err(error) => return Err(abort(&begun, error)),
+    };
+    let result = RenameResult {
+        renamed,
+        username: req.username(),
+        completed_at_unix_secs: now_secs(),
+    };
+    if !commit(
+        &mut begun,
+        serde_json::to_value(&result).unwrap(),
+        req.request_id,
+    ) {
+        drop(begun.lock);
+        return Err(Error::PostCommitRename(result));
+    }
+    drop(begun.lock);
+    Ok(result)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -710,9 +844,15 @@ case "$*" in
   *"ACL SETUSER"*) test -f "$base/REJECT_SETUSER" && exit 1; echo OK ;;
   *"ACL SAVE"*) test -f "$base/REJECT_SAVE" && exit 1; echo OK ;;
   *"ACL DELUSER"*) cat "$base/DELUSER_REPLY" 2>/dev/null || echo 1 ;;
+  *"ACL GETUSER site_new.test"*)
+    if test -f "$base/TARGET_SAME"; then
+      printf 'flags\non\npasswords\n%s\ncommands\n-@all\nkeys\n~*\nchannels\n\ndatabases\ndb=7\nselectors\n' "$(printf 'a%.0s' $(seq 1 64))"
+    elif test -f "$base/TARGET_OTHER"; then
+      printf 'flags\non\npasswords\n%s\ncommands\n-@all\nkeys\n~*\nchannels\n\ndatabases\ndb=9\nselectors\n' "$(printf 'b%.0s' $(seq 1 64))"
+    else echo; fi ;;
   *"ACL GETUSER"*)
     if test -f "$base/NO_USER"; then echo; else
-      printf 'flags\non\npasswords\nabc\ncommands\n-@all\nkeys\n~*\nchannels\n\ndatabases\n%s\nselectors\n' "$(cat "$base/USER_DB" 2>/dev/null || echo db=7)"
+      printf 'flags\non\npasswords\n%s\ncommands\n-@all\nkeys\n~*\nchannels\n\ndatabases\n%s\nselectors\n' "$(printf 'a%.0s' $(seq 1 64))" "$(cat "$base/USER_DB" 2>/dev/null || echo db=7)"
     fi ;;
   *" DBSIZE"*) cat "$base/DBSIZE_REPLY" 2>/dev/null || echo 3 ;;
   *"FLUSHDB ASYNC"*) test -f "$base/REJECT_FLUSH" && exit 1; echo OK ;;
@@ -1074,6 +1214,124 @@ esac
             &CancellationToken::default(),
         );
         assert!(matches!(result, Err(Error::MalformedOutput)));
+    }
+
+    fn rename_request(from: &str, to: &str, id: &str) -> SiteRequest {
+        let json = serde_json::json!({"container":"valkey-9","domain":to,"from":from}).to_string();
+        SiteRequest::parse(&json, id, None).unwrap()
+    }
+
+    #[test]
+    fn the_password_hash_is_read_only_when_there_is_exactly_one() {
+        let reply = |lines: &str| format!("flags\non\npasswords\n{lines}commands\n-@all\n");
+        let hash = "a".repeat(64);
+        assert_eq!(
+            parse_user_hash(reply(&format!("{hash}\n")).as_bytes()),
+            Some(hash.clone())
+        );
+        assert_eq!(parse_user_hash(reply("").as_bytes()), None, "no password");
+        assert_eq!(
+            parse_user_hash(reply(&format!("{hash}\n{}\n", "b".repeat(64))).as_bytes()),
+            None,
+            "two passwords"
+        );
+        assert_eq!(parse_user_hash(reply("short\n").as_bytes()), None);
+        assert_eq!(
+            parse_user_hash(reply(&format!("{}\n", "z".repeat(64))).as_bytes()),
+            None
+        );
+        assert_eq!(parse_user_hash(b"\n"), None);
+    }
+
+    #[test]
+    fn renaming_moves_the_user_with_the_same_database_and_password_hash() {
+        let fx = Fixture::new();
+        let result = rename(
+            &fx.context(),
+            &rename_request("old.test", "new.test", ID),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(result.renamed);
+        assert_eq!(result.username, "site_new.test");
+        let calls = fx.calls();
+        assert!(calls[0].ends_with("ACL GETUSER site_old.test"));
+        assert!(calls[1].ends_with("ACL GETUSER site_new.test"));
+        let set = &calls[2];
+        assert!(
+            set.contains("ACL SETUSER site_new.test reset on #aaaaaaaa"),
+            "{set}"
+        );
+        assert!(set.contains(" db=7 "), "{set}");
+        assert!(calls[3].ends_with("ACL DELUSER site_old.test"));
+        assert!(calls[4].ends_with("ACL SAVE"));
+        assert!(
+            calls
+                .iter()
+                .all(|c| !c.contains("FLUSH") && !c.contains("DBSIZE")),
+            "a rename never touches the data"
+        );
+    }
+
+    #[test]
+    fn renaming_a_site_that_has_no_user_is_a_success_that_moves_nothing() {
+        let fx = Fixture::new();
+        fx.mark("NO_USER", "");
+        let result = rename(
+            &fx.context(),
+            &rename_request("old.test", "new.test", ID),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(!result.renamed);
+        assert_eq!(fx.calls().len(), 1);
+    }
+
+    #[test]
+    fn renaming_onto_a_different_existing_user_is_refused_and_changes_nothing() {
+        let fx = Fixture::new();
+        fx.mark("TARGET_OTHER", "");
+        let result = rename(
+            &fx.context(),
+            &rename_request("old.test", "new.test", ID),
+            &CancellationToken::default(),
+        );
+        assert!(matches!(result, Err(Error::TargetExists)));
+        assert!(
+            fx.calls()
+                .iter()
+                .all(|c| !c.contains("SETUSER") && !c.contains("DELUSER"))
+        );
+    }
+
+    #[test]
+    fn a_retry_after_a_partial_rename_finishes_it() {
+        let fx = Fixture::new();
+        fx.mark("TARGET_SAME", "");
+        let result = rename(
+            &fx.context(),
+            &rename_request("old.test", "new.test", ID),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert!(result.renamed);
+        assert!(
+            fx.calls()
+                .iter()
+                .any(|c| c.contains("ACL DELUSER site_old.test"))
+        );
+    }
+
+    #[test]
+    fn a_rename_without_the_previous_domain_is_refused() {
+        let fx = Fixture::new();
+        let result = rename(
+            &fx.context(),
+            &req("new.test", ID, None),
+            &CancellationToken::default(),
+        );
+        assert!(matches!(result, Err(Error::MissingFrom)));
+        assert!(fx.calls().is_empty());
     }
 
     #[test]

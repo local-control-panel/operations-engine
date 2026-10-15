@@ -5,13 +5,16 @@ use crate::{
     error::ErrorCode,
     protocol::{Response, ResponseBuildError},
     secret_result,
-    valkey::site_access::{self, FLUSH_OPERATION, PROVISION_OPERATION, REVOKE_OPERATION},
+    valkey::site_access::{
+        self, FLUSH_OPERATION, PROVISION_OPERATION, RENAME_OPERATION, REVOKE_OPERATION,
+    },
 };
 
 pub enum Action {
     Provision,
     Revoke,
     Flush,
+    Rename,
 }
 
 impl Action {
@@ -20,6 +23,7 @@ impl Action {
             Self::Provision => PROVISION_OPERATION,
             Self::Revoke => REVOKE_OPERATION,
             Self::Flush => FLUSH_OPERATION,
+            Self::Rename => RENAME_OPERATION,
         }
     }
 }
@@ -110,6 +114,12 @@ pub fn run(
             },
             Action::Revoke => match site_access::revoke(&context, &request, &cancel) {
                 Ok(value) | Err(Error::PostCommitRevoke(value)) => {
+                    Response::success(operation, value)
+                }
+                Err(error) => failure(operation, &error),
+            },
+            Action::Rename => match site_access::rename(&context, &request, &cancel) {
+                Ok(value) | Err(Error::PostCommitRename(value)) => {
                     Response::success(operation, value)
                 }
                 Err(error) => failure(operation, &error),
