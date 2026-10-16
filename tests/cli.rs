@@ -126,6 +126,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.typedActions",
             "wordpress.setSmtpRelay",
             "cms.clearCache",
+            "drupal.automatedCron",
             "drupal.cacheRebuild",
             "drupal.cronRun",
             "drupal.installDrush",
