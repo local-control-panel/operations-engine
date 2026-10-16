@@ -20,6 +20,7 @@ pub mod backup_schedule;
 pub mod backup_trigger;
 pub mod cli;
 pub mod cms_cache;
+pub mod cms_maintenance;
 pub mod commands;
 pub mod compose;
 #[cfg(unix)]

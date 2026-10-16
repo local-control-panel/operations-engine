@@ -415,12 +415,24 @@ pub enum CmsCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Turn maintenance mode on or off for a Joomla (`site:down`/`site:up`)
+    /// or Laravel (`artisan down --secret`/`up`) project; explicit `state`
+    /// in the request.
+    Maintenance {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl CmsCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::ClearCache { .. } => "cms.clearCache",
+            Self::Maintenance { .. } => "cms.maintenance",
         }
     }
 }
