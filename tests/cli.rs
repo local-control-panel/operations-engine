@@ -125,6 +125,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.boundedAction",
             "wordpress.typedActions",
             "wordpress.setSmtpRelay",
+            "wordpress.rotateDebugLog",
             "cms.clearCache",
             "drupal.cacheRebuild",
             "drupal.cronRun",

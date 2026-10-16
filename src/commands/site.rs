@@ -1488,7 +1488,7 @@ fn release_root(
 /// Loads the engine config and state root, runs one `site_root` operation
 /// and maps its outcome to a protocol response.
 #[cfg(unix)]
-fn run_site_root<T: serde::Serialize>(
+pub(crate) fn run_site_root<T: serde::Serialize>(
     operation: &'static str,
     run: impl FnOnce(
         &crate::filesystem::ManagedRoot,

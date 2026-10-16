@@ -102,6 +102,8 @@ pub mod valkey;
 pub mod wordpress;
 pub mod wordpress_bounded_action;
 pub mod wordpress_clone;
+#[cfg(unix)]
+pub mod wordpress_debug_log;
 pub mod wordpress_drop_tables;
 pub mod wordpress_import;
 pub mod wordpress_install;
