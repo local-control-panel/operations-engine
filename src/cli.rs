@@ -1174,6 +1174,18 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Rotate `wp-content/debug.log` (rename-based, bounded copies, fresh
+    /// file with the same owner and mode) without reading its contents.
+    RotateDebugLog {
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        keep: Option<u32>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Install WP Mail SMTP and atomically write its relay constants to
     /// wp-config.php; the password arrives only in the root-owned request.
     SetSmtpRelay {
@@ -1204,6 +1216,7 @@ impl WordpressCommand {
             Self::DropTables { .. } => "wordpress.dropTables",
             Self::BoundedAction { .. } => "wordpress.boundedAction",
             Self::SetSmtpRelay { .. } => "wordpress.setSmtpRelay",
+            Self::RotateDebugLog { .. } => "wordpress.rotateDebugLog",
         }
     }
 }

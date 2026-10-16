@@ -28,7 +28,9 @@ fn wp_cli_operation(command: &WordpressCommand) -> Option<&'static str> {
         WordpressCommand::DropTables { .. } => wordpress_drop_tables::OPERATION,
         WordpressCommand::BoundedAction { .. } => wordpress_bounded_action::OPERATION,
         WordpressCommand::SetSmtpRelay { .. } => wordpress_smtp_relay::OPERATION,
-        WordpressCommand::MigrateDiscard { .. } => return None,
+        WordpressCommand::MigrateDiscard { .. } | WordpressCommand::RotateDebugLog { .. } => {
+            return None;
+        }
     })
 }
 
@@ -125,6 +127,12 @@ pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => set_smtp_relay(&request_file, &request_id, idempotency_key.as_deref()),
+        WordpressCommand::RotateDebugLog {
+            path,
+            keep,
+            request_id,
+            idempotency_key,
+        } => rotate_debug_log(&path, keep, &request_id, idempotency_key.as_deref()),
     }
 }
 
@@ -855,6 +863,45 @@ fn bounded_action(
             wordpress_bounded_action::OPERATION,
             ErrorCode::UnsupportedPlatform,
             "wordpress.boundedAction requires a Unix host",
+        ))
+    }
+}
+
+fn rotate_debug_log(
+    path: &str,
+    keep: Option<u32>,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::wordpress_debug_log::{OPERATION, RotateRequest};
+
+        let request = match RotateRequest::parse(path, keep, request_id, idempotency_key) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(Response::failure(
+                    OPERATION,
+                    ErrorCode::InvalidInput,
+                    error.message(),
+                ));
+            }
+        };
+        crate::commands::site::run_site_root(OPERATION, |engine_state, config| {
+            crate::wordpress_debug_log::rotate_debug_log(
+                engine_state,
+                &config.content_roots,
+                &request,
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, keep, request_id, idempotency_key);
+        Ok(Response::failure(
+            "wordpress.rotateDebugLog",
+            ErrorCode::UnsupportedPlatform,
+            "wordpress.rotateDebugLog requires a Unix host",
         ))
     }
 }
