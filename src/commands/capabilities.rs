@@ -124,8 +124,10 @@ pub const OPERATIONS: &[&str] = &[
     // install), carried by `wordpress.boundedAction`.
     "wordpress.typedActions",
     "wordpress.setSmtpRelay",
+    "wordpress.rotateDebugLog",
     "cms.clearCache",
     "cms.maintenance",
+    "drupal.automatedCron",
     "drupal.cacheRebuild",
     "drupal.cronRun",
     "drupal.installDrush",

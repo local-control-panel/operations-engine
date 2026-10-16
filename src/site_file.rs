@@ -122,7 +122,7 @@ pub fn is_env_file_name(name: &str) -> bool {
         || (name.len() > ".env.".len() && name.starts_with(".env."))
 }
 
-fn parse_path(path: &str) -> Result<&Path, RequestError> {
+pub(crate) fn parse_path(path: &str) -> Result<&Path, RequestError> {
     if path.is_empty() || path.len() > MAX_PATH_BYTES || path.contains('\0') {
         return Err(RequestError::InvalidPath);
     }
@@ -133,7 +133,7 @@ fn parse_path(path: &str) -> Result<&Path, RequestError> {
     Ok(path)
 }
 
-fn parse_ids(
+pub(crate) fn parse_ids(
     request_id: &str,
     key: Option<&str>,
 ) -> Result<(RequestId, Option<IdempotencyKey>), RequestError> {
@@ -322,7 +322,7 @@ struct QuarantineManifest<'a> {
 
 /// The content root a path is below and its components beneath it, which
 /// must be a site directory and at least one more level.
-fn split_path<'a>(
+pub(crate) fn split_path<'a>(
     content_roots: &'a [TrustedRoot],
     path: &Path,
 ) -> Result<(&'a TrustedRoot, Vec<SiteRelativePath>), Error> {
@@ -347,7 +347,7 @@ fn split_path<'a>(
 
 /// Walks to the directory holding the file without following a symlink and
 /// returns it with the file's name.
-fn open_parent(
+pub(crate) fn open_parent(
     content_root: &TrustedRoot,
     names: &[SiteRelativePath],
 ) -> Result<(ManagedRoot, SiteRelativePath), Error> {

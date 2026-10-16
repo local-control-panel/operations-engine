@@ -30,6 +30,17 @@ pub fn run(command: DrupalCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        DrupalCommand::AutomatedCron {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => action(
+            "automated-cron",
+            drupal_action::AUTOMATED_CRON,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         DrupalCommand::InstallDrush {
             request_file,
             request_id,

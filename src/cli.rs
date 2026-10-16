@@ -314,6 +314,17 @@ pub enum DrupalCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Set `automated_cron.settings:interval` through Drush `config:set`
+    /// (default `0` = off, or the `interval` of the request to restore it);
+    /// returns the previous and the new value and does nothing when equal.
+    AutomatedCron {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Install Drush into the site's Composer project
     /// (`composer require drush/drush` with the engine-managed Composer) as
     /// the site user.
@@ -359,6 +370,7 @@ impl DrupalCommand {
         match self {
             Self::CacheRebuild { .. } => "drupal.cacheRebuild",
             Self::CronRun { .. } => "drupal.cronRun",
+            Self::AutomatedCron { .. } => "drupal.automatedCron",
             Self::Maintenance { .. } => "drupal.maintenance",
             Self::InstallDrush { .. } => "drupal.installDrush",
             Self::UpdateDb { .. } => "drupal.updateDb",
@@ -1174,6 +1186,18 @@ pub enum WordpressCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Rotate `wp-content/debug.log` (rename-based, bounded copies, fresh
+    /// file with the same owner and mode) without reading its contents.
+    RotateDebugLog {
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        keep: Option<u32>,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Install WP Mail SMTP and atomically write its relay constants to
     /// wp-config.php; the password arrives only in the root-owned request.
     SetSmtpRelay {
@@ -1204,6 +1228,7 @@ impl WordpressCommand {
             Self::DropTables { .. } => "wordpress.dropTables",
             Self::BoundedAction { .. } => "wordpress.boundedAction",
             Self::SetSmtpRelay { .. } => "wordpress.setSmtpRelay",
+            Self::RotateDebugLog { .. } => "wordpress.rotateDebugLog",
         }
     }
 }
