@@ -314,6 +314,17 @@ pub enum DrupalCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Set `automated_cron.settings:interval` through Drush `config:set`
+    /// (default `0` = off, or the `interval` of the request to restore it);
+    /// returns the previous and the new value and does nothing when equal.
+    AutomatedCron {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Install Drush into the site's Composer project
     /// (`composer require drush/drush` with the engine-managed Composer) as
     /// the site user.
@@ -359,6 +370,7 @@ impl DrupalCommand {
         match self {
             Self::CacheRebuild { .. } => "drupal.cacheRebuild",
             Self::CronRun { .. } => "drupal.cronRun",
+            Self::AutomatedCron { .. } => "drupal.automatedCron",
             Self::Maintenance { .. } => "drupal.maintenance",
             Self::InstallDrush { .. } => "drupal.installDrush",
             Self::UpdateDb { .. } => "drupal.updateDb",
