@@ -765,6 +765,22 @@ maintenance mode read back (for `maintenance`) and the completion time. The
 operations are transaction/audit recorded and replay their outcome for a
 retried request with the same idempotency key.
 
+## `drupal.automatedCron`
+
+`drupal automated-cron` takes the same request as the other Drupal actions plus
+an optional `"interval"` (whole seconds, 0 to 31536000, default `0`; refused for
+every other Drupal action). It switches Drupal's web-triggered cron
+(`automated_cron.settings:interval`, `0` = off) so a system cron job can own the
+schedule, and can restore a previous interval. Under the same lock, idempotency
+and audit rules it runs, as the site user in the site's container, `drush
+config:get automated_cron.settings interval --format=json`, then (only when the
+value differs) `drush config:set --input-format=yaml automated_cron.settings
+interval <n>`, then reads it back and fails with `subprocessFailed` if Drupal
+does not report the requested value. Nothing is written to files. When Drush or
+Drupal cannot report the interval (no Drush, no Drupal, the `automated_cron`
+module uninstalled) the request fails before anything is set. The result has
+`previousInterval`, `interval` and `changed` (`false` for a repeat).
+
 ## `drupal.updateDb`
 
 `drupal update-db` takes the same request as the other Drupal actions

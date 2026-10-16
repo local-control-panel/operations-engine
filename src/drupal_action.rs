@@ -45,6 +45,11 @@ pub const CRON_RUN: &str = "drupal.cronRun";
 pub const MAINTENANCE: &str = "drupal.maintenance";
 pub const INSTALL_DRUSH: &str = "drupal.installDrush";
 pub const UPDATE_DB: &str = "drupal.updateDb";
+pub const AUTOMATED_CRON: &str = "drupal.automatedCron";
+
+/// Upper bound for a restored interval (one year, in seconds); Drupal offers
+/// 3 hours to 1 week, `0` turns the web-triggered cron off.
+const MAX_CRON_INTERVAL: u32 = 31_536_000;
 
 /// Path of the engine-managed Composer inside runtime containers (the tools
 /// directory is mounted read-only at `/opt/wcp-tools`).
@@ -66,9 +71,15 @@ const MAX_OUTPUT: usize = 64 * 1024;
 pub enum Action {
     CacheRebuild,
     CronRun,
-    Maintenance { enabled: bool },
+    Maintenance {
+        enabled: bool,
+    },
     InstallDrush,
     UpdateDb,
+    /// Set `automated_cron.settings:interval` (seconds; `0` = off).
+    AutomatedCron {
+        interval: u32,
+    },
 }
 
 impl Action {
@@ -79,6 +90,7 @@ impl Action {
             Self::Maintenance { .. } => MAINTENANCE,
             Self::InstallDrush => INSTALL_DRUSH,
             Self::UpdateDb => UPDATE_DB,
+            Self::AutomatedCron { .. } => AUTOMATED_CRON,
         }
     }
 
@@ -89,6 +101,7 @@ impl Action {
             Self::Maintenance { .. } => "maintenance",
             Self::InstallDrush => "installDrush",
             Self::UpdateDb => "updateDb",
+            Self::AutomatedCron { .. } => "automatedCron",
         }
     }
 }
@@ -103,6 +116,8 @@ struct Plan {
     gid: u32,
     /// `"on"` or `"off"`; required for maintenance, forbidden otherwise.
     state: Option<String>,
+    /// Seconds for `automated-cron` (default `0` = off); forbidden otherwise.
+    interval: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -121,6 +136,7 @@ pub struct Request {
 pub enum RequestError {
     InvalidJson,
     InvalidState,
+    InvalidInterval,
     InvalidRoot,
     InvalidContainer,
     InvalidRequestId,
@@ -151,7 +167,17 @@ impl Request {
         key: Option<&str>,
     ) -> Result<Self, RequestError> {
         let plan: Plan = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
+        if plan.interval.is_some() && kind != "automated-cron" {
+            return Err(RequestError::InvalidInterval);
+        }
         let action = match (kind, plan.state.as_deref()) {
+            ("automated-cron", None) => {
+                let interval = plan.interval.unwrap_or(0);
+                if interval > MAX_CRON_INTERVAL {
+                    return Err(RequestError::InvalidInterval);
+                }
+                Action::AutomatedCron { interval }
+            }
             ("cache-rebuild", None) => Action::CacheRebuild,
             ("cron-run", None) => Action::CronRun,
             ("install-drush", None) => Action::InstallDrush,
@@ -200,6 +226,12 @@ pub struct ActionResult {
     /// For `installDrush`: `false` when the project already had Drush.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed: Option<bool>,
+    /// For `automatedCron`: the interval (seconds) before the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_interval: Option<u32>,
+    /// For `automatedCron`: the interval (seconds) read back after the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u32>,
     /// For `updateDb`: how many database updates `updatedb:status` listed
     /// before the run (`0` means nothing was run).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -237,6 +269,8 @@ pub enum Error {
     /// `updatedb:status` printed something that is not the JSON list of
     /// pending updates, so the engine does not run an update blind.
     UpdateStatusUnreadable,
+    /// `config:get` printed something that is not a whole number of seconds.
+    CronIntervalUnreadable,
     /// Updates were still listed after `updatedb` finished.
     UpdatesRemain(u32),
     /// The engine-managed Composer is not installed on the host.
@@ -321,6 +355,10 @@ impl Error {
             Self::UpdateStatusUnreadable => (
                 ErrorCode::SubprocessFailed,
                 "Drush did not report the pending database updates in a readable form".into(),
+            ),
+            Self::CronIntervalUnreadable => (
+                ErrorCode::SubprocessFailed,
+                "Drush did not report the automated cron interval in a readable form".into(),
             ),
             Self::UpdatesRemain(count) => (
                 ErrorCode::SubprocessFailed,
@@ -517,6 +555,8 @@ fn maintenance_flag(bytes: &[u8]) -> Option<bool> {
 struct Outcome {
     maintenance_mode: Option<bool>,
     changed: Option<bool>,
+    previous_interval: Option<u32>,
+    interval: Option<u32>,
     updates_pending: Option<u32>,
     updates_remaining: Option<u32>,
 }
@@ -536,6 +576,77 @@ fn pending_updates(bytes: &[u8]) -> Option<u32> {
         serde_json::Value::Null => Some(0),
         _ => None,
     }
+}
+
+/// `drush config:get ... --format=json` prints a bare number for a scalar.
+fn cron_interval(bytes: &[u8]) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(bytes).trim())
+        .ok()?
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn read_cron_interval(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<u32, Error> {
+    let bytes = drush(
+        ctx,
+        req,
+        &[
+            "config:get",
+            "automated_cron.settings",
+            "interval",
+            "--format=json",
+        ],
+        READ_TIMEOUT,
+        cancel,
+    )?;
+    cron_interval(&bytes).ok_or(Error::CronIntervalUnreadable)
+}
+
+/// Reads the interval (failing when Drupal or the module is not there), sets
+/// it through Drupal's own config API only when it differs, and reads it back.
+fn automated_cron(
+    ctx: &Context<'_>,
+    req: &Request,
+    interval: u32,
+    cancel: &CancellationToken,
+) -> Result<Outcome, Error> {
+    let previous = read_cron_interval(ctx, req, cancel)?;
+    if previous == interval {
+        return Ok(Outcome {
+            changed: Some(false),
+            previous_interval: Some(previous),
+            interval: Some(previous),
+            ..Outcome::default()
+        });
+    }
+    drush(
+        ctx,
+        req,
+        &[
+            "config:set",
+            "--no-interaction",
+            "--input-format=yaml",
+            "automated_cron.settings",
+            "interval",
+            &interval.to_string(),
+        ],
+        READ_TIMEOUT,
+        cancel,
+    )?;
+    let now = read_cron_interval(ctx, req, cancel)?;
+    if now != interval {
+        return Err(Error::StateMismatch);
+    }
+    Ok(Outcome {
+        changed: Some(true),
+        previous_interval: Some(previous),
+        interval: Some(now),
+        ..Outcome::default()
+    })
 }
 
 fn update_status(
@@ -593,6 +704,7 @@ fn run_action(
             ..Outcome::default()
         }),
         Action::UpdateDb => update_db(ctx, req, cancel),
+        Action::AutomatedCron { interval } => automated_cron(ctx, req, interval, cancel),
         _ => run_drush_action(ctx, req, cancel).map(|maintenance_mode| Outcome {
             maintenance_mode,
             ..Outcome::default()
@@ -606,7 +718,9 @@ fn run_drush_action(
     cancel: &CancellationToken,
 ) -> Result<Option<bool>, Error> {
     match req.action {
-        Action::InstallDrush | Action::UpdateDb => unreachable!("handled by run_action"),
+        Action::InstallDrush | Action::UpdateDb | Action::AutomatedCron { .. } => {
+            unreachable!("handled by run_action")
+        }
         Action::CacheRebuild => {
             drush(ctx, req, &["cache:rebuild"], RUN_TIMEOUT, cancel)?;
             Ok(None)
@@ -706,6 +820,8 @@ pub fn execute(
         action: req.action.name().into(),
         maintenance_mode: outcome.maintenance_mode,
         changed: outcome.changed,
+        previous_interval: outcome.previous_interval,
+        interval: outcome.interval,
         updates_pending: outcome.updates_pending,
         updates_remaining: outcome.updates_remaining,
         completed_at_unix_secs: SystemTime::now()
@@ -1053,6 +1169,138 @@ exit 0
         .unwrap_err();
         assert!(matches!(error, Error::UpdatesRemain(2)));
         assert_eq!(error.protocol().0, ErrorCode::SubprocessFailed);
+    }
+
+    /// Keeps the interval in a file: `config:get` prints it, `config:set`
+    /// stores it. `missing` makes `config:get` fail like a site without the
+    /// automated_cron module.
+    fn fake_cron_docker(directory: &std::path::Path, start: u32, missing: bool) -> String {
+        let log = directory.join("drush.log");
+        let value = directory.join("interval");
+        fs::write(&value, start.to_string()).unwrap();
+        let path = directory.join("fake-docker");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"config:get automated_cron.settings interval --format=json"*)
+    if [ "{missing}" = true ]; then exit 1; fi; cat '{value}' ;;
+  *"config:set"*"automated_cron.settings interval "*) printf '%s' "$(echo "$*" | sed 's/.*interval //')" > '{value}' ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+                value = value.display(),
+                missing = missing,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn cron_request(interval: Option<u32>, id: &str) -> Request {
+        let extra = interval.map_or(String::new(), |n| format!(r#","interval":{n}"#));
+        Request::parse(
+            "automated-cron",
+            &format!(
+                r#"{{"container":"runtime-1","projectRoot":"/var/www/site","documentRoot":"/var/www/site/web","uid":1000,"gid":1000{extra}}}"#
+            ),
+            id,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn automated_cron_switches_off_is_idempotent_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_cron_docker(dir.path(), 10800, false);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+        };
+        let cancel = CancellationToken::default();
+        let off = execute(&ctx, &cron_request(None, ID), &cancel).unwrap();
+        assert_eq!(off.action, "automatedCron");
+        assert_eq!(
+            (off.changed, off.previous_interval, off.interval),
+            (Some(true), Some(10800), Some(0))
+        );
+        let recorded = log(dir.path());
+        assert!(recorded.contains(
+            "config:set --no-interaction --input-format=yaml automated_cron.settings interval 0"
+        ));
+        assert_eq!(recorded.lines().count(), 3, "get, set, get");
+
+        let again = execute(&ctx, &cron_request(Some(0), ID2), &cancel).unwrap();
+        assert_eq!(
+            (again.changed, again.previous_interval, again.interval),
+            (Some(false), Some(0), Some(0))
+        );
+        assert_eq!(log(dir.path()).lines().count(), 4, "repeat only reads");
+
+        let back = execute(
+            &ctx,
+            &cron_request(Some(10800), "123e4567-e89b-12d3-a456-426614174002"),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            (back.changed, back.previous_interval, back.interval),
+            (Some(true), Some(0), Some(10800))
+        );
+    }
+
+    #[test]
+    fn automated_cron_refuses_when_drupal_cannot_report_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_cron_docker(dir.path(), 10800, true);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+        };
+        assert!(matches!(
+            execute(&ctx, &cron_request(None, ID), &CancellationToken::default()),
+            Err(Error::Rejected(_))
+        ));
+        assert!(
+            !log(dir.path()).contains("config:set"),
+            "never writes blind"
+        );
+    }
+
+    #[test]
+    fn automated_cron_request_validation_and_interval_parsing() {
+        let base = |extra: &str| {
+            format!(
+                r#"{{"container":"runtime-1","projectRoot":"/var/www/site","documentRoot":"/var/www/site/web","uid":1,"gid":1{extra}}}"#
+            )
+        };
+        assert_eq!(
+            Request::parse("automated-cron", &base(r#","interval":99999999"#), ID, None)
+                .unwrap_err(),
+            RequestError::InvalidInterval
+        );
+        assert_eq!(
+            Request::parse("automated-cron", &base(r#","state":"on""#), ID, None).unwrap_err(),
+            RequestError::InvalidState
+        );
+        assert_eq!(
+            Request::parse("cron-run", &base(r#","interval":0"#), ID, None).unwrap_err(),
+            RequestError::InvalidInterval
+        );
+        assert_eq!(cron_interval(b"10800\n"), Some(10800));
+        assert_eq!(cron_interval(b"0"), Some(0));
+        assert_eq!(cron_interval(b"null"), None);
+        assert_eq!(cron_interval(b"\"abc\""), None);
+        assert_eq!(cron_interval(b"-1"), None);
     }
 
     #[test]

@@ -125,6 +125,7 @@ pub const OPERATIONS: &[&str] = &[
     "wordpress.typedActions",
     "wordpress.setSmtpRelay",
     "cms.clearCache",
+    "drupal.automatedCron",
     "drupal.cacheRebuild",
     "drupal.cronRun",
     "drupal.installDrush",
