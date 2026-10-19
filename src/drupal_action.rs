@@ -578,10 +578,18 @@ fn pending_updates(bytes: &[u8]) -> Option<u32> {
     }
 }
 
-/// `drush config:get ... --format=json` prints a bare number for a scalar.
+/// Drush versions report either a scalar or a single named config value.
+/// Accept only the requested interval; unrelated or ambiguous output is unknown.
 fn cron_interval(bytes: &[u8]) -> Option<u32> {
-    serde_json::from_str::<serde_json::Value>(String::from_utf8_lossy(bytes).trim())
-        .ok()?
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(bytes).trim()).ok()?;
+    let interval = match &value {
+        serde_json::Value::Object(items) if items.len() == 1 => {
+            items.get("automated_cron.settings:interval")?
+        }
+        _ => &value,
+    };
+    interval
         .as_u64()
         .and_then(|value| u32::try_from(value).ok())
 }
@@ -1186,7 +1194,7 @@ exit 0
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
   *"config:get automated_cron.settings interval --format=json"*)
-    if [ "{missing}" = true ]; then exit 1; fi; cat '{value}' ;;
+    if [ "{missing}" = true ]; then exit 1; fi; printf '%s' '{{"automated_cron.settings:interval":'; cat '{value}'; printf '%s\n' '}}' ;;
   *"config:set"*"automated_cron.settings interval "*) printf '%s' "$(echo "$*" | sed 's/.*interval //')" > '{value}' ;;
 esac
 exit 0
@@ -1301,6 +1309,34 @@ exit 0
         assert_eq!(cron_interval(b"null"), None);
         assert_eq!(cron_interval(b"\"abc\""), None);
         assert_eq!(cron_interval(b"-1"), None);
+    }
+
+    #[test]
+    fn cron_interval_accepts_only_the_requested_nonnegative_integer() {
+        for bytes in [
+            br#"{"automated_cron.settings:interval":3600}"#.as_slice(),
+            b"3600\n",
+        ] {
+            assert_eq!(cron_interval(bytes), Some(3600));
+        }
+        assert_eq!(
+            cron_interval(br#"{"automated_cron.settings:interval":0}"#),
+            Some(0)
+        );
+        for bytes in [
+            br#"{"interval":0}"#.as_slice(),
+            br#"{"automated_cron.settings:interval":0,"other":0}"#,
+            br#"{"automated_cron.settings:interval":null}"#,
+            br#"{"automated_cron.settings:interval":"0"}"#,
+            br#"{"automated_cron.settings:interval":-1}"#,
+            br#"{"automated_cron.settings:interval":1.5}"#,
+            b"4294967296",
+            b"[]",
+            b"{}",
+            b"warning\n0",
+        ] {
+            assert_eq!(cron_interval(bytes), None, "{bytes:?}");
+        }
     }
 
     #[test]
