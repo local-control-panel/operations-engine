@@ -779,7 +779,10 @@ interval <n>`, then reads it back and fails with `subprocessFailed` if Drupal
 does not report the requested value. Nothing is written to files. When Drush or
 Drupal cannot report the interval (no Drush, no Drupal, the `automated_cron`
 module uninstalled) the request fails before anything is set. The result has
-`previousInterval`, `interval` and `changed` (`false` for a repeat).
+`previousInterval`, `interval` and `changed` (`false` for a repeat). The read
+accepts a nonnegative integer or a single JSON entry named
+`automated_cron.settings:interval`, as emitted by Drush; unrelated keys, extra
+entries, strings and malformed output are refused.
 
 ## `drupal.updateDb`
 
