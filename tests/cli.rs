@@ -128,6 +128,7 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.rotateDebugLog",
             "cms.clearCache",
             "cms.maintenance",
+            "cms.safeMode",
             "drupal.automatedCron",
             "drupal.cacheRebuild",
             "drupal.cronRun",

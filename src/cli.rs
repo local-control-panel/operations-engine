@@ -426,6 +426,17 @@ pub enum CmsCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Safe mode ("disable all extensions") for WordPress (all plugins off,
+    /// saved list, exact restore) and Drupal (maintenance on, module list
+    /// only); `state` is `on`, `off` or `status` in the request.
+    SafeMode {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl CmsCommand {
@@ -433,6 +444,7 @@ impl CmsCommand {
         match self {
             Self::ClearCache { .. } => "cms.clearCache",
             Self::Maintenance { .. } => "cms.maintenance",
+            Self::SafeMode { .. } => "cms.safeMode",
         }
     }
 }
