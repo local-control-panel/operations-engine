@@ -790,13 +790,23 @@ entries, strings and malformed output are refused.
 (without `state`). Under the per-site lock the engine first runs `drush
 updatedb:status --format=json` as the site user. When no update is pending it
 stops there (`changed: false`, `updatesPending: 0`): nothing is mutated. When
-updates are pending it runs `drush updatedb --no-interaction` (30 minute
+updates are pending the engine, in this order: reads the maintenance mode
+(`state:get system.maintenance_mode`; unreadable output fails the request
+before anything changes), dumps the database with `drush sql:dump` into the
+backup root at `drupal-updates/<requestId>/database.sql` (a failed dump is
+deleted and the request fails with no update run), turns maintenance mode on
+unless it already was, runs `drush updatedb --no-interaction` (30 minute
 limit) and reads `updatedb:status` again; the request fails with
-`SUBPROCESS_FAILED` if any update is still listed. Status output that is not
-a JSON list or object is refused rather than guessed at. The result carries
-`changed`, `updatesPending` (before) and `updatesRemaining` (after, `0` on
-success) and no Drush output. Maintenance mode and the backup are the
-caller's business: the engine does not toggle maintenance or back up.
+`SUBPROCESS_FAILED` if any update is still listed. Whatever happened, the
+engine then puts the PREVIOUS maintenance mode back (also after an error, a
+timeout or a cancel); if it cannot, the request fails with a message saying
+the site may still be in maintenance mode. Status output that is not a JSON
+list or object is refused rather than guessed at. The result carries
+`changed`, `updatesPending` (before), `updatesRemaining` (after, `0` on
+success), `previousMaintenanceMode` and `backupFile` (relative to the backup
+root) and no Drush output. `capabilities` advertises
+`features.drupalUpdateDbSafety`; an engine without it neither backs up nor
+toggles maintenance, so clients must keep their own warning.
 
 ## `cms.clearCache`
 

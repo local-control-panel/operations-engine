@@ -30,6 +30,10 @@ struct Features {
     /// settings applied to the copy). Without this field the engine rejects
     /// the key, so clients send it only when this is true.
     clone_staging_defaults: bool,
+    /// `drupal.updateDb` backs the database up first and wraps the run in
+    /// maintenance mode, restoring the previous mode afterwards. Clients may
+    /// then drop their own reminder to back up.
+    drupal_update_db_safety: bool,
 }
 
 /// Every protocol operation this engine implements, as `capabilities`
@@ -206,6 +210,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 change_log: cfg!(unix),
                 admin_login_cms: ADMIN_LOGIN_CMS,
                 clone_staging_defaults: true,
+                drupal_update_db_safety: true,
             },
         },
     )
