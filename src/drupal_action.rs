@@ -240,6 +240,14 @@ pub struct ActionResult {
     /// success; the request fails otherwise).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updates_remaining: Option<u32>,
+    /// For `updateDb` that ran updates: the maintenance mode before the run
+    /// (it is restored to this afterwards, also when the run failed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_maintenance_mode: Option<bool>,
+    /// For `updateDb` that ran updates: the database dump taken first,
+    /// relative to the backup root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_file: Option<String>,
     pub completed_at_unix_secs: u64,
 }
 
@@ -248,6 +256,9 @@ pub struct Context<'a> {
     pub docker_program: &'a str,
     /// Host directory of the engine-managed tools ([`crate::tool_manage::TOOLS_DIR`]).
     pub tools_dir: &'a std::path::Path,
+    /// Managed backup root; `updateDb` writes its pre-update database dump
+    /// under `drupal-updates/<request id>/` there.
+    pub backup_root: &'a ManagedRoot,
 }
 
 #[derive(Debug)]
@@ -273,6 +284,16 @@ pub enum Error {
     CronIntervalUnreadable,
     /// Updates were still listed after `updatedb` finished.
     UpdatesRemain(u32),
+    /// The maintenance mode before `updateDb` could not be read, so it could
+    /// not be restored; nothing was changed.
+    MaintenanceUnreadable,
+    /// The pre-update database dump failed; no update was run.
+    BackupFailed(SubprocessDiagnostics),
+    /// The backup root could not be written; no update was run.
+    BackupUnavailable(std::io::Error),
+    /// `updateDb` failed (or finished) and the previous maintenance mode
+    /// could not be put back: the site may be left in maintenance mode.
+    MaintenanceNotRestored,
     /// The engine-managed Composer is not installed on the host.
     ComposerMissing,
     /// The project root has no `composer.json`: Drush is installed per
@@ -363,6 +384,28 @@ impl Error {
             Self::UpdatesRemain(count) => (
                 ErrorCode::SubprocessFailed,
                 format!("{count} database update(s) are still pending after the run"),
+            ),
+            Self::MaintenanceUnreadable => (
+                ErrorCode::SubprocessFailed,
+                "Drush did not report the maintenance mode in a readable form; no update was run"
+                    .into(),
+            ),
+            Self::BackupFailed(diagnostics) => (
+                subprocess_code(diagnostics),
+                format!(
+                    "the database backup before the update failed{}; no update was run",
+                    outcome_suffix(diagnostics)
+                ),
+            ),
+            Self::BackupUnavailable(_) => (
+                ErrorCode::Internal,
+                "the backup root could not be written; no update was run".into(),
+            ),
+            Self::MaintenanceNotRestored => (
+                ErrorCode::SubprocessFailed,
+                "the database update did not finish cleanly and the previous maintenance mode \
+                 could not be restored; the site may still be in maintenance mode"
+                    .into(),
             ),
             Self::ComposerMissing => (
                 ErrorCode::DependencyUnavailable,
@@ -559,6 +602,8 @@ struct Outcome {
     interval: Option<u32>,
     updates_pending: Option<u32>,
     updates_remaining: Option<u32>,
+    previous_maintenance_mode: Option<bool>,
+    backup_file: Option<String>,
 }
 
 /// Number of pending updates in `drush updatedb:status --format=json`
@@ -672,8 +717,114 @@ fn update_status(
     pending_updates(&bytes).ok_or(Error::UpdateStatusUnreadable)
 }
 
-/// `updatedb:status` first; nothing is run when nothing is pending. After
-/// `updatedb` the status is read again and must be empty.
+fn read_maintenance(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<bool, Error> {
+    maintenance_flag(&drush(
+        ctx,
+        req,
+        &["state:get", "system.maintenance_mode"],
+        READ_TIMEOUT,
+        cancel,
+    )?)
+    .ok_or(Error::StateMismatch)
+}
+
+/// Sets maintenance mode through Drupal's state API, rebuilds so cached pages
+/// follow, and reads it back.
+fn set_maintenance(
+    ctx: &Context<'_>,
+    req: &Request,
+    enabled: bool,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let value = if enabled { "1" } else { "0" };
+    drush(
+        ctx,
+        req,
+        &[
+            "state:set",
+            "system.maintenance_mode",
+            value,
+            "--input-format=integer",
+        ],
+        READ_TIMEOUT,
+        cancel,
+    )?;
+    // Drupal only honours the new mode for cached pages after a rebuild.
+    drush(ctx, req, &["cache:rebuild"], RUN_TIMEOUT, cancel)?;
+    if read_maintenance(ctx, req, cancel)? != enabled {
+        return Err(Error::StateMismatch);
+    }
+    Ok(())
+}
+
+/// Dumps the database with the site's own Drush into the managed backup root
+/// (`drupal-updates/<request id>/database.sql`) and returns that relative
+/// path. The dump is streamed to the file, never held in memory or returned.
+fn backup_database(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<String, Error> {
+    let dir = format!("drupal-updates/{}", req.request_id);
+    let dir_path = SiteRelativePath::parse(&dir).unwrap();
+    ctx.backup_root
+        .create_dir_all(&dir_path)
+        .map_err(Error::BackupUnavailable)?;
+    let relative = format!("{dir}/database.sql");
+    let file = ctx
+        .backup_root
+        .create_new_file(&SiteRelativePath::parse(&relative).unwrap())
+        .map_err(Error::BackupUnavailable)?;
+    let args: Vec<String> = vec![
+        "exec".into(),
+        "-i".into(),
+        "--user".into(),
+        format!("{}:{}", req.uid, req.gid),
+        "-w".into(),
+        req.project_root.display().to_string(),
+        req.container.as_str().to_owned(),
+        "sh".into(),
+        "-c".into(),
+        "if [ -x ./vendor/bin/drush ]; then exec ./vendor/bin/drush \"$@\"; else exec drush \"$@\"; fi"
+            .into(),
+        "drush".into(),
+        format!("--root={}", req.document_root.display()),
+        "--no-interaction".into(),
+        "sql:dump".into(),
+    ];
+    let output = process::run_with_stdout_file(
+        &ProcessRequest::new(ctx.docker_program).args(args),
+        file,
+        &ProcessLimits {
+            timeout: UPDATE_TIMEOUT,
+            max_stdout_bytes: 0,
+            max_stderr_bytes: MAX_OUTPUT,
+        },
+        cancel,
+    )
+    .map_err(Error::Run)?;
+    if !exited_ok(&output) {
+        // A partial dump is not a backup: do not leave it looking like one.
+        let _ = ctx
+            .backup_root
+            .remove_file(&SiteRelativePath::parse(&relative).unwrap());
+        return Err(Error::BackupFailed(SubprocessDiagnostics::from_output(
+            ctx.docker_program,
+            &output,
+        )));
+    }
+    Ok(relative)
+}
+
+/// `updatedb:status` first; nothing is run when nothing is pending. When
+/// updates are pending: read the maintenance mode, dump the database, turn
+/// maintenance on, run `updatedb`, and put the PREVIOUS mode back whatever
+/// happened (also on error and after a cancel). Afterwards the status is read
+/// again and must be empty.
 fn update_db(
     ctx: &Context<'_>,
     req: &Request,
@@ -688,15 +839,38 @@ fn update_db(
             ..Outcome::default()
         });
     }
-    drush(ctx, req, &["updatedb"], UPDATE_TIMEOUT, cancel)?;
-    let remaining = update_status(ctx, req, cancel)?;
-    if remaining > 0 {
-        return Err(Error::UpdatesRemain(remaining));
+    let previous = read_maintenance(ctx, req, cancel).map_err(|_| Error::MaintenanceUnreadable)?;
+    let backup_file = backup_database(ctx, req, cancel)?;
+
+    // From here on maintenance may have been touched: always run the restore.
+    let ran = (|| {
+        if !previous {
+            set_maintenance(ctx, req, true, cancel)?;
+        }
+        drush(ctx, req, &["updatedb"], UPDATE_TIMEOUT, cancel)?;
+        let remaining = update_status(ctx, req, cancel)?;
+        if remaining > 0 {
+            return Err(Error::UpdatesRemain(remaining));
+        }
+        Ok(())
+    })();
+    // A cancelled request must still leave the site as it found it.
+    let restore_cancel = CancellationToken::default();
+    let restored = if previous {
+        Ok(())
+    } else {
+        set_maintenance(ctx, req, false, &restore_cancel)
+    };
+    if restored.is_err() {
+        return Err(Error::MaintenanceNotRestored);
     }
+    ran?;
     Ok(Outcome {
         changed: Some(true),
         updates_pending: Some(pending),
         updates_remaining: Some(0),
+        previous_maintenance_mode: Some(previous),
+        backup_file: Some(backup_file),
         ..Outcome::default()
     })
 }
@@ -832,6 +1006,8 @@ pub fn execute(
         interval: outcome.interval,
         updates_pending: outcome.updates_pending,
         updates_remaining: outcome.updates_remaining,
+        previous_maintenance_mode: outcome.previous_maintenance_mode,
+        backup_file: outcome.backup_file,
         completed_at_unix_secs: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -1010,6 +1186,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let req = request("cache-rebuild", None, ID, Some("cache-key"));
         let first = execute(&ctx, &req, &CancellationToken::default()).unwrap();
@@ -1033,6 +1210,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let req = request("cron-run", None, ID, None);
         let result = execute(&ctx, &req, &CancellationToken::default()).unwrap();
@@ -1049,6 +1227,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let on = request("maintenance", Some("on"), ID, None);
         let result = execute(&ctx, &on, &CancellationToken::default()).unwrap();
@@ -1072,6 +1251,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let req = request("cache-rebuild", None, ID, Some("fail-key"));
         assert!(matches!(
@@ -1105,11 +1285,15 @@ case "$*" in
   *"updatedb:status"*)
     if [ -e '{done}' ] && [ "{sticky}" = false ]; then echo '[]'; else echo '{{{list}}}'; fi ;;
   *" updatedb"*) touch '{done}' ;;
+  *"state:set system.maintenance_mode 1"*) echo 1 > '{flag}' ;;
+  *"state:set system.maintenance_mode 0"*) echo 0 > '{flag}' ;;
+  *"state:get system.maintenance_mode"*) cat '{flag}' 2>/dev/null ;;
 esac
 exit 0
 "#,
                 log = log.display(),
                 done = done.display(),
+                flag = directory.join("flag").display(),
                 sticky = sticky,
                 list = list,
             ),
@@ -1117,6 +1301,169 @@ exit 0
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    /// Like `fake_updatedb_docker` but also keeps the maintenance flag in a
+    /// file (starting at `start_flag`), dumps a marker for `sql:dump`, and
+    /// with `fail_update` makes `updatedb` exit 1.
+    fn fake_safe_docker(
+        directory: &std::path::Path,
+        start_flag: u8,
+        fail_update: bool,
+        fail_dump: bool,
+    ) -> String {
+        let log = directory.join("drush.log");
+        let done = directory.join("updated");
+        let flag = directory.join("flag");
+        fs::write(&flag, start_flag.to_string()).unwrap();
+        let path = directory.join("fake-docker");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"updatedb:status"*)
+    if [ -e '{done}' ]; then echo '[]'; else echo '{{"hook_1":{{}}}}'; fi ;;
+  *" updatedb"*) if [ "{fail_update}" = true ]; then exit 1; fi; touch '{done}' ;;
+  *"sql:dump"*) if [ "{fail_dump}" = true ]; then echo partial; exit 1; fi; echo 'DUMP' ;;
+  *"state:set system.maintenance_mode 1"*) echo 1 > '{flag}' ;;
+  *"state:set system.maintenance_mode 0"*) echo 0 > '{flag}' ;;
+  *"state:get system.maintenance_mode"*) cat '{flag}' ;;
+esac
+exit 0
+"#,
+                log = log.display(),
+                done = done.display(),
+                flag = flag.display(),
+                fail_update = fail_update,
+                fail_dump = fail_dump,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn flag(directory: &std::path::Path) -> String {
+        fs::read_to_string(directory.join("flag"))
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    #[test]
+    fn update_db_backs_up_then_wraps_the_run_in_maintenance_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups_dir = tempfile::tempdir().unwrap();
+        let docker = fake_safe_docker(dir.path(), 0, false, false);
+        let state = managed(dir.path());
+        let backups = managed(backups_dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+            backup_root: &backups,
+        };
+        let result = execute(
+            &ctx,
+            &request("update-db", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(result.previous_maintenance_mode, Some(false));
+        let file = result.backup_file.unwrap();
+        assert_eq!(file, format!("drupal-updates/{ID}/database.sql"));
+        assert_eq!(
+            fs::read_to_string(backups_dir.path().join(&file)).unwrap(),
+            "DUMP\n"
+        );
+        assert_eq!(flag(dir.path()), "0", "previous mode restored");
+        let recorded = log(dir.path());
+        let at = |needle: &str| {
+            recorded
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {recorded}"))
+        };
+        assert!(at("sql:dump") < at("maintenance_mode 1"));
+        assert!(at("maintenance_mode 1") < at("--no-interaction updatedb\n"));
+        assert!(at("--no-interaction updatedb\n") < at("maintenance_mode 0"));
+    }
+
+    #[test]
+    fn update_db_leaves_maintenance_on_when_it_was_on_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_safe_docker(dir.path(), 1, false, false);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+            backup_root: &state,
+        };
+        let result = execute(
+            &ctx,
+            &request("update-db", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        assert_eq!(result.previous_maintenance_mode, Some(true));
+        assert_eq!(flag(dir.path()), "1");
+        assert!(!log(dir.path()).contains("state:set"), "never toggled");
+    }
+
+    #[test]
+    fn update_db_restores_maintenance_after_a_failed_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_safe_docker(dir.path(), 0, true, false);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+            backup_root: &state,
+        };
+        let error = execute(
+            &ctx,
+            &request("update-db", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::Rejected(_)), "{error:?}");
+        assert_eq!(flag(dir.path()), "0", "restored although updatedb failed");
+        assert!(log(dir.path()).contains("maintenance_mode 1"));
+    }
+
+    #[test]
+    fn update_db_runs_nothing_when_the_backup_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_safe_docker(dir.path(), 0, false, true);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+            backup_root: &state,
+        };
+        let error = execute(
+            &ctx,
+            &request("update-db", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::BackupFailed(_)), "{error:?}");
+        let recorded = log(dir.path());
+        assert!(!recorded.contains("state:set"), "{recorded}");
+        assert!(
+            !recorded.contains("--no-interaction updatedb\n"),
+            "{recorded}"
+        );
+        assert!(
+            !dir.path()
+                .join(format!("drupal-updates/{ID}/database.sql"))
+                .exists(),
+            "a partial dump is removed"
+        );
     }
 
     #[test]
@@ -1128,6 +1475,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let result = execute(
             &ctx,
@@ -1145,7 +1493,10 @@ exit 0
             recorded.contains("--no-interaction updatedb\n"),
             "{recorded}"
         );
-        assert_eq!(recorded.lines().count(), 3, "status, updatedb, status");
+        assert!(
+            recorded.contains("sql:dump") && recorded.contains("maintenance_mode 1"),
+            "{recorded}"
+        );
 
         // nothing pending now: status only, no mutation
         let again = execute(
@@ -1156,7 +1507,13 @@ exit 0
         .unwrap();
         assert_eq!(again.changed, Some(false));
         assert_eq!(again.updates_pending, Some(0));
-        assert_eq!(log(dir.path()).lines().count(), 4);
+        let after = log(dir.path());
+        assert_eq!(
+            after.matches("sql:dump").count(),
+            1,
+            "no second dump: {after}"
+        );
+        assert_eq!(after.matches("--no-interaction updatedb\n").count(), 1);
     }
 
     #[test]
@@ -1168,6 +1525,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let error = execute(
             &ctx,
@@ -1231,6 +1589,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let cancel = CancellationToken::default();
         let off = execute(&ctx, &cron_request(None, ID), &cancel).unwrap();
@@ -1273,6 +1632,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         assert!(matches!(
             execute(&ctx, &cron_request(None, ID), &CancellationToken::default()),
@@ -1396,6 +1756,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: &tools,
+            backup_root: &state,
         };
         let first = execute(
             &ctx,
@@ -1458,6 +1819,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: &tools,
+            backup_root: &state,
         };
         let error = execute(
             &ctx,
@@ -1510,6 +1872,7 @@ exit 0
             engine_state: &state,
             docker_program: &fake_composer_docker(dir.path(), true),
             tools_dir: &tools,
+            backup_root: &state,
         };
         assert!(matches!(
             execute(
@@ -1527,6 +1890,7 @@ exit 0
             engine_state: &state,
             docker_program: &fake_composer_docker(dir.path(), false),
             tools_dir: &tools,
+            backup_root: &state,
         };
         assert!(matches!(
             execute(
@@ -1560,6 +1924,7 @@ exit 0
             engine_state: &state,
             docker_program: &docker,
             tools_dir: dir.path(),
+            backup_root: &state,
         };
         let make = |kind: &str, st: Option<&str>, id: &str| {
             let st = st.map_or(String::new(), |s| format!(r#","state":"{s}""#));
