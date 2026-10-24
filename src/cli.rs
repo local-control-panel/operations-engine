@@ -1983,6 +1983,26 @@ pub enum IngressCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Restricts one domain's sensitive admin paths (from a closed per-kind
+    /// catalog) to an IP allowlist or to Basic auth, or removes the
+    /// restriction. Writes `bans/admin-<domain>.caddy`, validated, reloaded
+    /// and put back if the reload refuses it. The request file is
+    /// `{"domain":"..","restriction":null|{"kind","paths","mode",...}}`.
+    ApplyAdminPaths {
+        /// Root-owned JSON request file.
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+
+        /// Canonical UUID identifying this specific attempt.
+        #[arg(long = "request-id")]
+        request_id: String,
+
+        /// Caller-supplied token so a retried request returns the original
+        /// outcome instead of applying twice.
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+
     /// Sweeps the whole configured ingress root for `.tmp`/`.tmp-*`
     /// staging siblings and `.rollback-*` backup siblings left behind by
     /// an interrupted activate/park/unpark attempt, removing or restoring
@@ -2016,6 +2036,7 @@ impl IngressCommand {
             Self::RemoveRoute { .. } => "ingress.removeRoute",
             Self::SetEnabled { .. } => "ingress.setEnabled",
             Self::ApplyBans { .. } => "ingress.applyBans",
+            Self::ApplyAdminPaths { .. } => "ingress.applyAdminPaths",
             Self::Reconcile { .. } => "ingress.reconcile",
         }
     }
