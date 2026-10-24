@@ -836,6 +836,36 @@ replay carries `alreadyIssued: true` and no token. Lock, idempotency,
 transaction and audit as for the Drupal actions. Advertised as
 `cms.maintenance`.
 
+## `cms.safeMode`
+
+`cms safe-mode` ("disable all extensions") takes a root-owned JSON request
+`{kind, state, container, projectRoot, documentRoot?, uid, gid}` where `kind`
+is `wordpress` or `drupal` (Joomla is not supported: its console cannot switch
+extensions and the only other way is writing the database), `state` is `on`,
+`off` or `status`, and `documentRoot` is required for Drupal and forbidden for
+WordPress. Unknown fields, other kinds and states are rejected.
+
+WordPress `on` reads the active plugins (`wp plugin list --status=active`),
+writes them to a saved list in the engine's own state directory, then runs
+`wp plugin deactivate --all`, all with `--skip-plugins --skip-themes` so a
+broken plugin cannot stop the command. The result must read back as no active
+plugins; otherwise the previous plugins are re-activated and the list removed
+(kept if that fails too). A multisite install is refused with `invalid_input`.
+`off` re-activates exactly the saved plugins that are not active and removes the
+list only when all of them read back as active; otherwise it fails with
+`SUBPROCESS_FAILED` and keeps the list, so the restore can be retried. `on`
+while already on changes nothing (`conflict` if plugins were activated since).
+
+Drupal `on` records the previous maintenance mode and the enabled modules (for
+the record, nothing is disabled or uninstalled) and turns maintenance mode on
+(`state:set`, `cache:rebuild`, read back); `off` puts the maintenance mode back
+to the recorded value, so a site that was already in maintenance stays there.
+
+`status` only reads the saved list. The result is `{kind, safeMode, changed,
+extensions, maintenanceMode, savedAtUnixSecs, completedAtUnixSecs}` with no
+command output. Lock, idempotency, transaction and audit as for the Drupal
+actions. Advertised as `cms.safeMode`.
+
 ## `drupal.installDrush`
 
 `drupal install-drush` takes the same request as the other Drupal actions

@@ -127,6 +127,7 @@ pub const OPERATIONS: &[&str] = &[
     "wordpress.rotateDebugLog",
     "cms.clearCache",
     "cms.maintenance",
+    "cms.safeMode",
     "drupal.automatedCron",
     "drupal.cacheRebuild",
     "drupal.cronRun",
