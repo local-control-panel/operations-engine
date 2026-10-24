@@ -215,10 +215,27 @@ fn action(
                 ));
             }
         };
+        use crate::{backup_delete::BACKUP_ROOT, site::TrustedRoot};
+        // Only `updateDb` writes here (its pre-update dump); the others
+        // never touch it, so a missing root only matters for that one.
+        let _ = std::fs::create_dir_all(BACKUP_ROOT);
+        let backups = match TrustedRoot::parse(std::path::Path::new(BACKUP_ROOT)).and_then(|root| {
+            ManagedRoot::open(&root).map_err(|_| crate::site::ValidationError::PathResolutionFailed)
+        }) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    "backup root is unavailable",
+                ));
+            }
+        };
         let context = drupal_action::Context {
             engine_state: &state,
             docker_program: "docker",
             tools_dir: std::path::Path::new(crate::tool_manage::TOOLS_DIR),
+            backup_root: &backups,
         };
         match drupal_action::execute(
             &context,
