@@ -78,6 +78,7 @@ fn capabilities_describe_only_implemented_operations() {
             "ingress.removeRoute",
             "ingress.setEnabled",
             "ingress.applyBans",
+            "ingress.applyAdminPaths",
             "ingress.reconcile",
             "runtime.activateConfig",
             "runtime.removeConfig",
