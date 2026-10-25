@@ -90,6 +90,11 @@ pub fn run(command: IngressCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => apply_bans(&request_file, &request_id, idempotency_key.as_deref()),
+        IngressCommand::ApplyAdminPaths {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => apply_admin_paths(&request_file, &request_id, idempotency_key.as_deref()),
         IngressCommand::Reconcile {
             request_id,
             idempotency_key,
@@ -231,6 +236,84 @@ fn apply_bans(
             APPLY_BANS_OPERATION,
             ErrorCode::UnsupportedPlatform,
             "ingress.applyBans requires a Unix host",
+        ))
+    }
+}
+
+fn apply_admin_paths(
+    request_file: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    use crate::ingress::admin_paths::{
+        APPLY_ADMIN_PATHS_OPERATION as OP, ApplyAdminPathsRequest,
+        ApplyAdminPathsRequestError as E, execute as execute_apply,
+    };
+
+    let json = match crate::commands::read_root_owned_content_file(request_file) {
+        Ok(json) => json,
+        Err(_) => {
+            return Ok(Response::failure(
+                OP,
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            ));
+        }
+    };
+    let request = match ApplyAdminPathsRequest::parse(&json, request_id, idempotency_key) {
+        Ok(request) => request,
+        Err(error) => {
+            return Ok(Response::failure(
+                OP,
+                ErrorCode::InvalidInput,
+                match error {
+                    E::InvalidJson => "request-file is not a valid admin-paths document",
+                    E::InvalidDomain => "domain is not a valid lowercase domain",
+                    E::UnknownKind => "kind is not in the admin-path catalog",
+                    E::UnknownPath => "a path id is not in the catalog of this kind",
+                    E::NoPaths => "at least one path id is required",
+                    E::InvalidIp => "an allowlist entry is not an IP address or CIDR range",
+                    E::TooManyIps => "too many allowlist entries",
+                    E::NoIps => "an allowlist needs at least one entry",
+                    E::InvalidUsername => "username must be 1-32 of letters, digits, . _ -",
+                    E::InvalidPasswordHash => "passwordHash is not a bcrypt hash",
+                    E::MixedModes => "a field of the other restriction mode was sent",
+                    E::InvalidRequestId => "request-id is not a canonical UUID",
+                    E::InvalidIdempotencyKey => "idempotency-key is invalid",
+                },
+            ));
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        with_context(OP, |context| {
+            match execute_apply(context, &request, &CancellationToken::default()) {
+                Ok(result) => Response::success(OP, result),
+                Err(LifecycleError::PostCommitRecordFailed { result, .. }) => {
+                    Response::success(OP, result).map(|response| {
+                        response.with_warnings(vec![Warning {
+                            code: WarningCode::TransactionRecordIncomplete,
+                            message: "the restriction was applied but the transaction record \
+                                      could not be saved"
+                                .to_owned(),
+                        }])
+                    })
+                }
+                Err(error) => {
+                    let (code, message) = error.protocol();
+                    Ok(Response::failure(OP, code, &message))
+                }
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = request;
+        Ok(Response::failure(
+            OP,
+            ErrorCode::UnsupportedPlatform,
+            "ingress.applyAdminPaths requires a Unix host",
         ))
     }
 }

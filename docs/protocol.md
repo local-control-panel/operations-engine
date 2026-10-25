@@ -252,6 +252,12 @@ mutating operations are not journaled yet (they name their target in a
 request file or by domain, and need their own secret-free way to name the
 site); they are listed in the CMS-core design notes as a follow-up.
 
+## `ingress.applyAdminPaths`
+
+Restricts one domain's sensitive admin paths to an IP allowlist or to Basic auth, or removes the restriction. Request file: `{"domain":"example.com","restriction":null}` removes it; otherwise `restriction` is `{"kind","paths":[<catalog ids>],"mode":"ipAllowlist","ips":[<ip or cidr>]}` or `{"kind","paths","mode":"basicAuth","username","passwordHash":"<bcrypt>"}`. The catalog (kinds `wordpress`, `drupal`, `joomla`, `laravel`; ids such as `login`, `admin`) is advertised in `features.adminPaths` of `capabilities`, with the public exceptions it keeps open (WordPress `admin-ajax.php`, `admin-post.php`). The engine maps ids to paths, so a request cannot inject a matcher.
+
+It writes `bans/admin-<domain>.caddy`, which every route already imports through `bans/*.caddy` (the same file family as `ingress.applyBans`), with a `host <domain>` matcher so it affects only that site. The file is validated, swapped in, reloaded, and put back if the reload refuses it. An allowlist answers 403 to every other address, Basic auth answers 401; an empty allowlist is refused (it would lock everyone out). Only a bcrypt hash is accepted (use `caddy hash-password`); it is written to the file and never returned, logged or recorded, and the file header (`# wcp-admin-paths {json}`) carries the settings without it so a client can read them back. Removal restores normal access; removing an absent restriction reports `changed: false` after a confirming reload.
+
 ## `cron.installTab`
 
 `cron install-tab` atomically replaces a complete crontab with an optimistic

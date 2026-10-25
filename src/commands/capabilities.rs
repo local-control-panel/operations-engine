@@ -34,6 +34,42 @@ struct Features {
     /// maintenance mode, restoring the previous mode afterwards. Clients may
     /// then drop their own reminder to back up.
     drupal_update_db_safety: bool,
+    /// The sensitive-path catalog `ingress.applyAdminPaths` accepts, per site
+    /// kind. Absent on an engine without the operation.
+    admin_paths: Vec<AdminPathsKind>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminPathsKind {
+    kind: &'static str,
+    paths: Vec<AdminPathsEntry>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminPathsEntry {
+    id: &'static str,
+    patterns: &'static [&'static str],
+    public_exceptions: &'static [&'static str],
+}
+
+fn admin_paths_catalog() -> Vec<AdminPathsKind> {
+    crate::ingress::admin_paths::CATALOG
+        .iter()
+        .map(|kind| AdminPathsKind {
+            kind: kind.kind,
+            paths: kind
+                .entries
+                .iter()
+                .map(|entry| AdminPathsEntry {
+                    id: entry.id,
+                    patterns: entry.paths,
+                    public_exceptions: entry.except,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// Every protocol operation this engine implements, as `capabilities`
@@ -77,6 +113,7 @@ pub const OPERATIONS: &[&str] = &[
     "ingress.removeRoute",
     "ingress.setEnabled",
     "ingress.applyBans",
+    "ingress.applyAdminPaths",
     "ingress.reconcile",
     "runtime.activateConfig",
     "runtime.removeConfig",
@@ -212,6 +249,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 admin_login_cms: ADMIN_LOGIN_CMS,
                 clone_staging_defaults: true,
                 drupal_update_db_safety: true,
+                admin_paths: admin_paths_catalog(),
             },
         },
     )

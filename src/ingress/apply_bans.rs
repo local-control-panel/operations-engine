@@ -156,36 +156,78 @@ fn apply(
     context: &ActivateContext<'_>,
     request: &ApplyBansRequest,
 ) -> Result<ApplyBansResult, ApplyBansError> {
+    let content = request.content();
+    let outcome = apply_managed_file(
+        context,
+        &request.request_id,
+        BANS_FILE,
+        Some(content.as_bytes()),
+    )?;
+    Ok(ApplyBansResult {
+        ban_count: request.bans.len(),
+        changed: outcome.changed,
+        content_sha256: ConfigHash::of(content.as_bytes()),
+        applied_at_unix_secs: unix_now_secs(),
+    })
+}
+
+/// What `apply_managed_file` did.
+pub(crate) struct ManagedFileOutcome {
+    /// `false` when the file already held this content (or was already
+    /// absent); the ingress was still reloaded to confirm it.
+    pub changed: bool,
+}
+
+/// Replaces (`content` is `Some`) or removes (`None`) one `*.caddy` file under
+/// `bans/`, the directory every route imports. Shared by `ingress.applyBans`
+/// and `ingress.applyAdminPaths`: validate in a throw-away site block, swap by
+/// renames, reload, and put the previous file back if the reload refuses.
+pub(crate) fn apply_managed_file<R>(
+    context: &ActivateContext<'_>,
+    request_id: &RequestId,
+    live_name: &str,
+    content: Option<&[u8]>,
+) -> Result<ManagedFileOutcome, LifecycleError<R>> {
     let root = ManagedRoot::open(context.ingress_root).map_err(LifecycleError::Io)?;
     root.create_dir_all(&path(BANS_DIR))
         .map_err(LifecycleError::Io)?;
-    let live = path(BANS_FILE);
-    let content = request.content();
-    let result = |changed: bool| ApplyBansResult {
-        ban_count: request.bans.len(),
-        changed,
-        content_sha256: ConfigHash::of(content.as_bytes()),
-        applied_at_unix_secs: unix_now_secs(),
-    };
-
+    let live = path(live_name);
     let current = read_optional(&root, &live).map_err(LifecycleError::Io)?;
-    if current.as_deref() == Some(content.as_bytes()) {
+    let unchanged = current.as_deref() == content;
+    if unchanged {
         // Converge, do not assume: the file being right does not prove the
         // running server loaded it.
         transition::reload(context.compose, INGRESS_SERVICE).map_err(|failure| {
             LifecycleError::Transition(activate::Error::ReloadFailedUnchanged(failure))
         })?;
-        return Ok(result(false));
+        return Ok(ManagedFileOutcome { changed: false });
     }
-
-    let id = request.request_id.to_string();
-    let staged = path(&format!("{BANS_FILE}.tmp"));
+    let id = request_id.to_string();
+    let Some(content) = content else {
+        // Removal: the file moves aside, the reload confirms, the aside copy
+        // goes; a refused reload puts it back.
+        let rollback = rollback_sibling(&live, &id);
+        let renames = vec![Rename {
+            from: live,
+            to: rollback.clone(),
+        }];
+        transition::transition(
+            &root,
+            &renames,
+            Some(INGRESS_SERVICE),
+            &[rollback],
+            context.compose,
+        )
+        .map_err(LifecycleError::Transition)?;
+        return Ok(ManagedFileOutcome { changed: true });
+    };
+    let staged = path(&format!("{live_name}.tmp"));
     let wrapper = path(&format!(".bans-validate-{id}.tmp"));
     let wrapper_text = |staged_path: &str| {
         format!("http://bans-validate.invalid {{\n    import {staged_path}\n    respond 200\n}}\n")
     };
 
-    root.write_atomic(&staged, content.as_bytes())
+    root.write_atomic(&staged, content)
         .map_err(LifecycleError::Io)?;
     let discard = |root: &ManagedRoot| {
         let _ = root.remove_file(&staged);
@@ -253,7 +295,7 @@ fn apply(
     );
     discard(&root);
     outcome.map_err(LifecycleError::Transition)?;
-    Ok(result(true))
+    Ok(ManagedFileOutcome { changed: true })
 }
 
 #[cfg(all(test, unix))]

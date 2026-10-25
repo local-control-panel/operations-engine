@@ -20,6 +20,7 @@
 //! pipeline `deploy::execute` assembles around it.
 
 pub mod activate;
+pub mod admin_paths;
 pub mod apply_bans;
 pub mod execute;
 pub mod park;
