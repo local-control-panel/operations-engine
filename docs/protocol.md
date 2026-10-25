@@ -254,7 +254,7 @@ site); they are listed in the CMS-core design notes as a follow-up.
 
 ## `ingress.applyAdminPaths`
 
-Restricts one domain's sensitive admin paths to an IP allowlist or to Basic auth, or removes the restriction. Request file: `{"domain":"example.com","restriction":null}` removes it; otherwise `restriction` is `{"kind","paths":[<catalog ids>],"mode":"ipAllowlist","ips":[<ip or cidr>]}` or `{"kind","paths","mode":"basicAuth","username","passwordHash":"<bcrypt>"}`. The catalog (kinds `wordpress`, `drupal`, `joomla`, `laravel`; ids such as `login`, `admin`) is advertised in `features.adminPaths` of `capabilities`, with the public exceptions it keeps open (WordPress `admin-ajax.php`, `admin-post.php`). The engine maps ids to paths, so a request cannot inject a matcher.
+Restricts one domain's sensitive admin paths to an IP allowlist, to Basic auth, to both at once, and/or under a per-path rate limit, or removes the restriction. Request file: `{"domain":"example.com","restriction":null}` removes it; otherwise `restriction` is `{"kind","paths":[<catalog ids>],"ips":[<ip or cidr>],"username","passwordHash":"<bcrypt>","rateLimit":{"maxHits":3-10000,"windowMinutes":1-60,"banMinutes":1-1440}}` where at least one of `ips`, the `username`/`passwordHash` pair and `rateLimit` is present. The old `mode` field is still accepted (and checked against the fields). `features.adminPathsCombined` tells a client the engine takes the combined form and `rateLimit`; without it exactly one control is accepted. With both an allowlist and Basic auth, an address outside the allowlist gets 403 before it is asked for a password. The rate limit is not a Caddy directive: the header carries it with the expanded path patterns and the `bruteforce-guard` agent (2.1.0 or newer) bans an address that makes more than `maxHits` non-static requests to those paths within `windowMinutes`, through `ingress.applyBans` (jail `admin_paths`). The catalog (kinds `wordpress`, `drupal`, `joomla`, `laravel`; ids such as `login`, `admin`) is advertised in `features.adminPaths` of `capabilities`, with the public exceptions it keeps open (WordPress `admin-ajax.php`, `admin-post.php`). The engine maps ids to paths, so a request cannot inject a matcher.
 
 It writes `bans/admin-<domain>.caddy`, which every route already imports through `bans/*.caddy` (the same file family as `ingress.applyBans`), with a `host <domain>` matcher so it affects only that site. The file is validated, swapped in, reloaded, and put back if the reload refuses it. An allowlist answers 403 to every other address, Basic auth answers 401; an empty allowlist is refused (it would lock everyone out). Only a bcrypt hash is accepted (use `caddy hash-password`); it is written to the file and never returned, logged or recorded, and the file header (`# wcp-admin-paths {json}`) carries the settings without it so a client can read them back. Removal restores normal access; removing an absent restriction reports `changed: false` after a confirming reload.
 
@@ -798,8 +798,12 @@ updatedb:status --format=json` as the site user. When no update is pending it
 stops there (`changed: false`, `updatesPending: 0`): nothing is mutated. When
 updates are pending the engine, in this order: reads the maintenance mode
 (`state:get system.maintenance_mode`; unreadable output fails the request
-before anything changes), dumps the database with `drush sql:dump` into the
-backup root at `drupal-updates/<requestId>/database.sql` (a failed dump is
+before anything changes), dumps the database into the
+backup root (for MySQL/MariaDB: connection from `drush sql:conf` and the
+database container's own `mariadb-dump`, so the PHP container needs no client,
+the password only in the environment of that one `docker exec`; the
+connection host must be the database container's name; other drivers use
+`drush sql:dump`) at `drupal-updates/<requestId>/database.sql` (a failed dump is
 deleted and the request fails with no update run), turns maintenance mode on
 unless it already was, runs `drush updatedb --no-interaction` (30 minute
 limit) and reads `updatedb:status` again; the request fails with

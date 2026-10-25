@@ -34,9 +34,16 @@ struct Features {
     /// maintenance mode, restoring the previous mode afterwards. Clients may
     /// then drop their own reminder to back up.
     drupal_update_db_safety: bool,
+    /// `wordpress.rotateDebugLog` accepts `--compress` (gzip of the rotated
+    /// copy). An engine without this field rejects the flag.
+    debug_log_gzip: bool,
     /// The sensitive-path catalog `ingress.applyAdminPaths` accepts, per site
     /// kind. Absent on an engine without the operation.
     admin_paths: Vec<AdminPathsKind>,
+    /// `ingress.applyAdminPaths` accepts an allowlist and Basic auth together
+    /// and a `rateLimit` (enforced by the brute-force guard agent). Without
+    /// this field it takes exactly one `mode`.
+    admin_paths_combined: bool,
 }
 
 #[derive(Serialize)]
@@ -249,7 +256,9 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 admin_login_cms: ADMIN_LOGIN_CMS,
                 clone_staging_defaults: true,
                 drupal_update_db_safety: true,
+                debug_log_gzip: true,
                 admin_paths: admin_paths_catalog(),
+                admin_paths_combined: true,
             },
         },
     )

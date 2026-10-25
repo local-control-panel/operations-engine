@@ -289,6 +289,9 @@ pub enum Error {
     MaintenanceUnreadable,
     /// The pre-update database dump failed; no update was run.
     BackupFailed(SubprocessDiagnostics),
+    /// `drush sql:conf` did not give a usable database connection, so no
+    /// dump was taken and no update was run.
+    BackupConfigUnreadable,
     /// The backup root could not be written; no update was run.
     BackupUnavailable(std::io::Error),
     /// `updateDb` failed (or finished) and the previous maintenance mode
@@ -396,6 +399,12 @@ impl Error {
                     "the database backup before the update failed{}; no update was run",
                     outcome_suffix(diagnostics)
                 ),
+            ),
+            Self::BackupConfigUnreadable => (
+                ErrorCode::SubprocessFailed,
+                "the database connection could not be read for the backup before the update; \
+                 no update was run"
+                    .into(),
             ),
             Self::BackupUnavailable(_) => (
                 ErrorCode::Internal,
@@ -761,14 +770,83 @@ fn set_maintenance(
     Ok(())
 }
 
-/// Dumps the database with the site's own Drush into the managed backup root
+/// The connection `drush sql:conf` reports for the site's default database.
+/// Never logged, returned or put in argv: only the password travels, in the
+/// environment of one `docker exec`.
+struct DbConnection {
+    host: String,
+    user: String,
+    password: String,
+    database: String,
+}
+
+/// Reads the MySQL/MariaDB connection with `drush sql:conf`. `Ok(None)` for
+/// another driver (the dump then falls back to `drush sql:dump`); an
+/// unreadable answer is an error, so nothing is guessed.
+fn read_db_connection(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<Option<DbConnection>, Error> {
+    let stdout = drush(
+        ctx,
+        req,
+        &["sql:conf", "--format=json", "--show-passwords"],
+        READ_TIMEOUT,
+        cancel,
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&stdout).map_err(|_| Error::BackupConfigUnreadable)?;
+    // Some Drush versions nest the spec under `database.default.default`.
+    let spec = value
+        .get("database")
+        .filter(|inner| inner.is_object())
+        .and_then(|inner| inner.get("default").and_then(|d| d.get("default")))
+        .unwrap_or(&value);
+    let text = |key: &str| spec.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+    match text("driver").as_deref() {
+        Some("mysql") => {}
+        Some(_) => return Ok(None),
+        None => return Err(Error::BackupConfigUnreadable),
+    }
+    let (Some(host), Some(user), Some(database)) =
+        (text("host"), text("username"), text("database"))
+    else {
+        return Err(Error::BackupConfigUnreadable);
+    };
+    let password = text("password").unwrap_or_default();
+    // The host must name the database container; a socket or an address
+    // gives nothing to `docker exec` into.
+    if ContainerName::parse(&host).is_err()
+        || host == "localhost"
+        || user.is_empty()
+        || database.is_empty()
+        || user.starts_with('-')
+        || database.starts_with('-')
+        || user.chars().chain(database.chars()).any(char::is_control)
+    {
+        return Err(Error::BackupConfigUnreadable);
+    }
+    Ok(Some(DbConnection {
+        host,
+        user,
+        password,
+        database,
+    }))
+}
+
+/// Dumps the database into the managed backup root
 /// (`drupal-updates/<request id>/database.sql`) and returns that relative
 /// path. The dump is streamed to the file, never held in memory or returned.
+/// A MySQL/MariaDB site is dumped by the database container's own client
+/// (the PHP container usually has none), with the connection from `drush
+/// sql:conf`; any other driver uses `drush sql:dump`.
 fn backup_database(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
 ) -> Result<String, Error> {
+    let connection = read_db_connection(ctx, req, cancel)?;
     let dir = format!("drupal-updates/{}", req.request_id);
     let dir_path = SiteRelativePath::parse(&dir).unwrap();
     ctx.backup_root
@@ -779,25 +857,45 @@ fn backup_database(
         .backup_root
         .create_new_file(&SiteRelativePath::parse(&relative).unwrap())
         .map_err(Error::BackupUnavailable)?;
-    let args: Vec<String> = vec![
-        "exec".into(),
-        "-i".into(),
-        "--user".into(),
-        format!("{}:{}", req.uid, req.gid),
-        "-w".into(),
-        req.project_root.display().to_string(),
-        req.container.as_str().to_owned(),
-        "sh".into(),
-        "-c".into(),
-        "if [ -x ./vendor/bin/drush ]; then exec ./vendor/bin/drush \"$@\"; else exec drush \"$@\"; fi"
-            .into(),
-        "drush".into(),
-        format!("--root={}", req.document_root.display()),
-        "--no-interaction".into(),
-        "sql:dump".into(),
-    ];
+    let request = match &connection {
+        Some(db) => ProcessRequest::new(ctx.docker_program)
+            .env("MYSQL_PWD", &db.password)
+            .args([
+                "exec".to_owned(),
+                "-i".into(),
+                "-e".into(),
+                "MYSQL_PWD".into(),
+                db.host.clone(),
+                "mariadb-dump".into(),
+                format!("-u{}", db.user),
+                "--single-transaction".into(),
+                "--routines".into(),
+                "--triggers".into(),
+                db.database.clone(),
+            ]),
+        None => {
+            let args: Vec<String> = vec![
+                "exec".into(),
+                "-i".into(),
+                "--user".into(),
+                format!("{}:{}", req.uid, req.gid),
+                "-w".into(),
+                req.project_root.display().to_string(),
+                req.container.as_str().to_owned(),
+                "sh".into(),
+                "-c".into(),
+                "if [ -x ./vendor/bin/drush ]; then exec ./vendor/bin/drush \"$@\"; else exec drush \"$@\"; fi"
+                    .into(),
+                "drush".into(),
+                format!("--root={}", req.document_root.display()),
+                "--no-interaction".into(),
+                "sql:dump".into(),
+            ];
+            ProcessRequest::new(ctx.docker_program).args(args)
+        }
+    };
     let output = process::run_with_stdout_file(
-        &ProcessRequest::new(ctx.docker_program).args(args),
+        &request,
         file,
         &ProcessLimits {
             timeout: UPDATE_TIMEOUT,
@@ -1282,6 +1380,7 @@ exit 0
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"sql:conf"*) if [ -e '{conf}' ]; then cat '{conf}'; else echo '{{"driver":"mysql","host":"db-1","username":"drupal","password":"s3cret-pw","database":"drupal"}}'; fi ;;
   *"updatedb:status"*)
     if [ -e '{done}' ] && [ "{sticky}" = false ]; then echo '[]'; else echo '{{{list}}}'; fi ;;
   *" updatedb"*) touch '{done}' ;;
@@ -1295,6 +1394,7 @@ exit 0
                 done = done.display(),
                 flag = directory.join("flag").display(),
                 sticky = sticky,
+                conf = directory.join("conf").display(),
                 list = list,
             ),
         )
@@ -1304,7 +1404,7 @@ exit 0
     }
 
     /// Like `fake_updatedb_docker` but also keeps the maintenance flag in a
-    /// file (starting at `start_flag`), dumps a marker for `sql:dump`, and
+    /// file (starting at `start_flag`), dumps a marker for `mariadb-dump`/`sql:dump`, and
     /// with `fail_update` makes `updatedb` exit 1.
     fn fake_safe_docker(
         directory: &std::path::Path,
@@ -1323,10 +1423,11 @@ exit 0
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *"sql:conf"*) if [ -e '{conf}' ]; then cat '{conf}'; else echo '{{"driver":"mysql","host":"db-1","username":"drupal","password":"s3cret-pw","database":"drupal"}}'; fi ;;
   *"updatedb:status"*)
     if [ -e '{done}' ]; then echo '[]'; else echo '{{"hook_1":{{}}}}'; fi ;;
   *" updatedb"*) if [ "{fail_update}" = true ]; then exit 1; fi; touch '{done}' ;;
-  *"sql:dump"*) if [ "{fail_dump}" = true ]; then echo partial; exit 1; fi; echo 'DUMP' ;;
+  *"sql:dump"*|*"mariadb-dump"*) if [ "{fail_dump}" = true ]; then echo partial; exit 1; fi; echo 'DUMP' ;;
   *"state:set system.maintenance_mode 1"*) echo 1 > '{flag}' ;;
   *"state:set system.maintenance_mode 0"*) echo 0 > '{flag}' ;;
   *"state:get system.maintenance_mode"*) cat '{flag}' ;;
@@ -1336,6 +1437,7 @@ exit 0
                 log = log.display(),
                 done = done.display(),
                 flag = flag.display(),
+                conf = directory.join("conf").display(),
                 fail_update = fail_update,
                 fail_dump = fail_dump,
             ),
@@ -1385,7 +1487,17 @@ exit 0
                 .find(needle)
                 .unwrap_or_else(|| panic!("{needle}: {recorded}"))
         };
-        assert!(at("sql:dump") < at("maintenance_mode 1"));
+        assert!(at("mariadb-dump") < at("maintenance_mode 1"));
+        assert!(
+            recorded
+                .contains("exec -i -e MYSQL_PWD db-1 mariadb-dump -udrupal --single-transaction"),
+            "{recorded}"
+        );
+        assert!(!recorded.contains("sql:dump"), "{recorded}");
+        assert!(
+            !recorded.contains("s3cret-pw"),
+            "the password never reaches argv: {recorded}"
+        );
         assert!(at("maintenance_mode 1") < at("--no-interaction updatedb\n"));
         assert!(at("--no-interaction updatedb\n") < at("maintenance_mode 0"));
     }
@@ -1467,6 +1579,70 @@ exit 0
     }
 
     #[test]
+    fn update_db_uses_drush_dump_for_another_driver_and_refuses_unreadable_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_safe_docker(dir.path(), 0, false, false);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+            backup_root: &state,
+        };
+        fs::write(
+            dir.path().join("conf"),
+            r#"{"driver":"sqlite","database":"x.db"}"#,
+        )
+        .unwrap();
+        execute(
+            &ctx,
+            &request("update-db", None, ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        let recorded = log(dir.path());
+        assert!(recorded.contains("sql:dump") && !recorded.contains("mariadb-dump"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let docker = fake_safe_docker(dir.path(), 0, false, false);
+        let state = managed(dir.path());
+        let ctx = Context {
+            engine_state: &state,
+            docker_program: &docker,
+            tools_dir: dir.path(),
+            backup_root: &state,
+        };
+        for bad in [
+            "not json",
+            r#"{"driver":"mysql","host":"localhost","username":"u","password":"p","database":"d"}"#,
+            r#"{"driver":"mysql","host":"db-1","username":"-x","password":"p","database":"d"}"#,
+        ]
+        .into_iter()
+        .zip([
+            "123e4567-e89b-12d3-a456-426614174010",
+            "123e4567-e89b-12d3-a456-426614174011",
+            "123e4567-e89b-12d3-a456-426614174012",
+        ]) {
+            let (bad, id) = bad;
+            fs::write(dir.path().join("conf"), bad).unwrap();
+            let error = execute(
+                &ctx,
+                &request("update-db", None, id, None),
+                &CancellationToken::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(error, Error::BackupConfigUnreadable), "{error:?}");
+        }
+        let recorded = log(dir.path());
+        assert!(!recorded.contains("state:set"), "{recorded}");
+        assert!(
+            !recorded.contains("--no-interaction updatedb\n"),
+            "{recorded}"
+        );
+        assert!(!dir.path().join(format!("drupal-updates/{ID}")).exists());
+    }
+
+    #[test]
     fn update_db_runs_updatedb_only_when_updates_are_pending() {
         let dir = tempfile::tempdir().unwrap();
         let docker = fake_updatedb_docker(dir.path(), 3, false);
@@ -1494,7 +1670,7 @@ exit 0
             "{recorded}"
         );
         assert!(
-            recorded.contains("sql:dump") && recorded.contains("maintenance_mode 1"),
+            recorded.contains("mariadb-dump") && recorded.contains("maintenance_mode 1"),
             "{recorded}"
         );
 
@@ -1509,7 +1685,7 @@ exit 0
         assert_eq!(again.updates_pending, Some(0));
         let after = log(dir.path());
         assert_eq!(
-            after.matches("sql:dump").count(),
+            after.matches("mariadb-dump").count(),
             1,
             "no second dump: {after}"
         );
