@@ -12,9 +12,18 @@
 //!   record. Nothing is uninstalled or disabled. `off` puts maintenance mode
 //!   back to the value it had before (a site that was already in maintenance
 //!   mode stays there).
-//! * `joomla` is not a kind: its console cannot enable or disable
-//!   extensions and the only other way is writing `#__extensions` in the
-//!   database, which the engine does not do.
+//! * `joomla`: Joomla's console cannot enable or disable extensions, so the
+//!   engine boots Joomla's own framework in the site's runtime container
+//!   (inline `php -r`, as `site.adminUsers` does; nothing is written on the
+//!   site) and uses Joomla's database API: the credentials and the table
+//!   prefix never leave the site's own configuration and are never read by
+//!   the engine. Fixed statements only, over `#__extensions` rows with
+//!   `type = 'plugin'`, `protected = 0` and `locked = 0` (third-party
+//!   plugins; core and protected extensions are never touched). The enabled
+//!   ones are read first and written, by id, to the saved list; `on` sets
+//!   `enabled = 0` for exactly those ids in one transaction, `off` sets
+//!   `enabled = 1` for exactly the saved ids that read back as disabled and
+//!   removes the list only when every saved plugin reads back as enabled.
 //!
 //! `status` is a read of the saved list. The argv is fixed per kind; commands
 //! run as the site user inside the site's runtime container. Names that come
@@ -59,6 +68,7 @@ const SAVED: &str = "saved.json";
 pub enum Kind {
     WordPress,
     Drupal,
+    Joomla,
 }
 
 impl Kind {
@@ -66,6 +76,7 @@ impl Kind {
         match value {
             "wordpress" => Some(Self::WordPress),
             "drupal" => Some(Self::Drupal),
+            "joomla" => Some(Self::Joomla),
             _ => None,
         }
     }
@@ -74,6 +85,7 @@ impl Kind {
         match self {
             Self::WordPress => "wordpress",
             Self::Drupal => "drupal",
+            Self::Joomla => "joomla",
         }
     }
 }
@@ -154,7 +166,7 @@ impl Request {
                 }
                 Some(path)
             }
-            (Kind::WordPress, None) => None,
+            (Kind::WordPress | Kind::Joomla, None) => None,
             _ => return Err(RequestError::InvalidRoot),
         };
         Ok(Self {
@@ -187,6 +199,10 @@ struct Saved {
     /// WordPress: the active plugins (slug as WP-CLI names them). Drupal:
     /// the enabled modules, for the record only.
     extensions: Vec<String>,
+    /// Joomla: the `extension_id` of each saved plugin (same order as
+    /// `extensions`). The ids are what `off` restores.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ids: Vec<u64>,
     /// Drupal: maintenance mode before safe mode was switched on.
     previous_maintenance: Option<bool>,
     saved_at_unix_secs: u64,
@@ -550,6 +566,232 @@ fn drupal_modules(
     Ok(names)
 }
 
+// ---- Joomla -------------------------------------------------------------
+
+/// Fixed PHP text, run with `php -r` as the site user. The plan arrives on
+/// stdin as JSON (`root`, `op`, integer `ids`); nothing from it becomes SQL
+/// except the validated integers. Joomla's own database layer supplies the
+/// connection and the table prefix; no credential is read or printed. Only
+/// non-core (`locked = 0`), non-protected plugin rows are ever selected or
+/// updated. The last output line is `{"ok":true,...}` or `{"ok":false,"error":...}`;
+/// exception messages are never printed.
+const JOOMLA_PHP: &str = r#"$say = function ($v) { echo "\n" . json_encode($v) . "\n"; };
+try {
+$plan = json_decode(stream_get_contents(STDIN), true);
+if (!is_array($plan) || !isset($plan['root'], $plan['op']) || !is_string($plan['root']) || !in_array($plan['op'], array('list', 'disable', 'enable'), true)) { $say(array('ok' => false, 'error' => 'badPlan')); return; }
+$ids = array();
+foreach ((array) (isset($plan['ids']) ? $plan['ids'] : array()) as $i) { if (!is_int($i) || $i < 1) { $say(array('ok' => false, 'error' => 'badPlan')); return; } $ids[] = $i; }
+define('_JEXEC', 1); define('JPATH_BASE', $plan['root']);
+$_SERVER['HTTP_HOST'] = 'localhost';
+if (!is_file(JPATH_BASE . '/includes/framework.php') || !is_file(JPATH_BASE . '/configuration.php')) { $say(array('ok' => false, 'error' => 'notJoomla')); return; }
+require_once JPATH_BASE . '/includes/defines.php';
+require_once JPATH_BASE . '/includes/framework.php';
+$db = \Joomla\CMS\Factory::getContainer()->get(\Joomla\Database\DatabaseInterface::class);
+$t = $db->quoteName('#__extensions');
+$guard = $db->quoteName('type') . ' = ' . $db->quote('plugin') . ' AND ' . $db->quoteName('protected') . ' = 0 AND ' . $db->quoteName('locked') . ' = 0';
+if ($plan['op'] === 'list') {
+  $q = $db->getQuery(true)->select($db->quoteName(array('extension_id', 'folder', 'element')))->from($t)->where($guard)->where($db->quoteName('enabled') . ' = 1')->order($db->quoteName('extension_id'))->setLimit(2001);
+  $o = array();
+  foreach ($db->setQuery($q)->loadAssocList() as $r) { $o[] = array('id' => (int) $r['extension_id'], 'name' => $r['folder'] . '/' . $r['element']); }
+  $say(array('ok' => true, 'plugins' => $o));
+  return;
+}
+if (!$ids) { $say(array('ok' => true, 'affected' => 0)); return; }
+$to = $plan['op'] === 'enable' ? 1 : 0;
+$q = $db->getQuery(true)->update($t)->set($db->quoteName('enabled') . ' = ' . $to)->where($guard)->where($db->quoteName('enabled') . ' = ' . (1 - $to))->where($db->quoteName('extension_id') . ' IN (' . implode(',', $ids) . ')');
+$db->setQuery($q)->execute();
+$n = (int) $db->getAffectedRows();
+try {
+  foreach (array('site', 'administrator') as $app) {
+    \Joomla\CMS\Factory::getContainer()->get(\Joomla\CMS\Cache\CacheControllerFactoryInterface::class)->createCacheController('callback', array('defaultgroup' => 'com_plugins', 'application' => $app))->clean();
+  }
+} catch (\Throwable $e) { }
+$say(array('ok' => true, 'affected' => $n));
+} catch (\Throwable $e) { $say(array('ok' => false, 'error' => 'failed')); }"#;
+
+#[derive(Debug, Deserialize)]
+struct JoomlaReply {
+    ok: bool,
+    #[serde(default)]
+    plugins: Vec<JoomlaPlugin>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JoomlaPlugin {
+    id: u64,
+    name: String,
+}
+
+fn joomla_call(
+    ctx: &Context<'_>,
+    req: &Request,
+    op: &str,
+    ids: &[u64],
+    cancel: &CancellationToken,
+) -> Result<JoomlaReply, Error> {
+    let plan = serde_json::json!({
+        "root": req.project_root.display().to_string(),
+        "op": op,
+        "ids": ids,
+    });
+    let args: Vec<String> = vec![
+        "exec".into(),
+        "-i".into(),
+        "--user".into(),
+        format!("{}:{}", req.uid, req.gid),
+        req.container.as_str().to_owned(),
+        "php".into(),
+        "-r".into(),
+        JOOMLA_PHP.into(),
+    ];
+    let output = process::run_with_stdin_bytes(
+        &ProcessRequest::new(ctx.docker_program).args(args),
+        plan.to_string().as_bytes(),
+        &ProcessLimits {
+            timeout: if op == "list" {
+                READ_TIMEOUT
+            } else {
+                RUN_TIMEOUT
+            },
+            max_stdout_bytes: MAX_OUTPUT,
+            max_stderr_bytes: MAX_OUTPUT,
+        },
+        cancel,
+    )
+    .map_err(Error::Run)?;
+    let output = checked(ctx, output)?;
+    if output.stdout.truncated {
+        return Err(Error::Unreadable);
+    }
+    let text = String::from_utf8_lossy(&output.stdout.bytes);
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or(Error::Unreadable)?;
+    let reply: JoomlaReply = serde_json::from_str(line).map_err(|_| Error::Unreadable)?;
+    if reply.ok {
+        Ok(reply)
+    } else {
+        Err(Error::Unreadable)
+    }
+}
+
+/// The enabled, non-core, non-protected plugins: (ids, names), sorted by id.
+fn joomla_enabled(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<(Vec<u64>, Vec<String>), Error> {
+    let mut plugins = joomla_call(ctx, req, "list", &[], cancel)?.plugins;
+    plugins.sort_by_key(|plugin| plugin.id);
+    plugins.dedup_by_key(|plugin| plugin.id);
+    if plugins.len() > MAX_EXTENSIONS || !plugins.iter().all(|plugin| valid_name(&plugin.name)) {
+        return Err(Error::Unreadable);
+    }
+    Ok(plugins
+        .into_iter()
+        .map(|plugin| (plugin.id, plugin.name))
+        .unzip())
+}
+
+fn joomla_set(
+    ctx: &Context<'_>,
+    req: &Request,
+    enable: bool,
+    ids: &[u64],
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    joomla_call(
+        ctx,
+        req,
+        if enable { "enable" } else { "disable" },
+        ids,
+        cancel,
+    )
+    .map(|_| ())
+}
+
+fn missing_ids(saved: &[u64], current: &[u64]) -> Vec<u64> {
+    let have: BTreeSet<&u64> = current.iter().collect();
+    saved
+        .iter()
+        .filter(|id| !have.contains(id))
+        .copied()
+        .collect()
+}
+
+fn run_joomla(
+    ctx: &Context<'_>,
+    scope: &ManagedRoot,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<Ran, Error> {
+    let saved = load_saved(scope, req.kind)?;
+    match (req.mode, saved) {
+        (Mode::Status, Some(saved)) => Ok(ran_from(&saved, true, false, None)),
+        (Mode::Status, None) | (Mode::Off, None) => Ok(Ran {
+            safe_mode: false,
+            changed: false,
+            extensions: Vec::new(),
+            maintenance_mode: None,
+            saved_at: None,
+        }),
+        (Mode::On, Some(saved)) => {
+            // Already on. Anything enabled since is reported, not folded in.
+            if !joomla_enabled(ctx, req, cancel)?.0.is_empty() {
+                return Err(Error::Diverged);
+            }
+            Ok(ran_from(&saved, true, false, None))
+        }
+        (Mode::On, None) => {
+            let (ids, names) = joomla_enabled(ctx, req, cancel)?;
+            let saved = Saved {
+                kind: req.kind.name().into(),
+                extensions: names,
+                ids: ids.clone(),
+                previous_maintenance: None,
+                saved_at_unix_secs: unix_now(),
+            };
+            // The list is durable before the first plugin is touched.
+            store_saved(scope, &saved)?;
+            let disabled = (|| -> Result<(), Error> {
+                joomla_set(ctx, req, false, &ids, cancel)?;
+                if joomla_enabled(ctx, req, cancel)?.0.is_empty() {
+                    Ok(())
+                } else {
+                    Err(Error::StateMismatch)
+                }
+            })();
+            if let Err(error) = disabled {
+                // Put the previous state back; keep the list if that fails.
+                let restored = joomla_set(ctx, req, true, &ids, cancel)
+                    .and_then(|()| joomla_enabled(ctx, req, cancel))
+                    .is_ok_and(|(now, _)| missing_ids(&ids, &now).is_empty());
+                if restored {
+                    let _ = drop_saved(scope);
+                }
+                return Err(error);
+            }
+            Ok(ran_from(&saved, true, true, None))
+        }
+        (Mode::Off, Some(saved)) => {
+            if saved.ids.len() != saved.extensions.len() {
+                return Err(Error::Unreadable);
+            }
+            let (now, _) = joomla_enabled(ctx, req, cancel)?;
+            joomla_set(ctx, req, true, &missing_ids(&saved.ids, &now), cancel)?;
+            let (after, _) = joomla_enabled(ctx, req, cancel)?;
+            let left = missing_ids(&saved.ids, &after);
+            if !left.is_empty() {
+                return Err(Error::Incomplete(left.len()));
+            }
+            drop_saved(scope)?;
+            Ok(ran_from(&saved, false, true, None))
+        }
+    }
+}
+
 // ---- shared -------------------------------------------------------------
 
 struct Ran {
@@ -637,6 +879,7 @@ fn run_wordpress(
             let saved = Saved {
                 kind: req.kind.name().into(),
                 extensions: active.clone(),
+                ids: Vec::new(),
                 previous_maintenance: None,
                 saved_at_unix_secs: unix_now(),
             };
@@ -716,6 +959,7 @@ fn run_drupal(
             let saved = Saved {
                 kind: req.kind.name().into(),
                 extensions: modules,
+                ids: Vec::new(),
                 previous_maintenance: Some(previous),
                 saved_at_unix_secs: unix_now(),
             };
@@ -791,6 +1035,7 @@ pub fn execute(
         match req.kind {
             Kind::WordPress => run_wordpress(ctx, &scope, req, cancel),
             Kind::Drupal => run_drupal(ctx, &scope, req, cancel),
+            Kind::Joomla => run_joomla(ctx, &scope, req, cancel),
         }
     };
     let ran = match outcome {
@@ -909,6 +1154,22 @@ mod tests {
 D='{d}'
 printf '%s\n' "$*" >> '{log}'
 case "$*" in
+  *" php -r "*)
+    plan=$(cat)
+    printf '%s\n' "$plan" >> '{d}/plans.log'
+    case "$plan" in *'"op":"list"'*)
+      printf '{{"ok":true,"plugins":['; sep=''
+      while read -r id name en; do
+        [ "$en" = 1 ] || continue
+        printf '%s{{"id":%s,"name":"%s"}}' "$sep" "$id" "$name"; sep=','
+      done < "$D/jplugins"
+      printf ']}}\n'; exit 0 ;; esac
+    ids=$(printf '%s' "$plan" | sed 's/.*"ids":\[\([0-9,]*\)\].*/\1/')
+    case "$plan" in *'"op":"enable"'*) op=enable ;; *) op=disable ;; esac
+    if [ "$op" = disable ] && [ -f "$D/J_HALF" ]; then ids=$(printf '%s' "$ids" | cut -d, -f1); fi
+    awk -v ids=",$ids," -v op="$op" -v lock="$(cat "$D/J_LOCKED" 2>/dev/null)" '
+      {{ if (index(ids, "," $1 ",") > 0 && index(" " lock " ", " " $1 " ") == 0) $3 = (op == "enable") ? 1 : 0; print }}' "$D/jplugins" > "$D/jplugins.new" && mv "$D/jplugins.new" "$D/jplugins"
+    printf '{{"ok":true,"affected":1}}\n'; exit 0 ;;
   *"core is-installed --network"*) [ -f "$D/MULTISITE" ]; exit $? ;;
   *"plugin list --status=active"*)
     printf '['; sep=''
@@ -941,6 +1202,27 @@ exit 0
         .unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
+    }
+
+    /// Joomla plugins as `id name enabled`, one per line.
+    fn set_joomla(dir: &Path, rows: &[(u32, &str, u8)]) {
+        let mut text = String::new();
+        for (id, name, en) in rows {
+            text.push_str(&format!("{id} {name} {en}\n"));
+        }
+        fs::write(dir.join("jplugins"), text).unwrap();
+    }
+
+    fn joomla_enabled_names(dir: &Path) -> Vec<String> {
+        fs::read_to_string(dir.join("jplugins"))
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split(' ');
+                let (_, name, en) = (parts.next()?, parts.next()?, parts.next()?);
+                (en == "1").then(|| name.to_owned())
+            })
+            .collect()
     }
 
     fn set_plugins(dir: &Path, list: &[&str]) {
@@ -982,7 +1264,7 @@ exit 0
             )
         };
         assert_eq!(
-            Request::parse(&with("joomla", "on", ""), ID, None).unwrap_err(),
+            Request::parse(&with("typo3", "on", ""), ID, None).unwrap_err(),
             RequestError::InvalidKind
         );
         assert_eq!(
@@ -1174,5 +1456,132 @@ exit 0
             .unwrap();
         assert!(matches!(error, Error::Replayed { .. }));
         assert_eq!(log(dir.path()).lines().count(), calls);
+    }
+
+    const JOOMLA: [(u32, &str, u8); 4] = [
+        (10, "system/seo", 1),
+        (11, "content/gallery", 1),
+        (12, "system/off-already", 0),
+        (13, "user/sso", 1),
+    ];
+
+    #[test]
+    fn joomla_disables_the_enabled_plugins_and_restores_exactly_that_set() {
+        let dir = tempfile::tempdir().unwrap();
+        set_joomla(dir.path(), &JOOMLA);
+        let on = run(dir.path(), &request("joomla", "on", ID, Some("j1"))).unwrap();
+        assert!(on.safe_mode && on.changed);
+        assert_eq!(on.extensions, ["system/seo", "content/gallery", "user/sso"]);
+        assert!(joomla_enabled_names(dir.path()).is_empty());
+        // Every call carried a fixed op and integer ids only.
+        let plans = fs::read_to_string(dir.path().join("plans.log")).unwrap();
+        assert!(plans.contains(r#""ids":[10,11,13]"#), "{plans}");
+        assert!(!plans.contains("off-already"));
+
+        // Replay with the same key re-runs nothing.
+        let calls = plans.lines().count();
+        run(dir.path(), &request("joomla", "on", &id(1), Some("j1"))).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("plans.log"))
+                .unwrap()
+                .lines()
+                .count(),
+            calls
+        );
+        // Already on: unchanged.
+        let again = run(dir.path(), &request("joomla", "on", &id(2), None)).unwrap();
+        assert!(again.safe_mode && !again.changed);
+
+        let off = run(dir.path(), &request("joomla", "off", &id(3), None)).unwrap();
+        assert!(!off.safe_mode && off.changed);
+        // The plugin that was already disabled stays disabled.
+        assert_eq!(
+            joomla_enabled_names(dir.path()),
+            ["system/seo", "content/gallery", "user/sso"]
+        );
+        assert!(
+            !run(dir.path(), &request("joomla", "status", &id(4), None))
+                .unwrap()
+                .safe_mode
+        );
+        let off = run(dir.path(), &request("joomla", "off", &id(5), None)).unwrap();
+        assert!(!off.safe_mode && !off.changed);
+    }
+
+    #[test]
+    fn joomla_failed_disable_puts_the_plugins_back() {
+        let dir = tempfile::tempdir().unwrap();
+        set_joomla(dir.path(), &JOOMLA);
+        fs::write(dir.path().join("J_HALF"), "").unwrap();
+        let error = run(dir.path(), &request("joomla", "on", ID, None))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::StateMismatch), "{error:?}");
+        assert_eq!(
+            joomla_enabled_names(dir.path()),
+            ["system/seo", "content/gallery", "user/sso"]
+        );
+        assert!(
+            !run(dir.path(), &request("joomla", "status", &id(1), None))
+                .unwrap()
+                .safe_mode
+        );
+    }
+
+    #[test]
+    fn joomla_partial_restore_keeps_the_list_and_a_retry_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        set_joomla(dir.path(), &JOOMLA);
+        run(dir.path(), &request("joomla", "on", ID, None)).unwrap();
+        fs::write(dir.path().join("J_LOCKED"), "11").unwrap();
+        let error = run(dir.path(), &request("joomla", "off", &id(1), None))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Incomplete(1)), "{error:?}");
+        assert_eq!(joomla_enabled_names(dir.path()), ["system/seo", "user/sso"]);
+        assert!(
+            run(dir.path(), &request("joomla", "status", &id(2), None))
+                .unwrap()
+                .safe_mode
+        );
+        fs::remove_file(dir.path().join("J_LOCKED")).unwrap();
+        let off = run(dir.path(), &request("joomla", "off", &id(3), None)).unwrap();
+        assert!(!off.safe_mode);
+        assert_eq!(
+            joomla_enabled_names(dir.path()),
+            ["system/seo", "content/gallery", "user/sso"]
+        );
+    }
+
+    #[test]
+    fn joomla_on_again_after_new_activations_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        set_joomla(dir.path(), &JOOMLA);
+        run(dir.path(), &request("joomla", "on", ID, None)).unwrap();
+        set_joomla(dir.path(), &[(12, "system/late", 1)]);
+        let error = run(dir.path(), &request("joomla", "on", &id(1), None))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Diverged));
+    }
+
+    #[test]
+    fn joomla_takes_no_document_root() {
+        let json = r#"{"kind":"joomla","state":"on","container":"c","projectRoot":"/var/www/j","documentRoot":"/var/www/j","uid":1,"gid":1}"#;
+        assert_eq!(
+            Request::parse(json, ID, None).unwrap_err(),
+            RequestError::InvalidRoot
+        );
+    }
+
+    #[test]
+    fn the_joomla_script_touches_only_plugin_rows_that_are_neither_core_nor_protected() {
+        assert!(JOOMLA_PHP.contains("'plugin'"));
+        assert!(JOOMLA_PHP.contains("quoteName('protected') . ' = 0 AND '"));
+        assert!(JOOMLA_PHP.contains("quoteName('locked') . ' = 0'"));
+        // No credential is read or printed.
+        for word in ["password", "getConfig", "->get('user')", "dbtype"] {
+            assert!(!JOOMLA_PHP.contains(word), "{word}");
+        }
     }
 }

@@ -856,10 +856,9 @@ transaction and audit as for the Drupal actions. Advertised as
 
 `cms safe-mode` ("disable all extensions") takes a root-owned JSON request
 `{kind, state, container, projectRoot, documentRoot?, uid, gid}` where `kind`
-is `wordpress` or `drupal` (Joomla is not supported: its console cannot switch
-extensions and the only other way is writing the database), `state` is `on`,
-`off` or `status`, and `documentRoot` is required for Drupal and forbidden for
-WordPress. Unknown fields, other kinds and states are rejected.
+is `wordpress`, `drupal` or `joomla`, `state` is `on`, `off` or `status`, and
+`documentRoot` is required for Drupal and forbidden for WordPress and Joomla
+(`projectRoot` is the Joomla root). Unknown fields, other kinds and states are rejected.
 
 WordPress `on` reads the active plugins (`wp plugin list --status=active`),
 writes them to a saved list in the engine's own state directory, then runs
@@ -876,6 +875,21 @@ Drupal `on` records the previous maintenance mode and the enabled modules (for
 the record, nothing is disabled or uninstalled) and turns maintenance mode on
 (`state:set`, `cache:rebuild`, read back); `off` puts the maintenance mode back
 to the recorded value, so a site that was already in maintenance stays there.
+
+Joomla has no console command to switch extensions, so the engine runs a fixed
+inline `php -r` script in the runtime container as the site user (plan on
+stdin, as `site.adminUsers` does) that boots Joomla's own framework and uses its
+database API. The engine never reads configuration.php, the credentials or the
+table prefix. Only `#__extensions` rows with `type = 'plugin'`, `protected = 0`
+and `locked = 0` (non-core, non-protected plugins) are read or updated, with
+`enabled`, by integer id. `on` saves the enabled plugins (id and
+`folder/element`) before touching anything, sets `enabled = 0` for exactly those
+ids and reads back that none of them is enabled (otherwise it re-enables them
+and removes the list, or keeps it if that fails). `off` sets `enabled = 1` for
+the saved ids that are disabled and removes the list only when every saved id
+reads back as enabled (else `SUBPROCESS_FAILED`, list kept). Plugins that were
+already disabled stay disabled. Joomla's `com_plugins` cache is cleaned on a
+best-effort basis. `extensions` holds `folder/element`.
 
 `status` only reads the saved list. The result is `{kind, safeMode, changed,
 extensions, maintenanceMode, savedAtUnixSecs, completedAtUnixSecs}` with no
