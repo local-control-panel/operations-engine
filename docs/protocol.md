@@ -798,8 +798,12 @@ updatedb:status --format=json` as the site user. When no update is pending it
 stops there (`changed: false`, `updatesPending: 0`): nothing is mutated. When
 updates are pending the engine, in this order: reads the maintenance mode
 (`state:get system.maintenance_mode`; unreadable output fails the request
-before anything changes), dumps the database with `drush sql:dump` into the
-backup root at `drupal-updates/<requestId>/database.sql` (a failed dump is
+before anything changes), dumps the database into the
+backup root (for MySQL/MariaDB: connection from `drush sql:conf` and the
+database container's own `mariadb-dump`, so the PHP container needs no client,
+the password only in the environment of that one `docker exec`; the
+connection host must be the database container's name; other drivers use
+`drush sql:dump`) at `drupal-updates/<requestId>/database.sql` (a failed dump is
 deleted and the request fails with no update run), turns maintenance mode on
 unless it already was, runs `drush updatedb --no-interaction` (30 minute
 limit) and reads `updatedb:status` again; the request fails with
