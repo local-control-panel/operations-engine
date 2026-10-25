@@ -1205,6 +1205,10 @@ pub enum WordpressCommand {
         path: String,
         #[arg(long)]
         keep: Option<u32>,
+        /// Gzip the rotated copy to `debug.log.1.gz` (the plain copy is kept
+        /// if compression fails).
+        #[arg(long)]
+        compress: bool,
         #[arg(long = "request-id")]
         request_id: String,
         #[arg(long = "idempotency-key")]
