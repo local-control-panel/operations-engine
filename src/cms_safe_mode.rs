@@ -18,8 +18,9 @@
 //!   site) and uses Joomla's database API: the credentials and the table
 //!   prefix never leave the site's own configuration and are never read by
 //!   the engine. Fixed statements only, over `#__extensions` rows with
-//!   `type = 'plugin'`, `protected = 0` and `locked = 0` (third-party
-//!   plugins; core and protected extensions are never touched). The enabled
+//!   `type = 'plugin'`, `protected = 0` and `locked = 0` that Joomla's
+//!   `ExtensionHelper::checkIfCoreExtension` does not list as core (third-party
+//!   plugins only; core and protected extensions are never touched). The enabled
 //!   ones are read first and written, by id, to the saved list; `on` sets
 //!   `enabled = 0` for exactly those ids in one transaction, `off` sets
 //!   `enabled = 1` for exactly the saved ids that read back as disabled and
@@ -589,16 +590,28 @@ require_once JPATH_BASE . '/includes/framework.php';
 $db = \Joomla\CMS\Factory::getContainer()->get(\Joomla\Database\DatabaseInterface::class);
 $t = $db->quoteName('#__extensions');
 $guard = $db->quoteName('type') . ' = ' . $db->quote('plugin') . ' AND ' . $db->quoteName('protected') . ' = 0 AND ' . $db->quoteName('locked') . ' = 0';
-if ($plan['op'] === 'list') {
-  $q = $db->getQuery(true)->select($db->quoteName(array('extension_id', 'folder', 'element')))->from($t)->where($guard)->where($db->quoteName('enabled') . ' = 1')->order($db->quoteName('extension_id'))->setLimit(2001);
+// Joomla's own list of core extensions decides; without it nothing is touched.
+if (!class_exists('\Joomla\CMS\Extension\ExtensionHelper') || !method_exists('\Joomla\CMS\Extension\ExtensionHelper', 'checkIfCoreExtension')) { $say(array('ok' => false, 'error' => 'noCoreList')); return; }
+$rows = function ($extra) use ($db, $t, $guard) {
+  $q = $db->getQuery(true)->select($db->quoteName(array('extension_id', 'folder', 'element', 'client_id')))->from($t)->where($guard)->where($extra)->order($db->quoteName('extension_id'))->setLimit(2001);
   $o = array();
-  foreach ($db->setQuery($q)->loadAssocList() as $r) { $o[] = array('id' => (int) $r['extension_id'], 'name' => $r['folder'] . '/' . $r['element']); }
+  foreach ($db->setQuery($q)->loadAssocList() as $r) {
+    if (\Joomla\CMS\Extension\ExtensionHelper::checkIfCoreExtension('plugin', (string) $r['element'], (int) $r['client_id'], (string) $r['folder'])) { continue; }
+    $o[(int) $r['extension_id']] = $r['folder'] . '/' . $r['element'];
+  }
+  return $o;
+};
+if ($plan['op'] === 'list') {
+  $o = array();
+  foreach ($rows($db->quoteName('enabled') . ' = 1') as $id => $name) { $o[] = array('id' => $id, 'name' => $name); }
   $say(array('ok' => true, 'plugins' => $o));
   return;
 }
 if (!$ids) { $say(array('ok' => true, 'affected' => 0)); return; }
 $to = $plan['op'] === 'enable' ? 1 : 0;
-$q = $db->getQuery(true)->update($t)->set($db->quoteName('enabled') . ' = ' . $to)->where($guard)->where($db->quoteName('enabled') . ' = ' . (1 - $to))->where($db->quoteName('extension_id') . ' IN (' . implode(',', $ids) . ')');
+$eligible = array_keys($rows($db->quoteName('enabled') . ' = ' . (1 - $to) . ' AND ' . $db->quoteName('extension_id') . ' IN (' . implode(',', $ids) . ')'));
+if (!$eligible) { $say(array('ok' => true, 'affected' => 0)); return; }
+$q = $db->getQuery(true)->update($t)->set($db->quoteName('enabled') . ' = ' . $to)->where($guard)->where($db->quoteName('enabled') . ' = ' . (1 - $to))->where($db->quoteName('extension_id') . ' IN (' . implode(',', $eligible) . ')');
 $db->setQuery($q)->execute();
 $n = (int) $db->getAffectedRows();
 try {
@@ -1579,6 +1592,7 @@ exit 0
         assert!(JOOMLA_PHP.contains("'plugin'"));
         assert!(JOOMLA_PHP.contains("quoteName('protected') . ' = 0 AND '"));
         assert!(JOOMLA_PHP.contains("quoteName('locked') . ' = 0'"));
+        assert!(JOOMLA_PHP.contains("checkIfCoreExtension"));
         // No credential is read or printed.
         for word in ["password", "getConfig", "->get('user')", "dbtype"] {
             assert!(!JOOMLA_PHP.contains(word), "{word}");

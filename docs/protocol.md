@@ -881,7 +881,9 @@ inline `php -r` script in the runtime container as the site user (plan on
 stdin, as `site.adminUsers` does) that boots Joomla's own framework and uses its
 database API. The engine never reads configuration.php, the credentials or the
 table prefix. Only `#__extensions` rows with `type = 'plugin'`, `protected = 0`
-and `locked = 0` (non-core, non-protected plugins) are read or updated, with
+and `locked = 0` that Joomla's own `ExtensionHelper::checkIfCoreExtension` does
+not list as core (third-party plugins; Joomla ships unlocked core plugins such
+as schemaorg, so `locked` alone is not enough) are read or updated, with
 `enabled`, by integer id. `on` saves the enabled plugins (id and
 `folder/element`) before touching anything, sets `enabled = 0` for exactly those
 ids and reads back that none of them is enabled (otherwise it re-enables them
