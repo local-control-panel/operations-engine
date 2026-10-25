@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # wcp-agent: bruteforce-guard
-# wcp-agent-version: 2.0.0
+# wcp-agent-version: 2.1.0
 # wcp-agent-description: Fail2Ban-style brute-force protection for wp-login and general Caddy abuse. Bans in the ingress Caddy (a `remote_ip` block every route imports) instead of iptables, since containerized (Docker bridge + published-port) traffic is NAT'd through DOCKER-USER/FORWARD, not INPUT, so classic fail2ban bans never actually apply. The ban list is applied by the Operations Engine (`ingress.applyBans`), never by editing route files.
 #
 # Run modes:
@@ -26,10 +26,13 @@ APPLY_ONLY=0
 export APPLY_ONLY
 
 python3 - << 'PYEOF'
-import glob, json, os, re, sys, time, uuid
+import fnmatch, glob, json, os, re, sys, time, urllib.parse, uuid
 
 WCP_DIR        = os.environ.get("WCP_DIR", "/root/.wcp")
 LOG_GLOB       = os.environ["LOG_GLOB"]
+# Per-path rate limits: `ingress.applyAdminPaths` writes bans/admin-<domain>.caddy
+# whose header line carries `rateLimit` and the expanded path patterns.
+ADMIN_PATHS_DIR = os.environ.get("ADMIN_PATHS_DIR", "/etc/wcp/ingress.d/bans")
 ENGINE         = os.environ.get("OPS_ENGINE", "ops-engine")
 APPLY_ONLY     = os.environ.get("APPLY_ONLY", "0") == "1"
 
@@ -100,6 +103,56 @@ CADDY_ENABLED = get_bool(kv, "CADDY_ENABLED", True)
 CADDY_MAX_RETRIES = get_int(kv, "CADDY_MAX_RETRIES", 20)
 CADDY_FINDTIME_MIN = get_int(kv, "CADDY_FINDTIME_MIN", 10)
 CADDY_BANTIME_MIN = get_int(kv, "CADDY_BANTIME_MIN", 60)
+
+ADMIN_MARKER = "# wcp-admin-paths "
+STATIC_RE = re.compile(r"\.(css|js|mjs|map|png|jpe?g|gif|svg|webp|avif|ico|woff2?|ttf|eot)$", re.I)
+
+
+def load_path_limits():
+    """Rate limits of restricted admin paths, read from the engine's files."""
+    limits = []
+    for path in sorted(glob.glob(os.path.join(ADMIN_PATHS_DIR, "admin-*.caddy"))):
+        try:
+            with open(path) as f:
+                head = f.read(16384)
+            line = next(l for l in head.splitlines() if l.startswith(ADMIN_MARKER))
+            cfg = json.loads(line[len(ADMIN_MARKER):])
+            rl = cfg.get("rateLimit")
+            if not rl:
+                continue
+            limit = {
+                "domain": str(cfg["domain"]).lower(),
+                "jail": "rl:" + str(cfg["domain"]).lower(),
+                "max_hits": int(rl["maxHits"]),
+                "window_min": int(rl["windowMinutes"]),
+                "ban_min": int(rl["banMinutes"]),
+                "patterns": [str(p).lower() for p in cfg["patterns"]],
+                "except": [str(p).lower() for p in cfg.get("except", [])],
+            }
+        except (OSError, StopIteration, ValueError, KeyError, TypeError):
+            continue
+        if limit["max_hits"] >= 1 and limit["window_min"] >= 1 and limit["ban_min"] >= 1:
+            limits.append(limit)
+    return limits
+
+
+def path_of(uri):
+    p = urllib.parse.unquote(uri.split("?", 1)[0].split("#", 1)[0]).lower()
+    return re.sub(r"/{2,}", "/", p)
+
+
+def limit_matches(limit, host, uri):
+    if host != limit["domain"]:
+        return False
+    p = path_of(uri)
+    if STATIC_RE.search(p):
+        return False
+    if any(fnmatch.fnmatchcase(p, pat) for pat in limit["except"]):
+        return False
+    return any(fnmatch.fnmatchcase(p, pat) for pat in limit["patterns"])
+
+
+PATH_LIMITS = load_path_limits()
 
 IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
 IPV6_CHARS_RE = re.compile(r"^[0-9a-fA-F:]+$")
@@ -205,6 +258,11 @@ if not APPLY_ONLY:
                 method = req.get("method")
                 uri = req.get("uri") or ""
                 status = entry.get("status")
+                host = re.sub(r":\d+$", "", req.get("host") or "").lower()
+
+                for limit in PATH_LIMITS:
+                    if limit_matches(limit, host, uri):
+                        hits.append({"ts": now, "jail": limit["jail"], "ip": ip})
 
                 if WP_LOGIN_ENABLED and method == "POST" and "wp-login.php" in uri:
                     hits.append({"ts": now, "jail": "wp_login", "ip": ip})
@@ -216,7 +274,8 @@ if not APPLY_ONLY:
     write_json(OFFSETS_FILE, offsets)
 
     # ── 2. Prune hits older than the widest configured find-time window ─────
-    max_find_min = max(WP_LOGIN_FINDTIME_MIN, CADDY_FINDTIME_MIN)
+    max_find_min = max([WP_LOGIN_FINDTIME_MIN, CADDY_FINDTIME_MIN]
+                       + [l["window_min"] for l in PATH_LIMITS])
     cutoff = now - max_find_min * 60
     hits = [h for h in hits if h["ts"] >= cutoff]
     write_json(HITS_FILE, hits)
@@ -239,6 +298,11 @@ if not APPLY_ONLY:
         for ip, count in counts_for("caddy", CADDY_FINDTIME_MIN).items():
             if count >= CADDY_MAX_RETRIES:
                 ban_ip(ip, "caddy", CADDY_BANTIME_MIN, count)
+
+    for limit in PATH_LIMITS:
+        for ip, count in counts_for(limit["jail"], limit["window_min"]).items():
+            if count >= limit["max_hits"]:
+                ban_ip(ip, "admin_paths", limit["ban_min"], count)
 
 # ── 4. Expire old bans ────────────────────────────────────────────────────────
 bans = read_bans()

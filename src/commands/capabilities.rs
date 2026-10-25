@@ -37,6 +37,10 @@ struct Features {
     /// The sensitive-path catalog `ingress.applyAdminPaths` accepts, per site
     /// kind. Absent on an engine without the operation.
     admin_paths: Vec<AdminPathsKind>,
+    /// `ingress.applyAdminPaths` accepts an allowlist and Basic auth together
+    /// and a `rateLimit` (enforced by the brute-force guard agent). Without
+    /// this field it takes exactly one `mode`.
+    admin_paths_combined: bool,
 }
 
 #[derive(Serialize)]
@@ -250,6 +254,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 clone_staging_defaults: true,
                 drupal_update_db_safety: true,
                 admin_paths: admin_paths_catalog(),
+                admin_paths_combined: true,
             },
         },
     )

@@ -209,7 +209,7 @@ pub static AGENTS: [Agent; 7] = [
     },
     Agent {
         name: GUARD_NAME,
-        version: "2.0.0",
+        version: "2.1.0",
         default_schedule: Some("* * * * *"),
         configurable_schedule: false,
         script: include_str!("../resources/agents/bruteforce-guard.sh"),
@@ -599,7 +599,7 @@ mod tests {
         ),
         (
             "bruteforce-guard",
-            "58449f8898559582e46537053fa9260903eac30b65decff58307fbbf94349eb9",
+            "1706c80b5383fe5f6afd86b607cbd652e3022a68e80366bf30bbfd90daae8df3",
         ),
         (
             "backup-restore-drill",
