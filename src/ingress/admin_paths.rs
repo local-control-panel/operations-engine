@@ -1,6 +1,7 @@
 //! The `ingress.applyAdminPaths` operation: restricting a site's sensitive
 //! admin paths (`/wp-login.php`, `/wp-admin`, `/user/login`, `/administrator`,
-//! `/admin`) to an IP allowlist or to HTTP Basic auth.
+//! `/admin`) to an IP allowlist, to HTTP Basic auth, to both at once, and/or
+//! under a per-path rate limit.
 //!
 //! It rides on the same mechanism as `ingress.applyBans`: every route imports
 //! `bans/*.caddy`, so one extra file per domain, `bans/admin-<domain>.caddy`,
@@ -13,8 +14,15 @@
 //! The request names a site kind and ids from a closed catalog; the engine
 //! maps ids to paths, so the panel can never inject a matcher. An allowlist
 //! answers 403 to every other address; Basic auth answers 401 without the
-//! password. A request with no `restriction` removes the file, which restores
-//! normal access.
+//! password; with both, an address outside the allowlist is refused (403)
+//! before it is asked for a password. A request with no `restriction` removes
+//! the file, which restores normal access.
+//!
+//! The rate limit is not a Caddy directive (the ingress build has no
+//! rate-limit module): the file header carries `rateLimit` together with the
+//! engine-expanded `patterns`/`except`, and the brute-force guard, which
+//! already counts ingress access-log hits and bans through `ingress.applyBans`,
+//! reads them and bans an address that exceeds the limit on those paths.
 //!
 //! Only the bcrypt hash of a Basic-auth password is accepted, written to the
 //! file and never returned, logged or recorded; the file's header comment
@@ -116,6 +124,18 @@ pub fn catalog_for(kind: &str) -> Option<&'static KindCatalog> {
     CATALOG.iter().find(|entry| entry.kind == kind)
 }
 
+/// Per-path rate limit: more than `max_hits` requests inside `window_minutes`
+/// from one address bans it for `ban_minutes`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RateLimit {
+    pub max_hits: u32,
+    pub window_minutes: u32,
+    pub ban_minutes: u32,
+}
+
+/// Optional and informational: older clients named the single control they
+/// sent. It is only checked for consistency with the fields.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Mode {
@@ -128,12 +148,12 @@ pub struct Restriction {
     pub kind: &'static str,
     /// Catalog ids, in catalog order, de-duplicated.
     pub paths: Vec<&'static str>,
-    pub mode: Mode,
-    /// Canonical addresses or CIDR ranges (allowlist mode).
+    /// Canonical addresses or CIDR ranges; empty when there is no allowlist.
     pub ips: Vec<String>,
-    /// Basic auth mode.
+    /// Basic auth; both or neither.
     pub username: Option<String>,
     pub password_hash: Option<String>,
+    pub rate_limit: Option<RateLimit>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -157,8 +177,11 @@ pub enum ApplyAdminPathsRequestError {
     NoIps,
     InvalidUsername,
     InvalidPasswordHash,
-    /// A field of the other mode was sent.
+    /// A field contradicts the named legacy `mode`.
     MixedModes,
+    /// Neither an allowlist, Basic auth nor a rate limit was given.
+    NoControls,
+    InvalidRateLimit,
     InvalidRequestId,
     InvalidIdempotencyKey,
 }
@@ -175,11 +198,14 @@ struct Plan {
 struct PlanRestriction {
     kind: String,
     paths: Vec<String>,
-    mode: Mode,
+    #[serde(default)]
+    mode: Option<Mode>,
     #[serde(default)]
     ips: Vec<String>,
     username: Option<String>,
     password_hash: Option<String>,
+    #[serde(default)]
+    rate_limit: Option<RateLimit>,
 }
 
 /// The settings written into the file header (never the hash).
@@ -189,11 +215,16 @@ struct Stored<'a> {
     domain: &'a str,
     kind: &'a str,
     paths: &'a [&'static str],
-    mode: Mode,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     ips: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate_limit: Option<RateLimit>,
+    /// Caddy patterns of the chosen paths, for readers that match requests
+    /// themselves (the brute-force guard).
+    patterns: &'a [&'a str],
+    except: &'a [&'a str],
 }
 
 fn canonical_ip(raw: &str) -> Option<String> {
@@ -281,32 +312,47 @@ impl ApplyAdminPathsRequest {
             domain: self.domain.as_str(),
             kind: restriction.kind,
             paths: &restriction.paths,
-            mode: restriction.mode,
             ips: &restriction.ips,
             username: restriction.username.as_deref(),
+            rate_limit: restriction.rate_limit,
+            patterns: &paths,
+            except: &except,
         };
         let mut out = String::from("# Managed by ingress.applyAdminPaths. Do not edit.\n");
         out.push_str(SETTINGS_MARKER);
         out.push_str(&serde_json::to_string(&stored).expect("plain struct serializes"));
         out.push('\n');
-        out.push_str(&format!("{matcher} {{\n    host {}\n", self.domain));
-        out.push_str(&format!("    path {}\n", paths.join(" ")));
-        if !except.is_empty() {
-            out.push_str(&format!("    not path {}\n", except.join(" ")));
-        }
-        match restriction.mode {
-            Mode::IpAllowlist => {
-                out.push_str(&format!(
-                    "    not remote_ip {}\n}}\nrespond {matcher} 403\n",
-                    restriction.ips.join(" ")
-                ));
+        let has_ips = !restriction.ips.is_empty();
+        let has_auth = restriction.username.is_some();
+        if has_ips || has_auth {
+            let mut base = format!("    host {}\n    path {}\n", self.domain, paths.join(" "));
+            if !except.is_empty() {
+                base.push_str(&format!("    not path {}\n", except.join(" ")));
             }
-            Mode::BasicAuth => {
-                out.push_str(&format!(
-                    "}}\nbasicauth {matcher} {{\n    {} {}\n}}\n",
-                    restriction.username.as_deref().unwrap_or_default(),
-                    restriction.password_hash.as_deref().unwrap_or_default()
-                ));
+            let remote = format!("    not remote_ip {}\n", restriction.ips.join(" "));
+            let auth = format!(
+                "basicauth {matcher} {{\n    {} {}\n}}\n",
+                restriction.username.as_deref().unwrap_or_default(),
+                restriction.password_hash.as_deref().unwrap_or_default()
+            );
+            match (has_ips, has_auth) {
+                (true, false) => {
+                    out.push_str(&format!(
+                        "{matcher} {{\n{base}{remote}}}\nrespond {matcher} 403\n"
+                    ));
+                }
+                (false, true) => {
+                    out.push_str(&format!("{matcher} {{\n{base}}}\n{auth}"));
+                }
+                _ => {
+                    // `route` keeps the order: an address outside the
+                    // allowlist gets 403 before it is asked for a password.
+                    out.push_str(&format!(
+                        "{matcher} {{\n{base}}}\n{matcher}_deny {{\n{base}{remote}}}\n\
+                         route {{\n    respond {matcher}_deny 403\n    {}}}\n",
+                        auth.trim_end().replace('\n', "\n    ") + "\n"
+                    ));
+                }
             }
         }
         Some(out)
@@ -330,50 +376,60 @@ fn parse_restriction(plan: PlanRestriction) -> Result<Restriction, ApplyAdminPat
         .filter(|entry| plan.paths.iter().any(|id| id == entry.id))
         .map(|entry| entry.id)
         .collect();
-    let (mut ips, mut username, mut password_hash) = (Vec::new(), None, None);
+    let has_auth = plan.username.is_some() || plan.password_hash.is_some();
+    // A client that names its single control must not send the other's fields.
     match plan.mode {
-        Mode::IpAllowlist => {
-            if plan.username.is_some() || plan.password_hash.is_some() {
-                return Err(E::MixedModes);
-            }
-            if plan.ips.is_empty() {
-                // An empty allowlist would lock every address out.
-                return Err(E::NoIps);
-            }
-            if plan.ips.len() > MAX_IPS {
-                return Err(E::TooManyIps);
-            }
-            ips = plan
-                .ips
-                .iter()
-                .map(|raw| canonical_ip(raw).ok_or(E::InvalidIp))
-                .collect::<Result<Vec<_>, _>>()?;
-            ips.sort();
-            ips.dedup();
+        Some(Mode::IpAllowlist) if has_auth => return Err(E::MixedModes),
+        Some(Mode::BasicAuth) if !plan.ips.is_empty() => return Err(E::MixedModes),
+        _ => {}
+    }
+    let mut ips = Vec::new();
+    if !plan.ips.is_empty() {
+        if plan.ips.len() > MAX_IPS {
+            return Err(E::TooManyIps);
         }
-        Mode::BasicAuth => {
-            if !plan.ips.is_empty() {
-                return Err(E::MixedModes);
-            }
-            let name = plan.username.ok_or(E::InvalidUsername)?;
-            if !valid_username(&name) {
-                return Err(E::InvalidUsername);
-            }
-            let hash = plan.password_hash.ok_or(E::InvalidPasswordHash)?;
-            if !valid_bcrypt(&hash) {
-                return Err(E::InvalidPasswordHash);
-            }
-            username = Some(name);
-            password_hash = Some(hash);
+        ips = plan
+            .ips
+            .iter()
+            .map(|raw| canonical_ip(raw).ok_or(E::InvalidIp))
+            .collect::<Result<Vec<_>, _>>()?;
+        ips.sort();
+        ips.dedup();
+    } else if plan.mode == Some(Mode::IpAllowlist) {
+        // An empty allowlist would lock every address out.
+        return Err(E::NoIps);
+    }
+    let (mut username, mut password_hash) = (None, None);
+    if has_auth {
+        let name = plan.username.ok_or(E::InvalidUsername)?;
+        if !valid_username(&name) {
+            return Err(E::InvalidUsername);
         }
+        let hash = plan.password_hash.ok_or(E::InvalidPasswordHash)?;
+        if !valid_bcrypt(&hash) {
+            return Err(E::InvalidPasswordHash);
+        }
+        username = Some(name);
+        password_hash = Some(hash);
+    }
+    if let Some(limit) = plan.rate_limit {
+        let sane = (3..=10_000).contains(&limit.max_hits)
+            && (1..=60).contains(&limit.window_minutes)
+            && (1..=1440).contains(&limit.ban_minutes);
+        if !sane {
+            return Err(E::InvalidRateLimit);
+        }
+    }
+    if ips.is_empty() && username.is_none() && plan.rate_limit.is_none() {
+        return Err(E::NoControls);
     }
     Ok(Restriction {
         kind: catalog.kind,
         paths,
-        mode: plan.mode,
         ips,
         username,
         password_hash,
+        rate_limit: plan.rate_limit,
     })
 }
 
@@ -500,6 +556,94 @@ mod tests {
             .unwrap();
         assert!(!header.contains("$2a$") && header.contains("\"username\":\"editor\""));
         assert!(content.contains("path /administrator /administrator/*\n"));
+    }
+
+    fn combined(extra: serde_json::Value) -> String {
+        let mut restriction = serde_json::json!({
+            "kind": "wordpress", "paths": ["login", "admin"], "ips": ["203.0.113.9"],
+            "username": "editor", "passwordHash": good_hash()});
+        for (key, value) in extra.as_object().unwrap() {
+            restriction[key] = value.clone();
+        }
+        serde_json::json!({"domain": "a.test", "restriction": restriction}).to_string()
+    }
+
+    #[test]
+    fn an_allowlist_and_basic_auth_together_refuse_outsiders_before_asking() {
+        let hash = good_hash();
+        let content = parse(&combined(serde_json::json!({})))
+            .unwrap()
+            .content()
+            .unwrap();
+        let deny = content.find("respond @wcp_adm_").unwrap();
+        let auth = content.find("basicauth @wcp_adm_").unwrap();
+        assert!(content.contains("route {\n"), "{content}");
+        assert!(
+            deny < auth,
+            "403 comes before the password prompt: {content}"
+        );
+        assert!(content.contains("not remote_ip 203.0.113.9\n"));
+        assert!(content.contains(&format!("editor {hash}\n")));
+        assert!(content.contains("_deny 403\n"));
+        let header = content
+            .lines()
+            .find(|line| line.starts_with("# wcp-admin-paths "))
+            .unwrap();
+        assert!(!header.contains("$2a$"), "{header}");
+        assert!(header.contains("\"ips\":[\"203.0.113.9\"]") && header.contains("\"username\""));
+    }
+
+    #[test]
+    fn a_rate_limit_is_recorded_for_the_guard_and_adds_no_directive() {
+        let json = serde_json::json!({"domain": "a.test", "restriction": {
+            "kind": "wordpress", "paths": ["login", "admin"],
+            "rateLimit": {"maxHits": 30, "windowMinutes": 5, "banMinutes": 60}}})
+        .to_string();
+        let content = parse(&json).unwrap().content().unwrap();
+        assert!(!content.contains("respond") && !content.contains("basicauth"));
+        let header = content.lines().nth(1).unwrap();
+        assert!(
+            header.contains("\"rateLimit\":{\"maxHits\":30,\"windowMinutes\":5,\"banMinutes\":60}")
+        );
+        assert!(header.contains("\"patterns\":[\"/wp-login.php\",\"/wp-admin\",\"/wp-admin/*\"]"));
+        assert!(header.contains("\"except\":[\"/wp-admin/admin-ajax.php\""));
+    }
+
+    #[test]
+    fn an_allowlist_with_a_rate_limit_keeps_both() {
+        let content = parse(&combined(serde_json::json!({
+            "username": null, "passwordHash": null,
+            "rateLimit": {"maxHits": 10, "windowMinutes": 1, "banMinutes": 5}})))
+        .unwrap()
+        .content()
+        .unwrap();
+        assert!(content.contains("respond @wcp_adm_") && !content.contains("basicauth"));
+        assert!(content.contains("\"rateLimit\""));
+    }
+
+    #[test]
+    fn rate_limits_out_of_range_and_empty_restrictions_are_refused() {
+        use ApplyAdminPathsRequestError as E;
+        for limit in [
+            serde_json::json!({"maxHits": 2, "windowMinutes": 5, "banMinutes": 60}),
+            serde_json::json!({"maxHits": 30, "windowMinutes": 0, "banMinutes": 60}),
+            serde_json::json!({"maxHits": 30, "windowMinutes": 61, "banMinutes": 60}),
+            serde_json::json!({"maxHits": 30, "windowMinutes": 5, "banMinutes": 1441}),
+        ] {
+            assert_eq!(
+                parse(&combined(serde_json::json!({"rateLimit": limit}))).unwrap_err(),
+                E::InvalidRateLimit
+            );
+        }
+        let none = serde_json::json!({"domain": "a.test", "restriction": {
+            "kind": "wordpress", "paths": ["login"]}})
+        .to_string();
+        assert_eq!(parse(&none).unwrap_err(), E::NoControls);
+        // Half of a credential pair is not a credential.
+        assert_eq!(
+            parse(&combined(serde_json::json!({"passwordHash": null}))).unwrap_err(),
+            E::InvalidPasswordHash
+        );
     }
 
     #[test]

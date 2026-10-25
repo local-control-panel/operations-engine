@@ -130,9 +130,16 @@ pub fn run(command: WordpressCommand) -> Result<Response, ResponseBuildError> {
         WordpressCommand::RotateDebugLog {
             path,
             keep,
+            compress,
             request_id,
             idempotency_key,
-        } => rotate_debug_log(&path, keep, &request_id, idempotency_key.as_deref()),
+        } => rotate_debug_log(
+            &path,
+            keep,
+            compress,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
     }
 }
 
@@ -870,6 +877,7 @@ fn bounded_action(
 fn rotate_debug_log(
     path: &str,
     keep: Option<u32>,
+    compress: bool,
     request_id: &str,
     idempotency_key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
@@ -877,7 +885,8 @@ fn rotate_debug_log(
     {
         use crate::wordpress_debug_log::{OPERATION, RotateRequest};
 
-        let request = match RotateRequest::parse(path, keep, request_id, idempotency_key) {
+        let request = match RotateRequest::parse(path, keep, compress, request_id, idempotency_key)
+        {
             Ok(request) => request,
             Err(error) => {
                 return Ok(Response::failure(
@@ -897,7 +906,7 @@ fn rotate_debug_log(
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, keep, request_id, idempotency_key);
+        let _ = (path, keep, compress, request_id, idempotency_key);
         Ok(Response::failure(
             "wordpress.rotateDebugLog",
             ErrorCode::UnsupportedPlatform,
