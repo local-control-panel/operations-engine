@@ -277,7 +277,11 @@ fn apply_admin_paths(
                     E::NoIps => "an allowlist needs at least one entry",
                     E::InvalidUsername => "username must be 1-32 of letters, digits, . _ -",
                     E::InvalidPasswordHash => "passwordHash is not a bcrypt hash",
-                    E::MixedModes => "a field of the other restriction mode was sent",
+                    E::MixedModes => "a field contradicts the named restriction mode",
+                    E::NoControls => "an allowlist, Basic auth or a rate limit is required",
+                    E::InvalidRateLimit => {
+                        "rateLimit needs maxHits 3-10000, windowMinutes 1-60, banMinutes 1-1440"
+                    }
                     E::InvalidRequestId => "request-id is not a canonical UUID",
                     E::InvalidIdempotencyKey => "idempotency-key is invalid",
                 },
