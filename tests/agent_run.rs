@@ -151,21 +151,36 @@ fn run_does_not_start_an_agent_whose_lock_is_held() {
     );
     // `agent lock` holds the lock for as long as its command runs.
     let mut holder = std::process::Command::new(env!("CARGO_BIN_EXE_ops-engine"))
-        .args(["agent", "lock", "demo", "--", "sleep", "20"])
+        .args([
+            "agent",
+            "lock",
+            "demo",
+            "--",
+            "sh",
+            "-c",
+            "touch \"$WCP_DIR/holder-ready\"; exec sleep 20",
+        ])
         .env("WCP_DIR", dir.path())
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while engine(dir.path(), &["agent", "lock", "demo", "--check"])
-        .output()
-        .unwrap()
-        .status
-        .code()
-        != Some(75)
-    {
-        assert!(std::time::Instant::now() < deadline, "lock never taken");
+    // A --check probe takes the free lock briefly. Probing before the
+    // holder has started can win that race and make the holder legitimately
+    // skip its command. Wait for evidence produced inside the held lock.
+    while !dir.path().join("holder-ready").exists() {
+        assert!(
+            holder.try_wait().unwrap().is_none(),
+            "lock holder exited before starting its command"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "lock holder never became ready"
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
+    engine(dir.path(), &["agent", "lock", "demo", "--check"])
+        .assert()
+        .code(75);
     let output = engine(dir.path(), &["agent", "run", "demo"])
         .assert()
         .failure()
