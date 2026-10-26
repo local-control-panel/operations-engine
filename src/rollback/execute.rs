@@ -66,6 +66,7 @@ pub enum RollbackError {
     Activate(activate::Error),
     State(state::StateError),
     Cancelled,
+    Recovery(crate::deployment_recovery::Error),
     /// The rollback itself succeeded — `current` was switched — but its
     /// `TransactionState` could not be saved afterward.
     PostCommitRecordFailed {
@@ -120,6 +121,7 @@ impl RollbackError {
                 ErrorCode::Internal,
                 "activating the release failed".to_owned(),
             ),
+            Self::Recovery(error) => error.protocol(),
             Self::Cancelled => (
                 ErrorCode::Cancelled,
                 "cancelled before the commit point".to_owned(),
@@ -166,6 +168,25 @@ pub fn execute(
     let state_path = state_path_for(request.request_id);
     let audit_path = audit_log_path();
     let pre_commit = PreCommit::new(cancellation.clone());
+
+    if let Err(error) = crate::deployment_recovery::prepare(
+        context.content_root,
+        &site_state,
+        request.site_id,
+        request.request_id,
+        OPERATION,
+        request.release_id,
+        None,
+    ) {
+        return Err(fail(
+            &site_state,
+            &state_path,
+            &audit_path,
+            state,
+            RollbackError::Recovery(error),
+        ));
+    }
+    crate::failpoint::hit("deployment-after-checkpoint");
 
     let identity = match staging::resolve_site_identity(&manifest.site_user, cancellation) {
         Ok(identity) => identity,
@@ -254,7 +275,7 @@ pub fn execute(
     // Commit point: `current` now points back at `request.release_id`, and
     // nothing from here may be aborted by cancellation.
     let _post_commit = pre_commit.commit();
-    drop(lock);
+    crate::failpoint::hit("deployment-after-activation");
 
     let result = RollbackResult {
         release_id: request.release_id,
@@ -274,6 +295,8 @@ pub fn execute(
         &audit_path,
         &AuditRecord::result(request.request_id, true, None),
     );
+
+    drop(lock);
 
     // Best-effort, same as deploy: never turn a successful rollback into a
     // reported failure.

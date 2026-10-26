@@ -24,6 +24,10 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => crate::commands::site_admin::login(&request_file, &request_id, &idempotency_key),
+        SiteCommand::RecoverDeployment {
+            site_id,
+            request_id,
+        } => crate::deployment_recovery::command(&site_id, &request_id),
         SiteCommand::Deploy {
             site_id,
             revision,

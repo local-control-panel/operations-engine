@@ -26,6 +26,8 @@ pub struct OperationStatus {
     #[serde(flatten)]
     pub transaction: TransactionState,
     pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<&'static str>,
 }
 
 pub fn load_site(
@@ -106,6 +108,8 @@ pub struct OperationSummary {
     pub finished_at_unix_secs: Option<u64>,
     pub error_code: Option<crate::error::ErrorCode>,
     pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_action: Option<&'static str>,
     pub next_action: NextAction,
 }
 
@@ -218,6 +222,9 @@ pub fn list(
                 (true, true) => NextAction::Wait,
                 (true, false) => NextAction::ManualRecovery,
             };
+            let recovery_action = (!active
+                && crate::deployment_recovery::available(&scope_dir, &record))
+            .then_some("site.recoverDeployment");
             OperationSummary {
                 request_id: record.request_id,
                 operation: record.operation,
@@ -227,6 +234,7 @@ pub fn list(
                 error_code: record.outcome.and_then(|outcome| outcome.error_code),
                 active,
                 next_action,
+                recovery_action,
             }
         })
         .collect();
@@ -415,7 +423,11 @@ fn load_scoped(
     } else {
         false
     };
+    let recovery_action = (!active
+        && crate::deployment_recovery::available(&site_state, &transaction))
+    .then_some("site.recoverDeployment");
     Ok(OperationStatus {
+        recovery_action,
         transaction,
         active,
     })

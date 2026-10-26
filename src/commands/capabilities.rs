@@ -100,6 +100,7 @@ pub const OPERATIONS: &[&str] = &[
     "backup.triggerNow",
     "site.list",
     "site.deploy",
+    "site.recoverDeployment",
     "site.rollback",
     "site.moveRoot",
     "site.prepareRoot",

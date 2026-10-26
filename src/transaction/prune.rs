@@ -107,6 +107,10 @@ fn prune_finished_transactions(root: &ManagedRoot, retain_for: Duration) {
         if let Some(key) = &transaction.idempotency_key {
             let _ = idempotency::remove(root, key);
         }
+        let checkpoint = SiteRelativePath::parse(format!("deployment-recovery/{}", name)).unwrap();
+        if root.exists(&checkpoint) && root.remove_file(&checkpoint).is_err() {
+            continue;
+        }
         let _ = root.remove_file(&path);
     }
 }

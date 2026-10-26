@@ -35,6 +35,8 @@ pub mod db_restore;
 pub mod db_tool;
 pub mod deploy;
 #[cfg(unix)]
+pub mod deployment_recovery;
+#[cfg(unix)]
 pub mod docker_container;
 #[cfg(unix)]
 pub mod docker_prune;

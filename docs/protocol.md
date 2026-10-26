@@ -1018,3 +1018,30 @@ primary effect happened, but something adjacent to it needs attention.
 An unsupported platform or unavailable dependency makes `ready` false and adds
 a machine-readable warning. These conditions become operation errors only when
 a requested operation requires the missing capability.
+
+## `site.recoverDeployment`
+
+`site recover-deployment --site-id <uuid> --request-id <uuid>` reconciles the
+original `site.deploy` or `site.rollback` transaction. It never runs deploy,
+rollback, Git, validation hooks, or another release switch. The command takes
+the same site mutation lock and refuses a live owner, including an owner with
+the same request id. A finished request returns its recorded outcome unchanged.
+
+New deploy/rollback attempts save a checkpoint before staging: original request
+and site identity, operation, previous release, target release and, for deploy,
+the immutable revision. They keep the lock until the outcome has been saved.
+An unresolved checkpoint blocks subsequent deploy/rollback attempts. Recovery
+compares `current` with that checkpoint: the target proves activation and
+commits the stored identity; the previous release proves interruption before
+activation and records `CANCELLED`. A missing/corrupt checkpoint, changed current
+link, unsupported layout or rollback to an already active release is refused;
+legacy interrupted requests still need manual investigation. Recovery never
+removes staged content or changes the active link.
+
+`operation.status` and `operation.list` add optional `recoveryAction`:
+`"site.recoverDeployment"` only for an inactive incomplete deployment with a
+readable matching checkpoint. This is an offer to explicitly reconcile, not
+permission to retry the mutation. Recovery validates all checkpoint identities
+again while holding the lock. A recovered success includes `recovered: true`;
+its `activatedAtUnixSecs` is the time recovery verified the active release.
+Completed checkpoint files are pruned with their transaction records.

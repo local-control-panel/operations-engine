@@ -62,6 +62,7 @@ pub enum DeployError {
     Activate(activate::Error),
     State(state::StateError),
     Cancelled,
+    Recovery(crate::deployment_recovery::Error),
     /// The deployment itself succeeded — `current` was switched — but its
     /// `TransactionState` could not be saved afterward. Carries the result
     /// so the caller never loses it even though persistence failed; see
@@ -154,6 +155,7 @@ impl DeployError {
                 ErrorCode::Internal,
                 "activating the release failed".to_owned(),
             ),
+            Self::Recovery(error) => error.protocol(),
             Self::Cancelled => (
                 ErrorCode::Cancelled,
                 "cancelled before the commit point".to_owned(),
@@ -200,6 +202,25 @@ pub fn execute(
     let state_path = state_path_for(request.request_id);
     let audit_path = audit_log_path();
     let pre_commit = PreCommit::new(cancellation.clone());
+
+    if let Err(error) = crate::deployment_recovery::prepare(
+        context.content_root,
+        &site_state,
+        request.site_id,
+        request.request_id,
+        OPERATION,
+        ReleaseId::from(request.request_id),
+        Some(request.revision.clone()),
+    ) {
+        return Err(fail(
+            &site_state,
+            &state_path,
+            &audit_path,
+            state,
+            DeployError::Recovery(error),
+        ));
+    }
+    crate::failpoint::hit("deployment-after-checkpoint");
 
     let identity = match staging::resolve_site_identity(&manifest.site_user, cancellation) {
         Ok(identity) => identity,
@@ -331,7 +352,7 @@ pub fn execute(
     // here may be aborted by cancellation — the deployment already
     // happened. Only its bookkeeping remains.
     let _post_commit = pre_commit.commit();
-    drop(lock);
+    crate::failpoint::hit("deployment-after-activation");
 
     let result = DeployResult {
         release_id,
@@ -352,6 +373,8 @@ pub fn execute(
         &audit_path,
         &AuditRecord::result(request.request_id, true, None),
     );
+
+    drop(lock);
 
     // Best-effort: retention is a disk-usage concern, not a correctness
     // one, and must never turn this successful deploy into a reported

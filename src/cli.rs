@@ -1437,6 +1437,13 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: String,
     },
+    /// Resolve an interrupted deploy/rollback without repeating the mutation.
+    RecoverDeployment {
+        #[arg(long = "site-id")]
+        site_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
     /// Deploy a resolved Git revision for one site.
     Deploy {
         #[arg(long = "site-id")]
@@ -1780,6 +1787,7 @@ impl SiteCommand {
             Self::List => "site.list",
             Self::AdminUsers { .. } => "site.adminUsers",
             Self::AdminLogin { .. } => "site.adminLogin",
+            Self::RecoverDeployment { .. } => "site.recoverDeployment",
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
             Self::MoveRoot { .. } => "site.moveRoot",

@@ -58,6 +58,7 @@ fn capabilities_describe_only_implemented_operations() {
             "backup.triggerNow",
             "site.list",
             "site.deploy",
+            "site.recoverDeployment",
             "site.rollback",
             "site.moveRoot",
             "site.prepareRoot",
