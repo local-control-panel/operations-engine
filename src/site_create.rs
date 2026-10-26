@@ -243,19 +243,31 @@ pub fn execute(
             &serde_json::to_vec(plan).map_err(|_| internal())?,
         )
         .map_err(|_| internal())?;
-    // Check pending attempts while holding the domain scope lock.
-    if !scope
+    // A crash after recording the terminal outcome can leave a journal.
+    // Its transaction proves compensation/verification already finished;
+    // remove only that metadata before considering another explicit intent.
+    let pending = scope
         .open_managed_dir(&rel("pending"))
-        .map_err(|_| internal())?
-        .file_names()
-        .map_err(|_| internal())?
-        .is_empty()
-    {
-        state
-            .mark_failed(ErrorCode::Conflict, "an earlier creation requires recovery")
+        .map_err(|_| internal())?;
+    for name in pending.file_names().map_err(|_| internal())? {
+        let old = name
+            .strip_suffix(".json")
+            .and_then(|s| RequestId::parse(s).ok())
+            .ok_or_else(internal)?;
+        let record = state::load(&scope, &transaction(old)).map_err(|_| internal())?;
+        if record.request_id != old || record.operation != OPERATION {
+            return Err(internal());
+        }
+        if record.status == TransactionStatus::InProgress {
+            state
+                .mark_failed(ErrorCode::Conflict, "an earlier creation requires recovery")
+                .map_err(|_| internal())?;
+            state::save(&scope, &transaction(request_id), &state).map_err(|_| internal())?;
+            return Err(conflict());
+        }
+        scope
+            .remove_file(&journal_path(old))
             .map_err(|_| internal())?;
-        state::save(&scope, &transaction(request_id), &state).map_err(|_| internal())?;
-        return Err(conflict());
     }
     let root = match backend.check_available(plan) {
         Ok(root) => root,
@@ -728,6 +740,38 @@ mod tests {
         assert_eq!(fake.calls.borrow().len(), count);
         drop(guard);
     }
+    #[test]
+    fn terminal_journal_metadata_does_not_block_a_later_explicit_creation() {
+        let (_dir, state, id, key) = fixture();
+        let fake = Fake::default();
+        *fake.fail.borrow_mut() = Some("available".into());
+        assert!(execute(&state, &fake, &plan(), id, &key).is_err());
+        let scope = scope(&state, &Domain::parse("example.test").unwrap()).unwrap();
+        scope
+            .write_atomic(&journal_path(id), b"leftover terminal journal")
+            .unwrap();
+        *fake.fail.borrow_mut() = None;
+        fake.calls.borrow_mut().clear();
+        assert!(
+            execute(
+                &state,
+                &fake,
+                &plan(),
+                fresh(),
+                &IdempotencyKey::parse("new-intent").unwrap()
+            )
+            .is_ok()
+        );
+        assert!(!scope.exists(&journal_path(id)));
+        assert!(
+            !fake
+                .calls
+                .borrow()
+                .iter()
+                .any(|call| call.starts_with("remove"))
+        );
+    }
+
     #[test]
     fn plans_refuse_unsafe_paths_worker_counts_profiles_and_unknown_fields() {
         for root in ["../escape", "/tmp/x", "public/../secret", "public//web"] {
