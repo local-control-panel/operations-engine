@@ -682,6 +682,8 @@ pub enum OperationCommand {
     Status {
         #[arg(long = "site-id")]
         site_id: Option<String>,
+        #[arg(long = "create-domain")]
+        create_domain: Option<String>,
 
         #[arg(long)]
         database: Option<String>,
@@ -702,6 +704,8 @@ pub enum OperationCommand {
     List {
         #[arg(long = "site-id")]
         site_id: Option<String>,
+        #[arg(long = "create-domain")]
+        create_domain: Option<String>,
 
         #[arg(long)]
         database: Option<String>,
@@ -1437,6 +1441,29 @@ pub enum SiteCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: String,
     },
+    /// Resolve an interrupted deploy/rollback without repeating the mutation.
+    RecoverDeployment {
+        #[arg(long = "site-id")]
+        site_id: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
+    /// Create a PHP site as one server-owned, recoverable operation.
+    Create {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Compensate an interrupted site creation, or record its verified success.
+    RecoverCreate {
+        #[arg(long)]
+        domain: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
     /// Deploy a resolved Git revision for one site.
     Deploy {
         #[arg(long = "site-id")]
@@ -1780,6 +1807,9 @@ impl SiteCommand {
             Self::List => "site.list",
             Self::AdminUsers { .. } => "site.adminUsers",
             Self::AdminLogin { .. } => "site.adminLogin",
+            Self::Create { .. } => "site.create",
+            Self::RecoverCreate { .. } => "site.recoverCreate",
+            Self::RecoverDeployment { .. } => "site.recoverDeployment",
             Self::Deploy { .. } => "site.deploy",
             Self::Rollback { .. } => "site.rollback",
             Self::MoveRoot { .. } => "site.moveRoot",

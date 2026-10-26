@@ -35,6 +35,8 @@ pub mod db_restore;
 pub mod db_tool;
 pub mod deploy;
 #[cfg(unix)]
+pub mod deployment_recovery;
+#[cfg(unix)]
 pub mod docker_container;
 #[cfg(unix)]
 pub mod docker_prune;
@@ -69,6 +71,10 @@ pub mod site;
 pub mod site_admin;
 #[cfg(unix)]
 pub mod site_archive;
+#[cfg(unix)]
+pub mod site_create;
+#[cfg(unix)]
+pub mod site_create_host;
 pub mod site_enroll;
 pub mod site_error_pages;
 #[cfg(unix)]

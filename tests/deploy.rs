@@ -288,3 +288,89 @@ fn a_revision_not_on_an_allowed_branch_fails_without_activating_anything_and_fre
     execute(&context, &manifest, &retry, &CancellationToken::default())
         .expect("a fresh attempt after a rejected one should succeed");
 }
+
+#[cfg(all(feature = "failpoints", unix))]
+#[test]
+fn crash_recovery_child() {
+    let Ok(base) = std::env::var("DEPLOY_RECOVERY_FIXTURE") else {
+        return;
+    };
+    let base = std::path::Path::new(&base);
+    let manifest = SiteManifest::from_json_for_site(
+        &std::fs::read_to_string(base.join("manifest.json")).unwrap(),
+        site_id(),
+    )
+    .unwrap();
+    let revision = std::fs::read_to_string(base.join("revision")).unwrap();
+    let content_root = TrustedRoot::parse(base.join("content")).unwrap();
+    let credential_root = TrustedRoot::parse(base.join("credentials")).unwrap();
+    let engine_state = ManagedRoot::open(&TrustedRoot::parse(base.join("state")).unwrap()).unwrap();
+    let request = DeployRequest::parse(
+        SITE_ID,
+        &revision,
+        "123e4567-e89b-12d3-a456-426614174000",
+        Some("crash-recovery"),
+    )
+    .unwrap();
+    execute(
+        &DeployContext {
+            content_root: &content_root,
+            credential_root: &credential_root,
+            engine_state: &engine_state,
+        },
+        &manifest,
+        &request,
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    panic!("the configured crash point was not reached");
+}
+
+#[cfg(all(feature = "failpoints", unix))]
+#[test]
+fn real_sigkill_before_and_after_activation_recovers_without_redeploying() {
+    use operations_engine::{
+        deployment_recovery,
+        transaction::{RequestId, state::TransactionStatus},
+    };
+    use std::os::unix::process::ExitStatusExt;
+    let _serial = serial();
+    for (point, expected) in [
+        ("deployment-after-checkpoint", TransactionStatus::Failed),
+        ("deployment-after-activation", TransactionStatus::Committed),
+    ] {
+        let remote = local_remote();
+        let base = tempfile::tempdir().unwrap();
+        for name in ["content", "state", "credentials"] {
+            std::fs::create_dir(base.path().join(name)).unwrap();
+        }
+        std::fs::write(base.path().join("manifest.json"), manifest_json(&remote)).unwrap();
+        std::fs::write(base.path().join("revision"), &remote.head).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "crash_recovery_child", "--nocapture"])
+            .env("DEPLOY_RECOVERY_FIXTURE", base.path())
+            .env("WCP_FAILPOINT", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            child.status.signal(),
+            Some(libc::SIGKILL),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        let content = TrustedRoot::parse(base.path().join("content")).unwrap();
+        let state =
+            ManagedRoot::open(&TrustedRoot::parse(base.path().join("state")).unwrap()).unwrap();
+        let request = RequestId::parse("123e4567-e89b-12d3-a456-426614174000").unwrap();
+        let result = deployment_recovery::execute(&content, &state, site_id(), request).unwrap();
+        assert_eq!(result.transaction.status, expected);
+        let before =
+            operations_engine::deploy::activate::current_release(&content, site_id()).unwrap();
+        let repeated = deployment_recovery::execute(&content, &state, site_id(), request).unwrap();
+        assert_eq!(repeated.transaction, result.transaction);
+        assert_eq!(
+            operations_engine::deploy::activate::current_release(&content, site_id()).unwrap(),
+            before
+        );
+    }
+}

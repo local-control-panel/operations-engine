@@ -56,6 +56,14 @@ pub fn activate(
     Ok(previous)
 }
 
+pub fn current_release(
+    content_root: &TrustedRoot,
+    site_id: SiteId,
+) -> Result<Option<ReleaseId>, Error> {
+    let managed = ManagedRoot::open(content_root).map_err(Error::Io)?;
+    read_previous_release(&managed, &current_path(site_id))
+}
+
 fn current_path(site_id: SiteId) -> SiteRelativePath {
     SiteRelativePath::parse(format!("sites/{site_id}/current"))
         .expect("a canonical SiteId always yields a valid relative path")

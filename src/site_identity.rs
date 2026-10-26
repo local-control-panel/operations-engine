@@ -197,6 +197,7 @@ pub struct AllocateRequest {
     /// domain). `None` means the account derived from the domain.
     pub os_user: Option<String>,
     pub settings: SiteSettings,
+    pub(crate) require_absent: bool,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -228,6 +229,7 @@ impl AllocateRequest {
             runtime_id: RuntimeId::parse(runtime_id).map_err(|_| RequestError::InvalidRuntimeId)?,
             domain: Domain::parse(domain).map_err(|_| RequestError::InvalidDomain)?,
             os_user,
+            require_absent: false,
             settings: SiteSettings {
                 root: root.to_owned(),
                 worker_mode,
@@ -872,6 +874,14 @@ pub fn allocate(
             let derived = derived_user(&req.domain);
             let wanted = req.os_user.clone().unwrap_or_else(|| derived.clone());
 
+            if req.require_absent
+                && (read_record(&runtime, &req.runtime_id, &req.domain)?.is_some()
+                    || lookup_user(ctx, &wanted)?.is_some())
+            {
+                return Err(Error::Conflict(
+                    "a new site cannot adopt an existing identity",
+                ));
+            }
             if let Some(mut record) = read_record(&runtime, &req.runtime_id, &req.domain)? {
                 if record.os_user != wanted {
                     return Err(Error::Conflict(
