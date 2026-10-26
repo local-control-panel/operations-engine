@@ -55,12 +55,14 @@ pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
         OperationCommand::Incomplete => incomplete(),
         OperationCommand::Status {
             site_id,
+            create_domain,
             database,
             backup_database,
             stack,
             request_id,
         } => status(
             site_id.as_deref(),
+            create_domain.as_deref(),
             database.as_deref(),
             backup_database.as_deref(),
             stack.as_deref(),
@@ -68,12 +70,14 @@ pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
         ),
         OperationCommand::List {
             site_id,
+            create_domain,
             database,
             backup_database,
             stack,
             limit,
         } => list(
             site_id.as_deref(),
+            create_domain.as_deref(),
             database.as_deref(),
             backup_database.as_deref(),
             stack.as_deref(),
@@ -84,6 +88,7 @@ pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
 
 fn list(
     site_id: Option<&str>,
+    create_domain: Option<&str>,
     database: Option<&str>,
     backup_database: Option<&str>,
     stack: Option<&str>,
@@ -111,7 +116,20 @@ fn list(
                 ));
             }
         };
-        match operation_status::list(&root, site_id, database, backup_database, stack, limit) {
+        let result = if let Some(domain) = create_domain {
+            if site_id.is_some()
+                || database.is_some()
+                || backup_database.is_some()
+                || stack.is_some()
+            {
+                Err(StatusError::InvalidScope)
+            } else {
+                operation_status::list_create(&root, domain, limit)
+            }
+        } else {
+            operation_status::list(&root, site_id, database, backup_database, stack, limit)
+        };
+        match result {
             Ok(list) => Response::success(LIST_OPERATION, list),
             Err(
                 StatusError::InvalidScope
@@ -132,7 +150,14 @@ fn list(
     }
     #[cfg(not(unix))]
     {
-        let _ = (site_id, database, backup_database, stack, limit);
+        let _ = (
+            site_id,
+            create_domain,
+            database,
+            backup_database,
+            stack,
+            limit,
+        );
         Ok(Response::failure(
             LIST_OPERATION,
             ErrorCode::UnsupportedPlatform,
@@ -143,6 +168,7 @@ fn list(
 
 fn status(
     site_id: Option<&str>,
+    create_domain: Option<&str>,
     database: Option<&str>,
     backup_database: Option<&str>,
     stack: Option<&str>,
@@ -170,20 +196,32 @@ fn status(
                 ));
             }
         };
-        let state = match (site_id, database, backup_database, stack) {
-            (Some(site_id), None, None, None) => {
-                operation_status::load_site(&root, site_id, request_id)
+        let state = if let Some(domain) = create_domain {
+            if site_id.is_some()
+                || database.is_some()
+                || backup_database.is_some()
+                || stack.is_some()
+            {
+                Err(StatusError::InvalidScope)
+            } else {
+                operation_status::load_create(&root, domain, request_id)
             }
-            (None, Some(database), None, None) => {
-                operation_status::load_database(&root, database, request_id)
+        } else {
+            match (site_id, database, backup_database, stack) {
+                (Some(site_id), None, None, None) => {
+                    operation_status::load_site(&root, site_id, request_id)
+                }
+                (None, Some(database), None, None) => {
+                    operation_status::load_database(&root, database, request_id)
+                }
+                (None, None, Some(database), None) => {
+                    operation_status::load_backup(&root, database, request_id)
+                }
+                (None, None, None, Some(stack)) => {
+                    operation_status::load_stack(&root, stack, request_id)
+                }
+                _ => Err(StatusError::InvalidScope),
             }
-            (None, None, Some(database), None) => {
-                operation_status::load_backup(&root, database, request_id)
-            }
-            (None, None, None, Some(stack)) => {
-                operation_status::load_stack(&root, stack, request_id)
-            }
-            _ => Err(StatusError::InvalidScope),
         };
         match state {
             Ok(state) => Response::success(OPERATION, state),
@@ -211,7 +249,14 @@ fn status(
     }
     #[cfg(not(unix))]
     {
-        let _ = (site_id, database, backup_database, stack, request_id);
+        let _ = (
+            site_id,
+            create_domain,
+            database,
+            backup_database,
+            stack,
+            request_id,
+        );
         Ok(Response::failure(
             OPERATION,
             ErrorCode::UnsupportedPlatform,

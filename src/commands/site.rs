@@ -15,6 +15,12 @@ use crate::{
 
 pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        SiteCommand::Create {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => create_site(&request_file, &request_id, &idempotency_key),
+        SiteCommand::RecoverCreate { domain, request_id } => recover_create(&domain, &request_id),
         SiteCommand::List => list(),
         SiteCommand::AdminUsers { request_file } => {
             crate::commands::site_admin::users(&request_file)
@@ -1246,7 +1252,7 @@ const RUNTIME_LOG_DIR: &str = "/var/log/caddy";
 
 /// Builds everything the real migration backend needs and runs `body` with it.
 #[cfg(unix)]
-fn with_host_backend<T>(
+pub(crate) fn with_host_backend<T>(
     operation: &'static str,
     body: impl FnOnce(
         &crate::filesystem::ManagedRoot,
@@ -1800,4 +1806,74 @@ fn list() -> Result<Response, ResponseBuildError> {
         ErrorCode::UnsupportedPlatform,
         "site.list requires a Unix host",
     ))
+}
+
+fn create_site(
+    path: &std::path::Path,
+    request_id: &str,
+    key: &str,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        let parse = || {
+            let json = crate::commands::read_root_owned_content_file_bounded(path, 16 * 1024)
+                .map_err(|_| ())?;
+            let plan: crate::site_create::Plan = serde_json::from_str(&json).map_err(|_| ())?;
+            plan.validate().map_err(|_| ())?;
+            let id = crate::transaction::RequestId::parse(request_id).map_err(|_| ())?;
+            let key = crate::transaction::IdempotencyKey::parse(key).map_err(|_| ())?;
+            Ok::<_, ()>((plan, id, key))
+        };
+        let Ok((plan, id, key)) = parse() else {
+            return Ok(Response::failure(
+                "site.create",
+                ErrorCode::InvalidInput,
+                "invalid root-owned site creation request",
+            ));
+        };
+        match with_host_backend("site.create", |state, backend| {
+            Ok(crate::site_create::execute(state, backend, &plan, id, &key))
+        }) {
+            Err(response) => Ok(response),
+            Ok(Ok(result)) => Response::success("site.create", result),
+            Ok(Err(e)) => Ok(Response::failure("site.create", e.code, &e.message)),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            "site.create",
+            ErrorCode::UnsupportedPlatform,
+            "site.create requires Unix",
+        ))
+    }
+}
+fn recover_create(domain: &str, request_id: &str) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        let Ok(id) = crate::transaction::RequestId::parse(request_id) else {
+            return Ok(Response::failure(
+                "site.recoverCreate",
+                ErrorCode::InvalidInput,
+                "invalid request identity",
+            ));
+        };
+        match with_host_backend("site.recoverCreate", |state, backend| {
+            Ok(crate::site_create::recover(state, backend, domain, id))
+        }) {
+            Err(response) => Ok(response),
+            Ok(Ok(result)) => Response::success("site.recoverCreate", result),
+            Ok(Err(e)) => Ok(Response::failure("site.recoverCreate", e.code, &e.message)),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (domain, request_id);
+        Ok(Response::failure(
+            "site.recoverCreate",
+            ErrorCode::UnsupportedPlatform,
+            "site.recoverCreate requires Unix",
+        ))
+    }
 }

@@ -101,6 +101,8 @@ pub const OPERATIONS: &[&str] = &[
     "site.list",
     "site.deploy",
     "site.recoverDeployment",
+    "site.create",
+    "site.recoverCreate",
     "site.rollback",
     "site.moveRoot",
     "site.prepareRoot",

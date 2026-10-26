@@ -103,10 +103,6 @@ pub fn prepare(
             .remove_file(&path(id))
             .map_err(|_| Error::Unavailable)?;
     }
-    if activate::current_release(content, site_id).map_err(|_| Error::Unavailable)? == Some(target)
-    {
-        return Err(Error::Conflict);
-    }
     let checkpoint = Checkpoint {
         site_id,
         request_id,
@@ -184,7 +180,7 @@ pub fn execute(
         record
             .mark_committed(result)
             .map_err(|_| Error::Unavailable)?;
-    } else if current == c.previous && c.previous != Some(c.target) {
+    } else if current == c.previous {
         record
             .mark_failed(
                 ErrorCode::Cancelled,
@@ -337,6 +333,24 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn an_interrupted_rollback_to_the_already_active_target_does_not_claim_a_new_activation() {
+        let (_c, _s, content, state, site, id) = fixture("site.rollback");
+        let scope = preflight::open_site_state(&state, site).unwrap();
+        let mut checkpoint = load(&scope, id).unwrap();
+        checkpoint.previous = Some(checkpoint.target);
+        scope
+            .write_atomic(&path(id), &serde_json::to_vec(&checkpoint).unwrap())
+            .unwrap();
+        activate::activate(&content, site, checkpoint.target).unwrap();
+        let result = execute(&content, &state, site, id).unwrap();
+        assert_eq!(result.transaction.status, TransactionStatus::Failed);
+        assert_eq!(
+            activate::current_release(&content, site).unwrap(),
+            Some(checkpoint.target)
+        );
+    }
+
     #[test]
     fn live_lock_refuses_recovery_even_when_the_owner_id_matches() {
         let (_c, _s, content, state, site, id) = fixture("site.deploy");

@@ -59,6 +59,8 @@ fn capabilities_describe_only_implemented_operations() {
             "site.list",
             "site.deploy",
             "site.recoverDeployment",
+            "site.create",
+            "site.recoverCreate",
             "site.rollback",
             "site.moveRoot",
             "site.prepareRoot",

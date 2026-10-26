@@ -664,7 +664,7 @@ fn service_rel(runtime_id: &RuntimeId, domain: &Domain, file: &str) -> SiteRelat
 /// Ported verbatim from the control panel's
 /// `sites::build_site_process_caddyfile` so the engine, not the panel, is
 /// the single generator of this file's bytes (brief decision 3).
-fn site_process_caddyfile(
+pub(crate) fn site_process_caddyfile(
     domain: &Domain,
     runtime_id: &RuntimeId,
     port: u16,
@@ -716,14 +716,14 @@ fn site_process_caddyfile(
 
 /// Ported from the panel's `build_site_run_script`: drops privileges to the
 /// site's UID/GID and execs its own FrankenPHP child.
-fn site_run_script(uid: u32, gid: u32, container_dir: &str) -> String {
+pub(crate) fn site_run_script(uid: u32, gid: u32, container_dir: &str) -> String {
     format!(
         "#!/bin/sh\nexport PHP_INI_SCAN_DIR=\"/usr/local/etc/php/conf.d:{container_dir}\"\nexec setpriv --reuid={uid} --regid={gid} --clear-groups \\\n    frankenphp run --config {container_dir}/Caddyfile --adapter caddyfile\n"
     )
 }
 
 /// Ported from the panel's `build_site_open_basedir_ini`.
-fn site_open_basedir_ini(root: &str) -> String {
+pub(crate) fn site_open_basedir_ini(root: &str) -> String {
     format!(
         "; Managed by Website Control Panel - do not edit manually\nopen_basedir = {root}:/tmp:/var/tmp:/run/valkey/valkey.sock\n"
     )
@@ -1098,6 +1098,7 @@ pub struct RemoveSiteServiceRequest {
     pub domain: Domain,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
+    pub(crate) expected_files: Option<Vec<(SiteRelativePath, String)>>,
 }
 
 impl RemoveSiteServiceRequest {
@@ -1116,6 +1117,7 @@ impl RemoveSiteServiceRequest {
             domain,
             request_id,
             idempotency_key,
+            expected_files: None,
         })
     }
 }
@@ -1164,6 +1166,15 @@ pub fn remove_site_service(
                 return Ok(result(false, false));
             }
 
+            if let Some(expected) = &req.expected_files {
+                for (path, content) in expected {
+                    match root.read_to_string(path) {
+                        Ok(actual) if actual == *content => {}
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        _ => return Err(Error::HashMismatch),
+                    }
+                }
+            }
             let service = runtime_service(&req.runtime_id);
             let running = !compose(
                 ctx,
@@ -2141,6 +2152,33 @@ mod tests {
             .as_path()
             .join("fp1-php83/example.test")
             .exists()
+    }
+
+    #[test]
+    fn guarded_service_removal_preserves_changed_configuration() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = Fixture::new(0);
+        write_site_service(
+            &fixture.ctx(),
+            &write_req(OTHER_ID, None),
+            &CancellationToken::default(),
+        )
+        .unwrap();
+        fs::remove_file(&fixture.calls).unwrap();
+        let mut req = remove_req(ID, None);
+        req.expected_files = Some(vec![(
+            service_rel(&req.runtime_id, &req.domain, "Caddyfile"),
+            "a different creation attempt".into(),
+        )]);
+        assert!(matches!(
+            remove_site_service(&fixture.ctx(), &req, &CancellationToken::default()),
+            Err(Error::HashMismatch)
+        ));
+        assert!(service_dir_exists(&fixture));
+        assert!(
+            fixture.calls().is_empty(),
+            "a mismatched service must not even be stopped"
+        );
     }
 
     #[test]

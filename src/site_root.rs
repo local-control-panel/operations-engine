@@ -450,6 +450,7 @@ pub struct PrepareRequest {
     pub uid: u32,
     pub gid: u32,
     pub existing: ExistingPolicy,
+    pub(crate) require_absent: bool,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -479,6 +480,7 @@ impl PrepareRequest {
             uid,
             gid,
             existing,
+            require_absent: false,
             request_id,
             idempotency_key,
         })
@@ -510,6 +512,7 @@ pub struct RemoveRequest {
     pub site_id: Option<SiteId>,
     /// The caller confirms that deleting a non-empty directory is intended.
     pub confirm_contents: bool,
+    pub(crate) expected_owner: Option<(u32, u32)>,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -535,6 +538,7 @@ impl RemoveRequest {
             relative_root,
             site_id,
             confirm_contents,
+            expected_owner: None,
             request_id,
             idempotency_key,
         })
@@ -741,6 +745,14 @@ fn prepare(
     req: &PrepareRequest,
 ) -> Result<PrepareResult, Error> {
     refuse_system_dir(content_root)?;
+    if req.require_absent {
+        let root = ManagedRoot::open(content_root).map_err(Error::Io)?;
+        match root.symlink_metadata(&domain_rel(&req.domain)) {
+            Ok(_) => return Err(Error::TargetExists),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
     let mut names = vec![domain_rel(&req.domain)];
     names.extend(req.relative_root.iter().cloned());
 
@@ -961,6 +973,14 @@ fn remove(
         &req.relative_root,
         req.site_id.as_ref(),
     )?;
+    if let Some((uid, gid)) = req.expected_owner {
+        for target in &targets {
+            let metadata = target.dir.own_metadata().map_err(Error::Io)?;
+            if metadata.uid() != uid || metadata.gid() != gid {
+                return Err(Error::UnknownOwner);
+            }
+        }
+    }
     if !req.confirm_contents && targets.iter().any(|target| target.contents > 0) {
         return Err(Error::NotEmpty);
     }
@@ -1440,6 +1460,7 @@ mod tests {
             uid,
             gid,
             existing: ExistingPolicy::Refuse,
+            require_absent: false,
             request_id: RequestId::parse(id).unwrap(),
             idempotency_key: None,
         }
@@ -1494,6 +1515,24 @@ mod tests {
     }
 
     const SITE: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+    #[test]
+    fn guarded_empty_root_removal_preserves_a_different_owner() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.path("guarded.test")).unwrap();
+        let mut req = rm("guarded.test", None, false, ID);
+        req.expected_owner = Some((me().0.saturating_add(1), me().1));
+        let error = remove_root(
+            &fixture.state,
+            std::slice::from_ref(&fixture.content),
+            &fixture.sites_dir(),
+            me().0,
+            &req,
+        )
+        .unwrap_err();
+        assert!(matches!(error, Error::UnknownOwner));
+        assert!(fixture.path("guarded.test").is_dir());
+    }
 
     #[test]
     fn prepare_creates_the_site_directory_and_a_private_root() {

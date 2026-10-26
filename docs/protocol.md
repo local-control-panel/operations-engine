@@ -1034,8 +1034,8 @@ An unresolved checkpoint blocks subsequent deploy/rollback attempts. Recovery
 compares `current` with that checkpoint: the target proves activation and
 commits the stored identity; the previous release proves interruption before
 activation and records `CANCELLED`. A missing/corrupt checkpoint, changed current
-link, unsupported layout or rollback to an already active release is refused;
-legacy interrupted requests still need manual investigation. Recovery never
+link, or unsupported layout is refused;
+legacy interrupted requests still need manual investigation. If the requested target was already active before an interrupted rollback, recovery records an unchanged, cancelled attempt rather than claiming a new activation. Recovery never
 removes staged content or changes the active link.
 
 `operation.status` and `operation.list` add optional `recoveryAction`:
@@ -1045,3 +1045,46 @@ permission to retry the mutation. Recovery validates all checkpoint identities
 again while holding the lock. A recovered success includes `recovered: true`;
 its `activatedAtUnixSecs` is the time recovery verified the active release.
 Completed checkpoint files are pruned with their transaction records.
+
+## `site.create` and `site.recoverCreate`
+
+`site create --request-file <root-owned JSON> --request-id <uuid>
+--idempotency-key <key>` creates a new PHP site in the managed WCP stack. The
+closed JSON plan has `domain`, `runtimeId`, optional `relativeRoot` and Compose
+`profile`, `workerMode` (default false), and `workerCount` (1–64, default 4).
+The content root is derived from the sole configured content root and domain;
+absolute paths and existing directories, routes (including parked/disabled
+routes), identities, services and execution configs are refused. This first
+slice does not adopt an existing tree or provision a database.
+
+One engine invocation allocates a new Unix identity, prepares the private
+root, ensures the runtime, writes its supervised service and execution
+config, proves the runtime serves the site, then publishes ingress and
+verifies through ingress. Mutations reuse the existing typed operations.
+The per-domain scope is `site-create/<domain>`. The same idempotency key and
+plan replay the recorded result; a changed plan conflicts. A pending journal
+blocks a new creation even with another key.
+
+A durable journal precedes each mutation boundary. Failure compensates in
+reverse order: remove the hash-guarded route, remove the matching execution
+config, stop/remove the matching service, remove only an empty root owned by
+the allocated identity, then release the identity. Ownership comes from the
+nested allocation transaction, not from domain-name coincidence. Modified
+configurations, non-empty roots and unproven nested outcomes are retained
+with a visible incomplete transaction and journal. A started runtime pool is
+kept running; recovery never stops a shared pool.
+
+`site recover-create --domain <domain> --request-id <uuid>` explicitly
+compensates an interrupted attempt while holding its domain mutation lock.
+If verification completed and its completion checkpoint was saved, recovery
+records success instead of undoing the healthy site. A live lock, foreign
+identity or changed artifact is refused. Retrying recovery is safe; it does
+not repeat the creation. `operation status` and `operation list` accept
+`--create-domain <domain>` as an exclusive scope selector. Status/list offer
+`recoveryAction: "site.recoverCreate"` only for an inactive incomplete
+transaction with a readable matching journal.
+
+The desktop persists request identity before dispatch and reads the remote
+outcome after timeout/reconnect. It does not orchestrate these steps or run
+compensation over SSH. The optional database provisioning flow remains a
+separate desktop-owned scope; it is not part of this composite.

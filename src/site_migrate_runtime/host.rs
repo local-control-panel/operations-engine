@@ -65,7 +65,7 @@ fn relative(path: &str) -> Result<SiteRelativePath, StepError> {
 }
 
 impl HostBackend<'_> {
-    fn identity_context(&self) -> site_identity::Context<'_> {
+    pub(crate) fn identity_context(&self) -> site_identity::Context<'_> {
         site_identity::Context {
             engine_state: self.engine_state,
             runtime_root: &self.config.runtime_root,

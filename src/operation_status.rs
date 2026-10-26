@@ -161,8 +161,40 @@ pub fn list(
     limit: Option<usize>,
 ) -> Result<OperationList, StatusError> {
     let scope = scope_path(site_id, database, backup_database, stack)?;
+    list_scoped(engine_state, &scope, limit)
+}
+
+pub fn load_create(
+    engine_state: &ManagedRoot,
+    domain: &str,
+    request_id: &str,
+) -> Result<OperationStatus, StatusError> {
+    let domain = crate::site::Domain::parse(domain).map_err(|_| StatusError::InvalidScope)?;
+    load_scoped(
+        engine_state,
+        &SiteRelativePath::parse(format!("site-create/{domain}")).unwrap(),
+        request_id,
+    )
+}
+pub fn list_create(
+    engine_state: &ManagedRoot,
+    domain: &str,
+    limit: Option<usize>,
+) -> Result<OperationList, StatusError> {
+    let domain = crate::site::Domain::parse(domain).map_err(|_| StatusError::InvalidScope)?;
+    list_scoped(
+        engine_state,
+        &SiteRelativePath::parse(format!("site-create/{domain}")).unwrap(),
+        limit,
+    )
+}
+fn list_scoped(
+    engine_state: &ManagedRoot,
+    scope: &SiteRelativePath,
+    limit: Option<usize>,
+) -> Result<OperationList, StatusError> {
     let limit = limit.unwrap_or(LIST_DEFAULT_LIMIT).clamp(1, LIST_MAX_LIMIT);
-    let scope_dir = match engine_state.open_managed_dir(&scope) {
+    let scope_dir = match engine_state.open_managed_dir(scope) {
         Ok(dir) => dir,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(OperationList {
@@ -222,9 +254,7 @@ pub fn list(
                 (true, true) => NextAction::Wait,
                 (true, false) => NextAction::ManualRecovery,
             };
-            let recovery_action = (!active
-                && crate::deployment_recovery::available(&scope_dir, &record))
-            .then_some("site.recoverDeployment");
+            let recovery_action = recovery_action(&scope_dir, &record, active);
             OperationSummary {
                 request_id: record.request_id,
                 operation: record.operation,
@@ -423,14 +453,28 @@ fn load_scoped(
     } else {
         false
     };
-    let recovery_action = (!active
-        && crate::deployment_recovery::available(&site_state, &transaction))
-    .then_some("site.recoverDeployment");
+    let recovery_action = recovery_action(&site_state, &transaction, active);
     Ok(OperationStatus {
         recovery_action,
         transaction,
         active,
     })
+}
+
+fn recovery_action(
+    scope: &ManagedRoot,
+    record: &state::TransactionState,
+    active: bool,
+) -> Option<&'static str> {
+    if active {
+        None
+    } else if crate::deployment_recovery::available(scope, record) {
+        Some("site.recoverDeployment")
+    } else if crate::site_create::available(scope, record) {
+        Some("site.recoverCreate")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

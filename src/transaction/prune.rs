@@ -111,6 +111,12 @@ fn prune_finished_transactions(root: &ManagedRoot, retain_for: Duration) {
         if root.exists(&checkpoint) && root.remove_file(&checkpoint).is_err() {
             continue;
         }
+        for directory in ["plans", "pending"] {
+            let auxiliary = SiteRelativePath::parse(format!("{directory}/{name}")).unwrap();
+            if root.exists(&auxiliary) {
+                let _ = root.remove_file(&auxiliary);
+            }
+        }
         let _ = root.remove_file(&path);
     }
 }
