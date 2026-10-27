@@ -30,7 +30,9 @@ impl ManagedRoot {
 
     /// Persist directory entries after creating or renaming a recovery artifact.
     pub fn sync_all(&self) -> io::Result<()> {
-        self.directory.try_clone()?.into_std_file().sync_all()
+        // cap-std may hold an O_PATH directory capability on Linux. O_PATH
+        // descriptors cannot be fsynced; open the same directory for reading.
+        self.directory.open(".")?.sync_all()
     }
 
     pub fn open_dir(&self, path: &SiteRelativePath) -> io::Result<Dir> {
@@ -584,6 +586,18 @@ mod tests {
     use crate::site::{SiteRelativePath, TrustedRoot};
 
     use super::ManagedRoot;
+
+    #[test]
+    fn directory_entries_can_be_synced_from_a_managed_capability() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = ManagedRoot::open(&TrustedRoot::parse(directory.path()).unwrap()).unwrap();
+        managed
+            .create_new(&SiteRelativePath::parse("checkpoint.json").unwrap(), b"{}")
+            .unwrap();
+        managed
+            .sync_all()
+            .expect("directory fsync must work on Linux O_PATH capabilities too");
+    }
 
     #[test]
     fn creates_and_reads_only_beneath_opened_root() {
