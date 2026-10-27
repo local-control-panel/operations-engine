@@ -146,6 +146,18 @@ pub fn execute(
         ));
     }
 
+    // A legacy caller cannot bypass a pending protected restore on the same database.
+    #[cfg(unix)]
+    if super::protected::read_pending(&restore_state).map_or(true, |pending| pending.is_some()) {
+        return Err(fail(
+            &restore_state,
+            &state_path,
+            &audit_path,
+            state,
+            RestoreError::ReplayInProgress,
+        ));
+    }
+
     if let Err(error) = run_restore(context, request, cancellation) {
         return Err(fail(&restore_state, &state_path, &audit_path, state, error));
     }

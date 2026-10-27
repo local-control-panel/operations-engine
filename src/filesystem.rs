@@ -28,6 +28,11 @@ impl ManagedRoot {
         })
     }
 
+    /// Persist directory entries after creating or renaming a recovery artifact.
+    pub fn sync_all(&self) -> io::Result<()> {
+        self.directory.try_clone()?.into_std_file().sync_all()
+    }
+
     pub fn open_dir(&self, path: &SiteRelativePath) -> io::Result<Dir> {
         self.directory.open_dir(path.as_path())
     }

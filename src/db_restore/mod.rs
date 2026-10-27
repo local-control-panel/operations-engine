@@ -1,18 +1,14 @@
 //! The `db.restore` operation: runs a database client against an
 //! already-on-disk dump file, for audit-trail purposes only.
 //!
-//! Deliberately simpler than every other mutation this engine runs: no
-//! `TrustedRoot`-managed content (the dump file already exists on the host,
-//! this operation does not stage or own it), no `HashGuard` (there is no
-//! "expected prior content" for a destructive database import to be
-//! guarded against), no rollback (`mariadb`/`psql` either accept the
-//! submission or don't; there is no partial-apply state and, by explicit
-//! scope decision, this operation does not snapshot the database first -
-//! it is exactly as safe/unsafe as the client-side raw-SSH command it
-//! replaces, gaining only structured execution and a transaction/audit
-//! record of who restored what, when).
+//! This legacy path has no snapshot or rollback; SQL can be partially applied
+//! on failure. New interactive callers should negotiate `db.restoreProtected`.
+//! The raw client helper remains for existing enclosing CMS transactions that
+//! already provide their own compensation.
 
 pub mod execute;
+#[cfg(unix)]
+pub mod protected;
 
 use crate::transaction::{IdempotencyKey, RequestId};
 

@@ -1102,3 +1102,54 @@ The desktop persists request identity before dispatch and reads the remote
 outcome after timeout/reconnect. It does not orchestrate these steps or run
 compensation over SSH. The optional database provisioning flow remains a
 separate desktop-owned scope; it is not part of this composite.
+
+### Protected offline database restore
+
+`db restore-protected --request-file <root-owned-0600.json> --request-id <uuid>
+--idempotency-key <key>` implements `db.restoreProtected`. The closed request is
+`{dbType: "mariadb"|"postgres", database, container, filePath, rootPassword,
+confirmOffline: true}`. Applications, queues and other writers must be stopped
+before confirming; the engine's database lock does not stop external writers.
+Only trusted, single-database SQL/plain gzip dumps are supported. SQL executes
+with administrative privileges; this is not a sandbox and changes to other
+databases, roles or external effects are outside compensation. System databases
+are refused. Credentials travel through the private request and child environment,
+never argv, transaction state, error output or audit.
+
+The engine stages a private plain input and verifies gzip decompression before
+mutation, then streams a complete logical snapshot (MariaDB routines/events/
+triggers; PostgreSQL create/clean metadata) into `db-restore/<database>/snapshots/`
+with mode 0600 under a 0700 directory. It syncs the snapshot and a SHA-256-bound
+pending marker before import. A successful client exit and a fresh `SELECT 1`
+probe are required for success; this verifies connectivity, not application
+health. A private fixed client script records completion inside the immutable container;
+a nonzero Docker CLI exit is not accepted as proof that SQL stopped. Only a
+proven rejected import or failed post-import probe triggers a
+separate, uncancelled snapshot restore and another connection probe. Successful
+compensation records the original as failed, not successful. Snapshot restores
+replace the target database, removing objects created by a partial import;
+PostgreSQL recovery terminates sessions connected to that database first.
+
+An import timeout, cancellation, lost client process, failed compensation or
+invalid checkpoint returns `DATABASE_RECOVERY_REQUIRED`, retains the snapshot
+and leaves the original transaction unresolved. Killing `docker exec` does not
+prove the in-container client stopped, so the engine does not race automatic
+rollback with it. Both protected and legacy `db.restore` refuse a pending
+protected restore in that database scope. `operation status --database` and
+`operation list --database` expose `db.recoverRestore` as an explicit next action.
+
+After confirming every prior import and compensation client in this database scope has stopped, use
+`db recover-restore --request-file <root-owned-0600.json> --request-id <new-uuid>
+--idempotency-key <new-key>`, implementing `db.recoverRestore`. Its request is
+`{dbType, database, container, rootPassword, confirmOffline: true,
+originalRequestId, confirmClientsStopped: true}` (no input file). Recovery takes
+the same database lock and validates the original request, immutable container
+ID and snapshot hash before replacing anything. It does not import the submitted
+dump again. Recovery itself has a transaction, idempotency and audit record;
+repeating its key returns the original result. A terminal original is never
+rolled back again. Completed artifacts are removed after durable terminal state;
+unresolved artifacts remain for explicit recovery. This operation does not
+provide online restore, automatic application maintenance or cross-database
+atomicity. The existing `db.restore` raw import remains for compatibility and
+for existing enclosing CMS transactions; clients requiring snapshot protection
+must negotiate `db.restoreProtected` and must not fall back to raw import.

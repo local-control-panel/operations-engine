@@ -62,6 +62,8 @@ pub enum ErrorCode {
     /// caller asked for nor what was there before — it needs an operator,
     /// not a retry.
     ConfigRecoveryFailed,
+    /// A database import cannot be proven complete; its private rollback snapshot is retained.
+    DatabaseRecoveryRequired,
     /// An `ingress.unpark` was requested for a domain with no
     /// `.maintenance-backup` file — there is nothing to restore. Distinct
     /// from every `Config*` code above, since this is not a problem with
@@ -94,6 +96,7 @@ impl ErrorCode {
             Self::ConfigValidationFailed => "CONFIG_VALIDATION_FAILED",
             Self::ConfigReloadFailed => "CONFIG_RELOAD_FAILED",
             Self::ConfigRecoveryFailed => "CONFIG_RECOVERY_FAILED",
+            Self::DatabaseRecoveryRequired => "DATABASE_RECOVERY_REQUIRED",
             Self::IngressNotParked => "INGRESS_NOT_PARKED",
             Self::PermissionDenied => "PERMISSION_DENIED",
         }
@@ -187,6 +190,10 @@ mod tests {
             ),
             (ErrorCode::ConfigReloadFailed, "CONFIG_RELOAD_FAILED"),
             (ErrorCode::ConfigRecoveryFailed, "CONFIG_RECOVERY_FAILED"),
+            (
+                ErrorCode::DatabaseRecoveryRequired,
+                "DATABASE_RECOVERY_REQUIRED",
+            ),
         ];
         for (code, expected) in codes {
             assert_eq!(code.as_str(), expected);

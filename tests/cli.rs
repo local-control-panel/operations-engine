@@ -88,6 +88,8 @@ fn capabilities_describe_only_implemented_operations() {
             "runtime.reconcile",
             "cron.installTab",
             "db.restore",
+            "db.restoreProtected",
+            "db.recoverRestore",
             "db.export",
             "db.provisionMariaDb",
             "db.dropMariaDb",

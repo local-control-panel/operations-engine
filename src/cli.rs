@@ -2666,6 +2666,25 @@ pub enum DbCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Offline restore with a private snapshot and compensation on a rejected import.
+    RestoreProtected {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+    /// Recover a protected restore only after the original client has stopped.
+    RecoverRestore {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+    },
+
     /// Runs a database client against an already-on-disk dump file.
     /// Audit-trail only - no snapshot, no rollback; the dump either
     /// imports cleanly or it doesn't, the same as the raw command this
@@ -2729,6 +2748,8 @@ impl DbCommand {
             Self::ProvisionPostgresUser { .. } => "db.provisionPostgresUser",
             Self::DropPostgresUser { .. } => "db.dropPostgresUser",
             Self::Restore { .. } => "db.restore",
+            Self::RestoreProtected { .. } => "db.restoreProtected",
+            Self::RecoverRestore { .. } => "db.recoverRestore",
         }
     }
 }

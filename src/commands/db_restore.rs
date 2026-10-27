@@ -85,6 +85,16 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        DbCommand::RestoreProtected {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => protected(&request_file, &request_id, &idempotency_key, false),
+        DbCommand::RecoverRestore {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => protected(&request_file, &request_id, &idempotency_key, true),
         DbCommand::Export { request_file } => export(&request_file),
         DbCommand::ToolConverge {
             request_file,
@@ -1554,5 +1564,76 @@ fn request_error_message(error: RestoreRequestError) -> &'static str {
         RestoreRequestError::FilePathTooLong => "file-path is too long",
         RestoreRequestError::InvalidRequestId => "request-id is not a canonical UUID",
         RestoreRequestError::InvalidIdempotencyKey => "idempotency-key is invalid",
+    }
+}
+
+fn protected(
+    path: &std::path::Path,
+    id: &str,
+    key: &str,
+    recover: bool,
+) -> Result<Response, ResponseBuildError> {
+    let operation = if recover {
+        "db.recoverRestore"
+    } else {
+        "db.restoreProtected"
+    };
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, db_restore::protected, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let request = match read_root_owned_content_file(path)
+            .ok()
+            .and_then(|s| protected::Request::parse(&s, id, Some(key), recover).ok())
+        {
+            Some(v) => v,
+            None => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::InvalidInput,
+                    "invalid root-owned protected restore request-file",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = RestoreContext {
+            engine_state: &state,
+            docker_program: "docker",
+            gunzip_program: "gunzip",
+        };
+        match protected::execute(&context, &request, &CancellationToken::default()) {
+            Ok(v) => Response::success(operation, v),
+            Err(e) => {
+                let (code, msg) = e.protocol();
+                Ok(Response::failure(operation, code, msg))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, id, key);
+        Ok(Response::failure(
+            operation,
+            ErrorCode::UnsupportedPlatform,
+            "protected restore requires Unix",
+        ))
     }
 }
