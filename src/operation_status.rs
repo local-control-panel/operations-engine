@@ -330,7 +330,24 @@ fn read_list_record(
     if bytes.len() > maximum {
         return Err(StatusError::Corrupt);
     }
-    state::decode(&bytes).map_err(|_| StatusError::Corrupt)
+    let record = state::decode(&bytes).map_err(|_| StatusError::Corrupt)?;
+    let consistent = match record.status {
+        TransactionStatus::InProgress => {
+            record.finished_at_unix_secs.is_none() && record.outcome.is_none()
+        }
+        TransactionStatus::Committed => {
+            record.finished_at_unix_secs.is_some()
+                && record.outcome.as_ref().is_some_and(|outcome| outcome.ok)
+        }
+        TransactionStatus::Failed => {
+            record.finished_at_unix_secs.is_some()
+                && record.outcome.as_ref().is_some_and(|outcome| !outcome.ok)
+        }
+    };
+    if !consistent {
+        return Err(StatusError::Corrupt);
+    }
+    Ok(record)
 }
 
 /// One interrupted transaction found by [`incomplete`].
@@ -839,6 +856,26 @@ mod tests {
         assert!(result.operations.is_empty());
         assert_eq!(result.unreadable, if cfg!(unix) { 3 } else { 2 });
         assert!(!result.scan_truncated);
+    }
+
+    #[test]
+    fn invalid_terminal_outcome_is_unreadable_instead_of_reported_as_success() {
+        let (_directory, root) = state_root();
+        let site = root
+            .open_managed_dir(&SiteRelativePath::parse(format!("sites/{SITE_ID}")).unwrap())
+            .unwrap();
+        let id = RequestId::parse(REQUEST_ID).unwrap();
+        let mut record = TransactionState::start(id, None, "site.deploy");
+        record.status = TransactionStatus::Committed;
+        create(
+            &site,
+            &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+            &record,
+        )
+        .unwrap();
+        let result = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
+        assert!(result.operations.is_empty());
+        assert_eq!(result.unreadable, 1);
     }
 
     #[test]
