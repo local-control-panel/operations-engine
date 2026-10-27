@@ -85,6 +85,10 @@ const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
 
 pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        DbCommand::RestoreRecoveryInfo {
+            database,
+            original_request_id,
+        } => recovery_info(&database, &original_request_id),
         DbCommand::RestoreProtected {
             request_file,
             request_id,
@@ -1634,6 +1638,55 @@ fn protected(
             operation,
             ErrorCode::UnsupportedPlatform,
             "protected restore requires Unix",
+        ))
+    }
+}
+
+fn recovery_info(database: &str, id: &str) -> Result<Response, ResponseBuildError> {
+    let operation = "db.restoreRecoveryInfo";
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, db_restore::protected, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(c) => c,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(s) => s,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let context = RestoreContext {
+            engine_state: &state,
+            docker_program: "docker",
+            gunzip_program: "gunzip",
+        };
+        match protected::recovery_info(&context, database, id) {
+            Ok(info) => Response::success(operation, info),
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(operation, code, message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (database, id);
+        Ok(Response::failure(
+            operation,
+            ErrorCode::UnsupportedPlatform,
+            "database restore recovery requires Unix",
         ))
     }
 }
