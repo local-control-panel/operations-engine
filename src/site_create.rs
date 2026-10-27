@@ -14,6 +14,7 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 pub const OPERATION: &str = "site.create";
 pub const RECOVER_OPERATION: &str = "site.recoverCreate";
@@ -373,9 +374,22 @@ pub fn available(scope: &ManagedRoot, record: &state::TransactionState) -> bool 
     record.operation == OPERATION
         && record.status == TransactionStatus::InProgress
         && scope
-            .read_to_string(&journal_path(record.request_id))
+            .open_regular_read(&journal_path(record.request_id))
             .ok()
-            .and_then(|json| serde_json::from_str::<Journal>(&json).ok())
+            .and_then(|file| {
+                const MAX_JOURNAL_BYTES: u64 = 16 * 1024;
+                if file.metadata().ok()?.len() > MAX_JOURNAL_BYTES {
+                    return None;
+                }
+                let mut bytes = Vec::new();
+                file.take(MAX_JOURNAL_BYTES + 1)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                if bytes.len() > MAX_JOURNAL_BYTES as usize {
+                    return None;
+                }
+                serde_json::from_slice::<Journal>(&bytes).ok()
+            })
             .is_some_and(|j| j.request_id == record.request_id && j.plan.validate().is_ok())
 }
 
@@ -608,6 +622,26 @@ mod tests {
             IdempotencyKey::parse("create-test").unwrap(),
         )
     }
+    #[test]
+    fn oversized_journal_does_not_advertise_creation_recovery() {
+        let (_dir, state, id, _key) = fixture();
+        let scope = scope(&state, &Domain::parse("example.com").unwrap()).unwrap();
+        let journal = Journal {
+            request_id: id,
+            plan: plan(),
+            root: "x".repeat(16 * 1024),
+            identity: false,
+            root_attempted: false,
+            service: false,
+            exec: false,
+            route: false,
+            completed: None,
+        };
+        save(&scope, &journal).unwrap();
+        let record = state::TransactionState::start(id, None, OPERATION);
+        assert!(!available(&scope, &record));
+    }
+
     #[test]
     fn site_is_published_only_after_runtime_probe_and_same_key_replays_without_steps() {
         let (_dir, state, id, key) = fixture();
