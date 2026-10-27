@@ -187,7 +187,17 @@ finished transaction, `wait` while the same request owns the mutation lock and
 owner. The engine never names an automatic retry for interrupted work. A
 scope that never ran a mutation returns an empty list. `unreadable` counts
 records that exist but could not be parsed and `truncated` is true when more
-records exist than were returned.
+readable records exist than were returned. Scanning is limited to 1,000
+entries, 1 MiB per transaction and 16 MiB of transaction bytes per request.
+Non-regular, oversized, malformed, unsupported-schema and filename/request-ID
+mismatched records count as unreadable. `scanTruncated` is true when an entry
+or total-byte scan budget is reached: returned entries are sorted newest first
+within the scanned subset, and may omit newer operations. Clients must show
+that incompleteness rather than claim a complete or globally newest history.
+Old engines may omit `scanTruncated`; clients treat an absent field as false.
+If the kernel lock is held but its bounded diagnostic record cannot identify
+the owner, the query fails rather than labelling transactions as inactive or
+suggesting recovery.
 
 ## `site.changeLog.append`, `site.changeLog.list`
 

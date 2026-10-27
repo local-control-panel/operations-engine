@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::fd::AsRawFd,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -138,9 +138,9 @@ pub fn holder(root: &ManagedRoot, path: &SiteRelativePath) -> Result<Option<Requ
     if error.kind() != io::ErrorKind::WouldBlock {
         return Err(LockError::Io);
     }
-    Ok(read_lock(root, path)
-        .ok()
-        .map(|existing| existing.record.holder))
+    // A held kernel lock with unreadable diagnostics has an unknown owner,
+    // not an absent owner. Callers must not offer interrupted-work recovery.
+    read_lock(root, path).map(|existing| Some(existing.record.holder))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,8 +166,16 @@ fn lock_record_bytes(holder: RequestId) -> Result<Vec<u8>, LockError> {
 }
 
 fn read_lock(root: &ManagedRoot, path: &SiteRelativePath) -> Result<ExistingLock, LockError> {
-    let json = root.read_to_string(path).map_err(|_| LockError::Io)?;
-    let record: LockRecord = serde_json::from_str(&json).map_err(|_| LockError::Io)?;
+    let mut bytes = Vec::new();
+    root.open_read(path)
+        .map_err(|_| LockError::Io)?
+        .take(4097)
+        .read_to_end(&mut bytes)
+        .map_err(|_| LockError::Io)?;
+    if bytes.len() > 4096 {
+        return Err(LockError::Io);
+    }
+    let record: LockRecord = serde_json::from_slice(&bytes).map_err(|_| LockError::Io)?;
     if record.schema_version != LOCK_SCHEMA_VERSION {
         return Err(LockError::Io);
     }
@@ -185,7 +193,7 @@ fn unix_now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd;
+    use std::{io::Write, os::fd::AsRawFd};
 
     use super::{LockError, acquire, holder as current_holder};
     use crate::{
@@ -211,6 +219,23 @@ mod tests {
 
     fn lock_path() -> SiteRelativePath {
         SiteRelativePath::parse("locks/mutation.lock").expect("lock path should be valid")
+    }
+
+    #[test]
+    fn live_lock_with_unreadable_diagnostics_is_unknown_instead_of_inactive() {
+        let (_directory, managed) = managed_root();
+        let path = lock_path();
+        let _guard = acquire(
+            &managed,
+            &path,
+            holder("550e8400-e29b-41d4-a716-446655440000"),
+        )
+        .unwrap();
+        // Write through the same inode: atomic rename would replace the locked inode.
+        let mut file = managed.open_or_create_file(&path).unwrap();
+        file.set_len(0).unwrap();
+        file.write_all(b"{").unwrap();
+        assert_eq!(current_holder(&managed, &path), Err(LockError::Io));
     }
 
     #[test]

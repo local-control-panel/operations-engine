@@ -303,6 +303,23 @@ impl ManagedRoot {
         Ok(names)
     }
 
+    /// Enumerates at most `limit` directory entries, including non-files in
+    /// the budget. The boolean means the directory scan is incomplete.
+    pub fn file_names_bounded(&self, limit: usize) -> io::Result<(Vec<String>, bool)> {
+        let mut names = Vec::new();
+        for (index, entry) in self.directory.entries()?.enumerate() {
+            if index == limit {
+                return Ok((names, true));
+            }
+            let entry = entry?;
+            // Keep non-regular entries: the reader must report them as unreadable.
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        Ok((names, false))
+    }
+
     /// Creates `path` only if it does not already exist and writes `contents`
     /// to it. The create-and-open step is atomic, so this is safe to use as a
     /// mutual-exclusion primitive between racing processes.

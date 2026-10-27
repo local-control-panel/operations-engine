@@ -160,7 +160,11 @@ pub fn load(root: &ManagedRoot, path: &SiteRelativePath) -> Result<TransactionSt
             StateError::Io
         }
     })?;
-    let state: TransactionState = serde_json::from_str(&json).map_err(|_| StateError::Corrupt)?;
+    decode(json.as_bytes())
+}
+
+pub(crate) fn decode(bytes: &[u8]) -> Result<TransactionState, StateError> {
+    let state: TransactionState = serde_json::from_slice(bytes).map_err(|_| StateError::Corrupt)?;
     if state.schema_version != STATE_SCHEMA_VERSION {
         return Err(StateError::Corrupt);
     }
