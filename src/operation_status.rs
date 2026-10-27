@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use serde::Serialize;
 
 use crate::{
@@ -82,6 +84,9 @@ pub fn load_stack(
 /// Largest page `operation.list` will return; larger requests are clamped.
 pub const LIST_MAX_LIMIT: usize = 100;
 pub const LIST_DEFAULT_LIMIT: usize = 20;
+pub const LIST_SCAN_MAX_ENTRIES: usize = 1000;
+pub const LIST_RECORD_MAX_BYTES: usize = 1024 * 1024;
+pub const LIST_SCAN_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// The only safe next step the engine can name for a transaction. `unknown`
 /// or interrupted work never maps to an automatic destructive retry.
@@ -121,6 +126,8 @@ pub struct OperationList {
     pub unreadable: usize,
     /// True when more records exist than `operations` holds.
     pub truncated: bool,
+    /// The scan hit its entry or byte budget; results may omit newer records.
+    pub scan_truncated: bool,
 }
 
 fn scope_path(
@@ -150,7 +157,7 @@ fn scope_path(
     Ok(SiteRelativePath::parse(path).expect("validated identifiers produce safe relative paths"))
 }
 
-/// Lists the newest transactions of one scope without executing anything.
+/// Lists unfinished transactions first, newest within each group, without executing anything.
 /// A scope that never ran a mutation is an empty list, not `NotFound`.
 pub fn list(
     engine_state: &ManagedRoot,
@@ -201,6 +208,7 @@ fn list_scoped(
                 operations: Vec::new(),
                 unreadable: 0,
                 truncated: false,
+                scan_truncated: false,
             });
         }
         Err(_) => return Err(StatusError::Io),
@@ -213,18 +221,25 @@ fn list_scoped(
                 operations: Vec::new(),
                 unreadable: 0,
                 truncated: false,
+                scan_truncated: false,
             });
         }
         Err(_) => return Err(StatusError::Io),
     };
     let lock_path = SiteRelativePath::parse("locks/mutation.lock").unwrap();
     let owner = lock::holder(&scope_dir, &lock_path).map_err(|_| StatusError::Io)?;
-    let mut names = transactions_dir.file_names().map_err(|_| StatusError::Io)?;
-    names.retain(|name| name.ends_with(".json"));
-
+    let (names, mut scan_truncated) = transactions_dir
+        .file_names_bounded(LIST_SCAN_MAX_ENTRIES)
+        .map_err(|_| StatusError::Io)?;
     let mut unreadable = 0;
     let mut records = Vec::new();
-    for name in names {
+    let mut remaining_bytes = LIST_SCAN_MAX_BYTES;
+    for name in names.into_iter().filter(|name| name.ends_with(".json")) {
+        // Reserve enough budget to distinguish a full record from an oversized one.
+        if remaining_bytes <= 1 {
+            scan_truncated = true;
+            break;
+        }
         let path = match SiteRelativePath::parse(&name) {
             Ok(path) => path,
             Err(_) => {
@@ -232,14 +247,27 @@ fn list_scoped(
                 continue;
             }
         };
-        match state::load(&transactions_dir, &path) {
-            Ok(record) => records.push(record),
-            Err(_) => unreadable += 1,
+        let maximum = LIST_RECORD_MAX_BYTES.min(remaining_bytes - 1);
+        let loaded = read_list_record(&transactions_dir, &path, maximum, &mut remaining_bytes);
+        match loaded {
+            Ok(record)
+                if name == format!("{}.json", record.request_id)
+                    && record.operation.len() <= 128
+                    && record
+                        .operation
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.') =>
+            {
+                records.push(record);
+            }
+            _ => unreadable += 1,
         }
     }
+    scan_truncated |= remaining_bytes <= 1;
     records.sort_by(|a, b| {
-        b.started_at_unix_secs
-            .cmp(&a.started_at_unix_secs)
+        (b.status == TransactionStatus::InProgress)
+            .cmp(&(a.status == TransactionStatus::InProgress))
+            .then_with(|| b.started_at_unix_secs.cmp(&a.started_at_unix_secs))
             .then_with(|| a.request_id.to_string().cmp(&b.request_id.to_string()))
     });
     let truncated = records.len() > limit;
@@ -272,7 +300,54 @@ fn list_scoped(
         operations,
         unreadable,
         truncated,
+        scan_truncated,
     })
+}
+
+// Read only regular, capability-scoped records. Limits apply before JSON
+// deserialization, so a corrupt or unexpectedly large outcome cannot exhaust RAM.
+fn read_list_record(
+    root: &ManagedRoot,
+    path: &SiteRelativePath,
+    maximum: usize,
+    remaining: &mut usize,
+) -> Result<TransactionState, StatusError> {
+    let metadata = root.symlink_metadata(path).map_err(|_| StatusError::Io)?;
+    if !metadata.is_file() {
+        return Err(StatusError::Corrupt);
+    }
+    if metadata.len() > maximum as u64 {
+        if metadata.len() <= LIST_RECORD_MAX_BYTES as u64 {
+            *remaining = 0;
+        }
+        return Err(StatusError::Corrupt);
+    }
+    let file = root.open_regular_read(path).map_err(|_| StatusError::Io)?;
+    let mut bytes = Vec::new();
+    let read_result = file.take(maximum as u64 + 1).read_to_end(&mut bytes);
+    *remaining = remaining.saturating_sub(bytes.len());
+    read_result.map_err(|_| StatusError::Io)?;
+    if bytes.len() > maximum {
+        return Err(StatusError::Corrupt);
+    }
+    let record = state::decode(&bytes).map_err(|_| StatusError::Corrupt)?;
+    let consistent = match record.status {
+        TransactionStatus::InProgress => {
+            record.finished_at_unix_secs.is_none() && record.outcome.is_none()
+        }
+        TransactionStatus::Committed => {
+            record.finished_at_unix_secs.is_some()
+                && record.outcome.as_ref().is_some_and(|outcome| outcome.ok)
+        }
+        TransactionStatus::Failed => {
+            record.finished_at_unix_secs.is_some()
+                && record.outcome.as_ref().is_some_and(|outcome| !outcome.ok)
+        }
+    };
+    if !consistent {
+        return Err(StatusError::Corrupt);
+    }
+    Ok(record)
 }
 
 /// One interrupted transaction found by [`incomplete`].
@@ -673,6 +748,34 @@ mod tests {
     }
 
     #[test]
+    fn older_interrupted_operation_stays_discoverable_ahead_of_newer_terminal_records() {
+        let (_directory, root) = state_root();
+        let site = root
+            .open_managed_dir(&SiteRelativePath::parse(format!("sites/{SITE_ID}")).unwrap())
+            .unwrap();
+        for (index, unfinished) in [true, false, false].into_iter().enumerate() {
+            let id = RequestId::parse(&format!("{index:08x}-e89b-12d3-a456-426614174000")).unwrap();
+            let mut record = TransactionState::start(id, None, "site.deploy");
+            record.started_at_unix_secs = index as u64;
+            if !unfinished {
+                record
+                    .mark_failed(crate::error::ErrorCode::Conflict, "rejected")
+                    .unwrap();
+            }
+            create(
+                &site,
+                &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+                &record,
+            )
+            .unwrap();
+        }
+        let page = list(&root, Some(SITE_ID), None, None, None, Some(1)).unwrap();
+        assert_eq!(page.operations.len(), 1);
+        assert_eq!(page.operations[0].next_action, NextAction::ManualRecovery);
+        assert!(page.truncated);
+    }
+
+    #[test]
     fn list_of_an_unused_scope_is_empty_and_bad_scopes_are_rejected() {
         let (_directory, root) = state_root();
         let empty = list(
@@ -708,6 +811,95 @@ mod tests {
         .unwrap();
         let listed = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
         assert_eq!(listed.unreadable, 1);
+    }
+
+    #[test]
+    fn list_reports_incomplete_scan_at_the_directory_entry_budget() {
+        let (directory, root) = state_root();
+        let transactions = directory
+            .path()
+            .join(format!("sites/{SITE_ID}/transactions"));
+        for index in 0..=LIST_SCAN_MAX_ENTRIES {
+            std::fs::write(transactions.join(format!("{index}.tmp")), "").unwrap();
+        }
+        let result = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
+        assert!(result.scan_truncated);
+        assert!(!result.truncated);
+        assert!(result.operations.is_empty());
+    }
+
+    #[test]
+    fn list_rejects_oversized_mismatched_and_symlink_records() {
+        let (directory, root) = state_root();
+        let transactions = directory
+            .path()
+            .join(format!("sites/{SITE_ID}/transactions"));
+        std::fs::write(
+            transactions.join("oversized.json"),
+            vec![b' '; LIST_RECORD_MAX_BYTES + 1],
+        )
+        .unwrap();
+        let record =
+            TransactionState::start(RequestId::parse(REQUEST_ID).unwrap(), None, "site.deploy");
+        std::fs::write(
+            transactions.join("mismatch.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            transactions.join("mismatch.json"),
+            transactions.join("link.json"),
+        )
+        .unwrap();
+        let result = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
+        assert!(result.operations.is_empty());
+        assert_eq!(result.unreadable, if cfg!(unix) { 3 } else { 2 });
+        assert!(!result.scan_truncated);
+    }
+
+    #[test]
+    fn invalid_terminal_outcome_is_unreadable_instead_of_reported_as_success() {
+        let (_directory, root) = state_root();
+        let site = root
+            .open_managed_dir(&SiteRelativePath::parse(format!("sites/{SITE_ID}")).unwrap())
+            .unwrap();
+        let id = RequestId::parse(REQUEST_ID).unwrap();
+        let mut record = TransactionState::start(id, None, "site.deploy");
+        record.status = TransactionStatus::Committed;
+        create(
+            &site,
+            &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+            &record,
+        )
+        .unwrap();
+        let result = list(&root, Some(SITE_ID), None, None, None, None).unwrap();
+        assert!(result.operations.is_empty());
+        assert_eq!(result.unreadable, 1);
+    }
+
+    #[test]
+    fn list_reports_total_read_budget_without_publishing_partial_records() {
+        let (directory, root) = state_root();
+        let transactions = directory
+            .path()
+            .join(format!("sites/{SITE_ID}/transactions"));
+        for index in 0..20 {
+            let id = RequestId::parse(&format!("{index:08x}-e89b-12d3-a456-426614174000")).unwrap();
+            let mut record = TransactionState::start(id, None, "site.deploy");
+            record
+                .mark_committed(serde_json::json!({"secret": "x".repeat(900_000)}))
+                .unwrap();
+            std::fs::write(
+                transactions.join(format!("{id}.json")),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        let result = list(&root, Some(SITE_ID), None, None, None, Some(100)).unwrap();
+        assert!(result.scan_truncated);
+        assert!(result.operations.len() < 20);
+        assert!(!serde_json::to_string(&result).unwrap().contains("secret"));
     }
 
     #[test]

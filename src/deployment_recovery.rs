@@ -15,6 +15,9 @@ use crate::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+
+const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024;
 pub const OPERATION: &str = "site.recoverDeployment";
 
 #[derive(Debug)]
@@ -63,12 +66,27 @@ fn state_path(id: RequestId) -> SiteRelativePath {
     SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap()
 }
 fn load(root: &ManagedRoot, id: RequestId) -> Result<Checkpoint, Error> {
-    serde_json::from_str(
-        &root
-            .read_to_string(&path(id))
-            .map_err(|_| Error::Unsupported)?,
-    )
-    .map_err(|_| Error::Unavailable)
+    let path = path(id);
+    let metadata = root
+        .symlink_metadata(&path)
+        .map_err(|_| Error::Unsupported)?;
+    if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
+        return Err(Error::Unavailable);
+    }
+    let file = root
+        .open_regular_read(&path)
+        .map_err(|_| Error::Unavailable)?;
+    if !file.metadata().map_err(|_| Error::Unavailable)?.is_file() {
+        return Err(Error::Unavailable);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_CHECKPOINT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::Unavailable)?;
+    if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
+        return Err(Error::Unavailable);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| Error::Unavailable)
 }
 /// Called under the mutation lock before staging or activation. A previous
 /// interrupted request must be reconciled before another release can switch.
@@ -418,6 +436,26 @@ mod tests {
             Err(Error::Conflict)
         ));
     }
+    #[test]
+    fn oversized_checkpoint_is_not_advertised_or_used_for_recovery() {
+        let (_c, _s, content, state, site, id) = fixture("site.deploy");
+        let scope = preflight::open_site_state(&state, site).unwrap();
+        let original = scope.read_bytes(&path(id)).unwrap();
+        let mut oversized = vec![b' '; MAX_CHECKPOINT_BYTES as usize];
+        oversized.extend_from_slice(&original);
+        scope.write_atomic(&path(id), &oversized).unwrap();
+        let record = state::load(&scope, &state_path(id)).unwrap();
+        assert!(!available(&scope, &record));
+        assert!(matches!(
+            execute(&content, &state, site, id),
+            Err(Error::Unavailable)
+        ));
+        assert_eq!(
+            state::load(&scope, &state_path(id)).unwrap().status,
+            TransactionStatus::InProgress
+        );
+    }
+
     #[test]
     fn advertised_recovery_requires_a_valid_checkpoint_and_incomplete_transaction() {
         let (_c, _s, content, state, site, id) = fixture("site.deploy");

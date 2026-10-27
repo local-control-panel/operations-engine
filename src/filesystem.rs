@@ -303,6 +303,23 @@ impl ManagedRoot {
         Ok(names)
     }
 
+    /// Enumerates at most `limit` directory entries, including non-files in
+    /// the budget. The boolean means the directory scan is incomplete.
+    pub fn file_names_bounded(&self, limit: usize) -> io::Result<(Vec<String>, bool)> {
+        let mut names = Vec::new();
+        for (index, entry) in self.directory.entries()?.enumerate() {
+            if index == limit {
+                return Ok((names, true));
+            }
+            let entry = entry?;
+            // Keep non-regular entries: the reader must report them as unreadable.
+            if let Ok(name) = entry.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        Ok((names, false))
+    }
+
     /// Creates `path` only if it does not already exist and writes `contents`
     /// to it. The create-and-open step is atomic, so this is safe to use as a
     /// mutual-exclusion primitive between racing processes.
@@ -342,6 +359,35 @@ impl ManagedRoot {
                 OpenOptions::new().write(true).create_new(true).mode(mode),
             )
             .map(cap_std::fs::File::into_std)
+    }
+
+    /// Opens a regular file without following its final symlink. On Unix,
+    /// nonblocking open prevents a swapped FIFO from blocking before metadata.
+    pub fn open_regular_read(&self, path: &SiteRelativePath) -> io::Result<std::fs::File> {
+        if !self.symlink_metadata(path)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular file",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = self
+            .directory
+            .open_with(path.as_path(), &options)?
+            .into_std();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular file",
+            ));
+        }
+        Ok(file)
     }
 
     /// Opens an existing file beneath this capability root for reading.
