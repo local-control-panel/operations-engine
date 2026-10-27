@@ -361,6 +361,35 @@ impl ManagedRoot {
             .map(cap_std::fs::File::into_std)
     }
 
+    /// Opens a regular file without following its final symlink. On Unix,
+    /// nonblocking open prevents a swapped FIFO from blocking before metadata.
+    pub fn open_regular_read(&self, path: &SiteRelativePath) -> io::Result<std::fs::File> {
+        if !self.symlink_metadata(path)?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular file",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = self
+            .directory
+            .open_with(path.as_path(), &options)?
+            .into_std();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+
     /// Opens an existing file beneath this capability root for reading.
     pub fn open_read(&self, path: &SiteRelativePath) -> io::Result<std::fs::File> {
         self.directory

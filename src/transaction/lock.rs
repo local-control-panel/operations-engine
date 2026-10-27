@@ -167,7 +167,7 @@ fn lock_record_bytes(holder: RequestId) -> Result<Vec<u8>, LockError> {
 
 fn read_lock(root: &ManagedRoot, path: &SiteRelativePath) -> Result<ExistingLock, LockError> {
     let mut bytes = Vec::new();
-    root.open_read(path)
+    root.open_regular_read(path)
         .map_err(|_| LockError::Io)?
         .take(4097)
         .read_to_end(&mut bytes)

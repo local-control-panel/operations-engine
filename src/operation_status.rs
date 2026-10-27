@@ -157,7 +157,7 @@ fn scope_path(
     Ok(SiteRelativePath::parse(path).expect("validated identifiers produce safe relative paths"))
 }
 
-/// Lists the newest transactions of one scope without executing anything.
+/// Lists unfinished transactions first, newest within each group, without executing anything.
 /// A scope that never ran a mutation is an empty list, not `NotFound`.
 pub fn list(
     engine_state: &ManagedRoot,
@@ -265,8 +265,9 @@ fn list_scoped(
     }
     scan_truncated |= remaining_bytes <= 1;
     records.sort_by(|a, b| {
-        b.started_at_unix_secs
-            .cmp(&a.started_at_unix_secs)
+        (b.status == TransactionStatus::InProgress)
+            .cmp(&(a.status == TransactionStatus::InProgress))
+            .then_with(|| b.started_at_unix_secs.cmp(&a.started_at_unix_secs))
             .then_with(|| a.request_id.to_string().cmp(&b.request_id.to_string()))
     });
     let truncated = records.len() > limit;
@@ -321,7 +322,7 @@ fn read_list_record(
         }
         return Err(StatusError::Corrupt);
     }
-    let file = root.open_read(path).map_err(|_| StatusError::Io)?;
+    let file = root.open_regular_read(path).map_err(|_| StatusError::Io)?;
     let mut bytes = Vec::new();
     let read_result = file.take(maximum as u64 + 1).read_to_end(&mut bytes);
     *remaining = remaining.saturating_sub(bytes.len());
@@ -726,6 +727,34 @@ mod tests {
 
         let page = list(&root, Some(SITE_ID), None, None, None, Some(2)).unwrap();
         assert_eq!(page.operations.len(), 2);
+        assert!(page.truncated);
+    }
+
+    #[test]
+    fn older_interrupted_operation_stays_discoverable_ahead_of_newer_terminal_records() {
+        let (_directory, root) = state_root();
+        let site = root
+            .open_managed_dir(&SiteRelativePath::parse(format!("sites/{SITE_ID}")).unwrap())
+            .unwrap();
+        for (index, unfinished) in [true, false, false].into_iter().enumerate() {
+            let id = RequestId::parse(&format!("{index:08x}-e89b-12d3-a456-426614174000")).unwrap();
+            let mut record = TransactionState::start(id, None, "site.deploy");
+            record.started_at_unix_secs = index as u64;
+            if !unfinished {
+                record
+                    .mark_failed(crate::error::ErrorCode::Conflict, "rejected")
+                    .unwrap();
+            }
+            create(
+                &site,
+                &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+                &record,
+            )
+            .unwrap();
+        }
+        let page = list(&root, Some(SITE_ID), None, None, None, Some(1)).unwrap();
+        assert_eq!(page.operations.len(), 1);
+        assert_eq!(page.operations[0].next_action, NextAction::ManualRecovery);
         assert!(page.truncated);
     }
 
