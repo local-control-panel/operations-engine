@@ -53,6 +53,11 @@ fn incomplete() -> Result<Response, ResponseBuildError> {
 pub fn run(command: OperationCommand) -> Result<Response, ResponseBuildError> {
     match command {
         OperationCommand::Incomplete => incomplete(),
+        OperationCommand::ResourceStatus {
+            resource_operation,
+            resource,
+            request_id,
+        } => resource_status(&resource_operation, &resource, &request_id),
         OperationCommand::Status {
             site_id,
             create_domain,
@@ -261,6 +266,67 @@ fn status(
             OPERATION,
             ErrorCode::UnsupportedPlatform,
             "operation.status requires a Unix host",
+        ))
+    }
+}
+
+fn resource_status(
+    operation: &str,
+    resource: &str,
+    id: &str,
+) -> Result<Response, ResponseBuildError> {
+    const NAME: &str = "operation.resourceStatus";
+    #[cfg(unix)]
+    {
+        let config = match EngineConfig::load_root_owned(Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    NAME,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let root = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    NAME,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        match operation_status::load_resource(&root, &config.content_roots, operation, resource, id)
+        {
+            Ok(v) => Response::success(NAME, v),
+            Err(StatusError::NotFound) => Ok(Response::failure(
+                NAME,
+                ErrorCode::NotFound,
+                "the engine has no durable record for this request",
+            )),
+            Err(StatusError::InvalidScope | StatusError::InvalidRequestId) => {
+                Ok(Response::failure(
+                    NAME,
+                    ErrorCode::InvalidInput,
+                    "unsupported operation resource",
+                ))
+            }
+            Err(_) => Ok(Response::failure(
+                NAME,
+                ErrorCode::Internal,
+                "operation record could not be validated",
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (operation, resource, id);
+        Ok(Response::failure(
+            NAME,
+            ErrorCode::UnsupportedPlatform,
+            "resource status requires Unix",
         ))
     }
 }

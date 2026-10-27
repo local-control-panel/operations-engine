@@ -678,6 +678,15 @@ impl SystemCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum OperationCommand {
+    /// Read one known operation family's durable record without executing it.
+    ResourceStatus {
+        #[arg(long = "resource-operation")]
+        resource_operation: String,
+        #[arg(long)]
+        resource: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
     /// Return the last durable state for one site-scoped request.
     Status {
         #[arg(long = "site-id")]
@@ -727,6 +736,7 @@ impl OperationCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Status { .. } => "operation.status",
+            Self::ResourceStatus { .. } => "operation.resourceStatus",
             Self::List { .. } => "operation.list",
             Self::Incomplete => "operation.incomplete",
         }

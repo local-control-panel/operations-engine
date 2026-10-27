@@ -86,6 +86,7 @@ pub const OPERATIONS: &[&str] = &[
     "capabilities",
     "doctor",
     "operation.status",
+    "operation.resourceStatus",
     "operation.list",
     "operation.incomplete",
     "backup.delete",

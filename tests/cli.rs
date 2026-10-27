@@ -44,6 +44,7 @@ fn capabilities_describe_only_implemented_operations() {
             "capabilities",
             "doctor",
             "operation.status",
+            "operation.resourceStatus",
             "operation.list",
             "operation.incomplete",
             "backup.delete",
