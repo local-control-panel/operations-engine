@@ -234,7 +234,7 @@ fn build_command(request: &ProcessRequest) -> Command {
 /// "Text file busy" for that short window. Nothing has run when `exec`
 /// fails, so retrying is safe. Seen with test fixtures and with binaries
 /// this engine writes and then runs (rclone, the engine itself).
-fn spawn_retrying_busy(command: &mut Command) -> io::Result<std::process::Child> {
+pub(crate) fn spawn_retrying_busy(command: &mut Command) -> io::Result<std::process::Child> {
     const ATTEMPTS: u32 = 5;
     let mut attempt = 1;
     loop {
