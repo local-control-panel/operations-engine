@@ -545,6 +545,8 @@ fn recovery_action(
         None
     } else if crate::deployment_recovery::available(scope, record) {
         Some("site.recoverDeployment")
+    } else if crate::db_restore::protected::available(scope, record) {
+        Some("db.recoverRestore")
     } else if crate::site_create::available(scope, record) {
         Some("site.recoverCreate")
     } else {

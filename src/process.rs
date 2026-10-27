@@ -331,6 +331,16 @@ pub fn run_with_stdin_file(
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, ProcessRunError> {
     let file = std::fs::File::open(stdin_path).map_err(ProcessRunError::Spawn)?;
+    run_with_stdin_handle(request, file, limits, cancellation)
+}
+
+/// Hands a previously validated file descriptor to the child without reopening a path.
+pub fn run_with_stdin_handle(
+    request: &ProcessRequest,
+    file: std::fs::File,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
     let mut command = build_command(request);
     command.stdin(Stdio::from(file));
     spawn_and_supervise(command, limits, cancellation)
@@ -344,9 +354,36 @@ pub fn run_with_stdout_file(
     limits: &ProcessLimits,
     cancellation: &CancellationToken,
 ) -> Result<ProcessOutput, ProcessRunError> {
+    run_with_files_impl(request, Stdio::null(), stdout_file, limits, cancellation)
+}
+
+/// Streams an already validated input descriptor to an already opened output file.
+pub fn run_with_files(
+    request: &ProcessRequest,
+    stdin_file: std::fs::File,
+    stdout_file: std::fs::File,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
+    run_with_files_impl(
+        request,
+        Stdio::from(stdin_file),
+        stdout_file,
+        limits,
+        cancellation,
+    )
+}
+
+fn run_with_files_impl(
+    request: &ProcessRequest,
+    stdin: Stdio,
+    stdout_file: std::fs::File,
+    limits: &ProcessLimits,
+    cancellation: &CancellationToken,
+) -> Result<ProcessOutput, ProcessRunError> {
     let mut command = build_command(request);
     command
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::piped());
     let mut child = spawn_retrying_busy(&mut command).map_err(ProcessRunError::Spawn)?;
