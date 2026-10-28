@@ -133,6 +133,7 @@ pub const OPERATIONS: &[&str] = &[
     "cron.installTab",
     "db.restore",
     "db.restoreProtected",
+    "db.restoreRecoveryInfo",
     "db.recoverRestore",
     "db.export",
     "db.provisionMariaDb",

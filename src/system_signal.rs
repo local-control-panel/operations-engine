@@ -500,7 +500,12 @@ mod tests {
         let program = dir.path().join(name);
         fs::copy(which_sleep(), &program).unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut child = Command::new(&program).arg("300").spawn().unwrap();
+        // Another test thread may have forked while this binary was being
+        // copied. Reuse the runner's bounded ETXTBSY handling until that
+        // child's inherited writable descriptor closes at exec.
+        let mut command = Command::new(&program);
+        command.arg("300");
+        let mut child = crate::process::spawn_retrying_busy(&mut command).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let want: String = name.chars().take(MAX_COMM_LEN).collect();
         while Instant::now() < deadline {

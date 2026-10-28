@@ -1187,3 +1187,15 @@ A partial file rollback whose prior files cannot be proved remains manual. No au
 rollback is provided for incremental WXR imports, WordPress updates, Meilisearch upgrades,
 host package installation or image pulls: their status is inspectable, and retained artifacts
 and live services require manual assessment.
+`db restore-recovery-info --database <name> --original-request-id <uuid>`
+implements the bounded, read-only `db.restoreRecoveryInfo` discovery operation.
+It validates the original protected transaction and pending marker, a regular
+retained snapshot and the current immutable container identity. Transaction
+reads are limited to 1 MiB and marker reads to 16 KiB; SQL contents, snapshot
+hashes, credentials, stored outcome messages and idempotency keys are omitted.
+The response contains `{originalRequestId, database, dbType, container, active,
+status, recoverable}`. Any held database mutation lock disables recovery, even
+when held by a different recovery request. `recoverable` is only eligibility for
+explicit recovery; it does not prove that an orphaned DB client has stopped.
+Clients must still obtain offline/all-prior-clients-stopped confirmation and
+`db.recoverRestore` rechecks identity and integrity under its mutation lock.

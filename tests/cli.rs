@@ -90,6 +90,7 @@ fn capabilities_describe_only_implemented_operations() {
             "cron.installTab",
             "db.restore",
             "db.restoreProtected",
+            "db.restoreRecoveryInfo",
             "db.recoverRestore",
             "db.export",
             "db.provisionMariaDb",

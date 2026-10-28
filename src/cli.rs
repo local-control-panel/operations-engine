@@ -2685,6 +2685,13 @@ pub enum DbCommand {
         idempotency_key: Option<String>,
     },
 
+    /// Read bounded recovery metadata for an original protected restore.
+    RestoreRecoveryInfo {
+        #[arg(long)]
+        database: String,
+        #[arg(long = "original-request-id")]
+        original_request_id: String,
+    },
     /// Offline restore with a private snapshot and compensation on a rejected import.
     RestoreProtected {
         #[arg(long = "request-file")]
@@ -2767,6 +2774,7 @@ impl DbCommand {
             Self::ProvisionPostgresUser { .. } => "db.provisionPostgresUser",
             Self::DropPostgresUser { .. } => "db.dropPostgresUser",
             Self::Restore { .. } => "db.restore",
+            Self::RestoreRecoveryInfo { .. } => "db.restoreRecoveryInfo",
             Self::RestoreProtected { .. } => "db.restoreProtected",
             Self::RecoverRestore { .. } => "db.recoverRestore",
         }
