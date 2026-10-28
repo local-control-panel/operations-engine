@@ -402,6 +402,14 @@ pub fn recovery_info(
     if marker.request_id != id || marker.dest_root != std::path::Path::new(resource) {
         return unavailable("Checkpoint does not belong to this exact request");
     }
+    if transaction_committed(&scope, original) {
+        return RecoveryInfo {
+            available: true,
+            reason: "The original operation committed; clear only its retained checkpoint",
+            requires_database: false,
+            database_container: None,
+        };
+    }
     if kind.db_dir.is_some() {
         if marker.recovery_evidence_version != Some(1) || marker.mutation_started.is_none() {
             return unavailable(
@@ -1062,6 +1070,90 @@ mod tests {
         )
         .unwrap();
         assert!(reconcile(&fx.context(), &targeted(&fx, "site.importArchive")).is_err());
+        assert!(fx.www("site/partial.txt").exists());
+    }
+    fn verified_checkpoint(fx: &Fx, started: bool) -> PathBuf {
+        fx.interrupted_db_operation(true, Some(true), Some(DUMP), (started, true, true));
+        let hash = resource_lock::canonical_hash(&fx.www("site"));
+        let scope = fx.base.join(format!("state/wordpress-clone/{hash}"));
+        fs::rename(fx.base.join("state/wordpress-clone/abc"), &scope).unwrap();
+        let path = scope.join("pending.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["recoveryEvidenceVersion"] = 1.into();
+        value["mutationStarted"] = started.into();
+        value["databaseContainerId"] = "a".repeat(64).into();
+        let dump = fx
+            .base
+            .join(format!("recovery/wordpress-clone/{ID}/target.sql"));
+        fs::set_permissions(&dump, fs::Permissions::from_mode(0o600)).unwrap();
+        value["databaseSnapshotSha256"] =
+            crate::recovery_evidence::digest(fs::File::open(dump).unwrap())
+                .unwrap()
+                .into();
+        fs::write(&path, value.to_string()).unwrap();
+        path
+    }
+    #[test]
+    fn untouched_verified_checkpoint_only_clears_without_writing_current_files_or_sql() {
+        let fx = Fx::new();
+        let path = verified_checkpoint(&fx, false);
+        fs::write(fx.www("site/partial.txt"), "external sentinel").unwrap();
+        let result = reconcile(&fx.context(), &targeted(&fx, "wordpress.clone")).unwrap();
+        assert_eq!(result.cleared.len(), 1);
+        assert!(!path.exists());
+        assert!(fx.calls().is_empty());
+        assert_eq!(
+            fs::read_to_string(fx.www("site/partial.txt")).unwrap(),
+            "external sentinel"
+        );
+    }
+    #[test]
+    fn missing_phase_and_modified_snapshot_refuse_content_mutation() {
+        for corrupt_phase in [true, false] {
+            let fx = Fx::new();
+            let path = verified_checkpoint(&fx, true);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            if corrupt_phase {
+                value.as_object_mut().unwrap().remove("mutationStarted");
+            } else {
+                value["databaseSnapshotSha256"] = "0".repeat(64).into();
+            }
+            fs::write(&path, value.to_string()).unwrap();
+            let mut req = targeted(&fx, "wordpress.clone");
+            req.mariadb_root_passwords
+                .insert("mariadb".into(), "s3cret".into());
+            assert!(reconcile(&fx.context(), &req).is_err());
+            assert!(path.exists());
+            assert!(fx.calls().is_empty());
+            assert!(fx.www("site/partial.txt").exists());
+        }
+    }
+    #[test]
+    fn unproven_database_client_preserves_unknown_recovery_and_checkpoint() {
+        let fx = Fx::new();
+        let path = verified_checkpoint(&fx, true);
+        let mut req = targeted(&fx, "wordpress.clone");
+        req.mariadb_root_passwords
+            .insert("mariadb".into(), "s3cret".into());
+        assert!(matches!(
+            reconcile(&fx.context(), &req),
+            Err(Error::RecoveryUncertain)
+        ));
+        let scope = fx
+            .state
+            .open_managed_dir(&crate::site_archive::rel(&format!(
+                "site-content-recovery/{ID}"
+            )))
+            .unwrap();
+        let status = state::load(
+            &scope,
+            &crate::site_archive::rel(&format!("transactions/{RECONCILE_ID}.json")),
+        )
+        .unwrap();
+        assert_eq!(status.status, TransactionStatus::InProgress);
+        assert!(path.exists());
         assert!(fx.www("site/partial.txt").exists());
     }
     #[test]
