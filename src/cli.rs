@@ -1745,6 +1745,14 @@ pub enum SiteCommand {
     },
     /// Roll back `site.importArchive`, `wordpress.migrateImport` and
     /// `wordpress.clone` runs that a killed engine left half done.
+    RecoverContent {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: String,
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+    },
     Reconcile {
         #[arg(long = "request-id")]
         request_id: String,
@@ -1839,6 +1847,7 @@ impl SiteCommand {
             Self::ExportArchive { .. } => "site.exportArchive",
             Self::ImportArchive { .. } => "site.importArchive",
             Self::DiscardArchive { .. } => "site.discardArchive",
+            Self::RecoverContent { .. } => "site.recoverContent",
             Self::Reconcile { .. } => "site.reconcile",
             Self::MigrateRuntime { .. } => "site.migrateRuntime",
         }

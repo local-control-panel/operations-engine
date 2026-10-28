@@ -51,6 +51,8 @@ struct Plan {
     mariadb_container: String,
     db_name: String,
     db_root_password: String,
+    #[serde(default)]
+    recovery_evidence: bool,
     /// Safety defaults for the copy; empty for a plain clone. Closed set, see
     /// [`StagingDefaults`].
     #[serde(default)]
@@ -94,6 +96,7 @@ impl StagingDefaults {
     }
 }
 
+#[derive(Clone)]
 pub struct Request {
     source_container: ContainerName,
     source_root: PathBuf,
@@ -110,6 +113,8 @@ pub struct Request {
     mariadb_container: ContainerName,
     db_name: DatabaseName,
     db_root_password: String,
+    recovery_evidence: bool,
+    original_database_container: Option<ContainerName>,
     staging_defaults: StagingDefaults,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
@@ -187,6 +192,8 @@ impl Request {
             db_name: DatabaseName::parse(&plan.db_name)
                 .map_err(|_: RestoreRequestError| RequestError)?,
             db_root_password: plan.db_root_password,
+            recovery_evidence: plan.recovery_evidence,
+            original_database_container: None,
             staging_defaults: StagingDefaults::parse(&plan.staging_defaults)?,
             request_id: RequestId::parse(request_id).map_err(|_| RequestError)?,
             idempotency_key: key
@@ -286,6 +293,29 @@ pub fn execute(
     req: &Request,
     cancel: &CancellationToken,
 ) -> Result<CloneResult, Error> {
+    let pinned;
+    if req.recovery_evidence
+        && ["mysql", "sys", "information_schema", "performance_schema"]
+            .iter()
+            .any(|name| req.db_name.as_str().eq_ignore_ascii_case(name))
+    {
+        return Err(Error::UnsafeTarget);
+    }
+    let req = if req.recovery_evidence {
+        let id = crate::recovery_evidence::container_id(
+            ctx.docker_program,
+            req.mariadb_container.as_str(),
+        )
+        .map_err(Error::Io)?;
+        let mut copy = req.clone();
+        copy.original_database_container = Some(req.mariadb_container.clone());
+        copy.mariadb_container = ContainerName::parse(&id).map_err(|_| Error::UnsafeTarget)?;
+        pinned = copy;
+        &pinned
+    } else {
+        req
+    };
+
     let hash = resource_lock::canonical_hash(&req.staging_root);
     let scope_path = SiteRelativePath::parse(format!("wordpress-clone/{hash}")).unwrap();
     ctx.engine_state
@@ -647,6 +677,22 @@ fn clone_with_recovery(
             &step_limits(),
             cancel,
         ))?;
+        if req.recovery_evidence {
+            crate::recovery_evidence::record(
+                scope,
+                &pending,
+                ctx.dump_managed,
+                &recovery_sql,
+                req.original_database_container
+                    .as_ref()
+                    .expect("pinned name")
+                    .as_str(),
+                req.mariadb_container.as_str(),
+            )
+            .map_err(Error::Io)?;
+            crate::failpoint::hit("content.after-snapshot");
+            crate::recovery_evidence::mutation_started(scope, &pending).map_err(Error::Io)?;
+        }
         staging.create_dir(&saved_dir).map_err(Error::Io)?;
         staging.set_mode(&saved_dir, 0o700).map_err(Error::Io)?;
         match staging.rename(relative, &saved_files) {
@@ -687,7 +733,13 @@ fn clone_with_recovery(
             ("DB_NAME", req.db_name.as_str()),
             ("DB_USER", req.db_user.as_str()),
             ("DB_PASSWORD", req.db_password.as_str()),
-            ("DB_HOST", req.mariadb_container.as_str()),
+            (
+                "DB_HOST",
+                req.original_database_container
+                    .as_ref()
+                    .unwrap_or(&req.mariadb_container)
+                    .as_str(),
+            ),
         ] {
             // WP-CLI reads the value from stdin, keeping credentials out of argv.
             critical(process::run_with_stdin_bytes(
@@ -720,6 +772,7 @@ fn clone_with_recovery(
         crate::failpoint::hit("clone.before-db");
         restore(ctx, req, &source_sql, cancel)?;
         crate::failpoint::hit("clone.after-db");
+        verify_database_identity(ctx, req)?;
         wp_step(
             ctx,
             req,
@@ -761,10 +814,14 @@ fn clone_with_recovery(
             )?;
         }
         wp_step(ctx, req, &["core", "is-installed"], cancel)?;
+        verify_database_identity(ctx, req)?;
         Ok(())
     })();
     let _ = ctx.dump_managed.remove_file(&source_sql);
     if let Err(error) = work {
+        if req.recovery_evidence {
+            return Err(Error::RecoveryRequired);
+        }
         // A cancelled forward operation must still be allowed to recover.
         let recovered_db = !database_mutated
             || restore(ctx, req, &recovery_sql, &CancellationToken::default()).is_ok();
@@ -814,6 +871,19 @@ fn restore(
         cancel,
     )
     .map_err(Error::Import)
+}
+
+fn verify_database_identity(ctx: &Context<'_>, req: &Request) -> Result<(), Error> {
+    if let Some(name) = req.original_database_container.as_ref() {
+        if crate::recovery_evidence::container_id(ctx.docker_program, name.as_str())
+            .ok()
+            .as_deref()
+            != Some(req.mariadb_container.as_str())
+        {
+            return Err(Error::RecoveryRequired);
+        }
+    }
+    Ok(())
 }
 
 fn critical(output: Result<process::ProcessOutput, ProcessRunError>) -> Result<(), Error> {

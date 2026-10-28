@@ -300,7 +300,20 @@ fn resource_status(
         };
         match operation_status::load_resource(&root, &config.content_roots, operation, resource, id)
         {
-            Ok(v) => Response::success(NAME, v),
+            Ok(v) => {
+                let recovery = crate::site_reconcile::recovery_info(
+                    &root,
+                    &config.content_roots,
+                    operation,
+                    resource,
+                    id,
+                    v.active,
+                );
+                let mut value = serde_json::to_value(v).expect("status serializes");
+                value["recovery"] =
+                    serde_json::to_value(recovery).expect("recovery info serializes");
+                Response::success(NAME, value)
+            }
             Err(StatusError::NotFound) => Ok(Response::failure(
                 NAME,
                 ErrorCode::NotFound,

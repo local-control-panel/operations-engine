@@ -935,11 +935,15 @@ pub fn recover(
     else {
         return Recovery::Attention("the journal has an invalid name".into());
     };
-    let mut journal: Journal = match scope
-        .read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-    {
+    let mut journal: Journal = match scope.open_regular_read(&path).ok().and_then(|file| {
+        use std::io::Read;
+        let mut text = String::new();
+        file.take(65537).read_to_string(&mut text).ok()?;
+        if text.len() > 65536 {
+            return None;
+        }
+        serde_json::from_str(&text).ok()
+    }) {
         Some(journal) => journal,
         None => return Recovery::Attention("the journal cannot be read".into()),
     };

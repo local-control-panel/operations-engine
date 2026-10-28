@@ -76,11 +76,14 @@ struct Plan {
     /// is not the container name `docker exec` uses.
     db_host: String,
     db_root_password: String,
+    #[serde(default)]
+    recovery_evidence: bool,
     db_name: String,
     db_user: String,
     db_password: String,
 }
 
+#[derive(Clone)]
 pub struct Request {
     manifest: Manifest,
     source_domain: Domain,
@@ -92,6 +95,8 @@ pub struct Request {
     mariadb_container: ContainerName,
     db_host: ContainerName,
     db_root_password: String,
+    recovery_evidence: bool,
+    original_database_container: Option<ContainerName>,
     db_name: DatabaseName,
     db_user: DatabaseName,
     db_password: String,
@@ -153,6 +158,8 @@ impl Request {
                 .map_err(|_| RequestError)?,
             db_host: ContainerName::parse(&plan.db_host).map_err(|_| RequestError)?,
             db_root_password: plan.db_root_password,
+            recovery_evidence: plan.recovery_evidence,
+            original_database_container: None,
             db_name: DatabaseName::parse(&plan.db_name).map_err(|_| RequestError)?,
             db_user: DatabaseName::parse(&plan.db_user).map_err(|_| RequestError)?,
             db_password: plan.db_password,
@@ -285,6 +292,32 @@ pub fn execute(
     req: &Request,
     cancel: &CancellationToken,
 ) -> Result<ImportResult, Error> {
+    let pinned;
+    if req.recovery_evidence
+        && ["mysql", "sys", "information_schema", "performance_schema"]
+            .iter()
+            .any(|name| req.db_name.as_str().eq_ignore_ascii_case(name))
+    {
+        return Err(Error::UnsafeTarget);
+    }
+    if req.recovery_evidence && req.db_host != req.mariadb_container {
+        return Err(Error::UnsafeTarget);
+    }
+    let req = if req.recovery_evidence {
+        let id = crate::recovery_evidence::container_id(
+            ctx.docker_program,
+            req.mariadb_container.as_str(),
+        )
+        .map_err(Error::Io)?;
+        let mut copy = req.clone();
+        copy.original_database_container = Some(req.mariadb_container.clone());
+        copy.mariadb_container = ContainerName::parse(&id).map_err(|_| Error::UnsafeTarget)?;
+        pinned = copy;
+        &pinned
+    } else {
+        req
+    };
+
     let manifest = &req.manifest;
     if manifest.database_uncompressed_bytes > MAX_DUMP_BYTES
         || manifest.file_content_bytes > MAX_FILES_BYTES
@@ -504,6 +537,22 @@ fn import_with_recovery(
             cancel,
         ))?;
 
+        if req.recovery_evidence {
+            crate::recovery_evidence::record(
+                scope,
+                &pending,
+                ctx.recovery_managed,
+                &recovery_sql,
+                req.original_database_container
+                    .as_ref()
+                    .expect("pinned name")
+                    .as_str(),
+                req.mariadb_container.as_str(),
+            )
+            .map_err(Error::Io)?;
+            crate::failpoint::hit("content.after-snapshot");
+            crate::recovery_evidence::mutation_started(scope, &pending).map_err(Error::Io)?;
+        }
         content.create_dir(&saved_dir).map_err(Error::Io)?;
         content.set_mode(&saved_dir, 0o700).map_err(Error::Io)?;
         if target_exists {
@@ -567,6 +616,7 @@ fn import_with_recovery(
         }
         critical(Ok(output))?;
         crate::failpoint::hit("migrate-import.after-db");
+        verify_database_identity(ctx, req)?;
 
         if req.source_domain.as_str() != req.dest_domain.as_str() {
             critical(process::run(
@@ -586,10 +636,14 @@ fn import_with_recovery(
             &step_limits(),
             cancel,
         ))?;
+        verify_database_identity(ctx, req)?;
         Ok(())
     })();
 
     if let Err(error) = work {
+        if req.recovery_evidence {
+            return Err(Error::RecoveryRequired);
+        }
         // A cancelled forward operation must still be allowed to recover.
         let recovered_db = !database_mutated
             || restore_snapshot(ctx, req, &recovery_sql, &CancellationToken::default()).is_ok();
@@ -658,6 +712,19 @@ fn wp(ctx: &Context<'_>, req: &Request) -> ProcessRequest {
         "--skip-plugins".into(),
         "--skip-themes".into(),
     ])
+}
+
+fn verify_database_identity(ctx: &Context<'_>, req: &Request) -> Result<(), Error> {
+    if let Some(name) = req.original_database_container.as_ref() {
+        if crate::recovery_evidence::container_id(ctx.docker_program, name.as_str())
+            .ok()
+            .as_deref()
+            != Some(req.mariadb_container.as_str())
+        {
+            return Err(Error::RecoveryRequired);
+        }
+    }
+    Ok(())
 }
 
 fn critical(output: Result<process::ProcessOutput, ProcessRunError>) -> Result<(), Error> {

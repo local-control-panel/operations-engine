@@ -1153,3 +1153,37 @@ provide online restore, automatic application maintenance or cross-database
 atomicity. The existing `db.restore` raw import remains for compatibility and
 for existing enclosing CMS transactions; clients requiring snapshot protection
 must negotiate `db.restoreProtected` and must not fall back to raw import.
+
+## Resource status and explicit content recovery
+
+`operation resource-status --resource-operation <operation> --resource <resource> --request-id <id>`
+selects only fixed operation scopes. Resource is the normalized remote root for CMS/archive
+operations, domain for runtime migration, runtime ID for runtime config, `wp-stack` for
+Meilisearch, `server` for Docker installation/start, or an opaque image identity for pulls.
+It returns bounded transaction identity/status and `outcomeKnown`, never stored plugin
+output or free-form errors. `recovery` contains safe availability/reason and optionally the
+validated database container name. Missing status never implies success or permission to replay.
+Lexical root aliases are normalized by clients; symlink aliases still require operator review.
+
+`site recover-content --request-file <private-root-owned-json> --request-id <new-id>
+--idempotency-key <key>` recovers exactly one checkpoint, never scans a server.
+Document: `{"target":{"operation":"wordpress.clone","resource":"/var/www/stage",
+"originalRequestId":"<uuid>","confirmOffline":true,"confirmClientsStopped":true},
+"mariadbRootPasswords":{"<container>":"<secret>"}}`. The confirmations mean the site is
+offline and every previous import, rollback and CMS database client has been stopped.
+Supported original operations: site.importArchive, wordpress.clone, joomla.clone,
+wordpress.migrateImport and site.migrateRuntime. Recovery has its own persisted status
+under `site-content-recovery/<original-id>`; resourceStatus uses operation site.recoverContent
+and resource original request UUID. Same-key recovery replays its own original outcome.
+
+The `contentRecoveryEvidence` feature permits clone/migrate plans to opt in with
+`recoveryEvidence:true`. Database snapshots then record an immutable Docker container ID,
+SHA-256 and a durable mutation boundary; SQL clients use the pinned container. Failures
+retain the checkpoint instead of speculative automatic compensation. Explicit restore
+refuses replaced containers, modified snapshots, live owners and legacy evidence, and
+requires independent in-container completion proof. Loss of proof leaves the recovery
+IN_PROGRESS. A later attempt requires fresh explicit confirmation that prior clients stopped.
+A partial file rollback whose prior files cannot be proved remains manual. No automatic
+rollback is provided for incremental WXR imports, WordPress updates, Meilisearch upgrades,
+host package installation or image pulls: their status is inspectable, and retained artifacts
+and live services require manual assessment.

@@ -64,6 +64,8 @@ pub mod pg_provision;
 pub mod pg_user;
 pub mod process;
 pub mod protocol;
+#[cfg(unix)]
+pub mod recovery_evidence;
 pub mod rollback;
 pub mod runtime_config;
 pub mod secret_result;

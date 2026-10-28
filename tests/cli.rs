@@ -188,6 +188,7 @@ fn capabilities_describe_only_implemented_operations() {
             "site.importArchive",
             "site.discardArchive",
             "site.reconcile",
+            "site.recoverContent",
             "site.migrateRuntime",
             "system.service",
             "compose.action",

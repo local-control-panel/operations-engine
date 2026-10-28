@@ -26,6 +26,25 @@ use std::{
 
 pub const OPERATION: &str = "db.restoreProtected";
 pub const RECOVER_OPERATION: &str = "db.recoverRestore";
+
+/// A surrounding content transaction owns the lock, evidence and terminal state.
+/// This only replays a validated private snapshot with independent client proof.
+pub(crate) fn restore_snapshot_file(
+    c: &RestoreContext<'_>,
+    r: &RestoreRequest,
+    file: File,
+    expected_container_id: &str,
+) -> Result<(), Error> {
+    if container_id(c, r)? != expected_container_id {
+        return Err(Error::RecoveryRequired);
+    }
+    let pinned = bound_request(r, expected_container_id);
+    let cancel = CancellationToken::default();
+    if !run_client(c, &pinned, file, true, &cancel)? || !verify(c, &pinned, &cancel) {
+        return Err(Error::RecoveryRequired);
+    }
+    Ok(())
+}
 const TIMEOUT: Duration = Duration::from_secs(3600);
 const MAX_MARKER: u64 = 16 * 1024;
 

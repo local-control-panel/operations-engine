@@ -251,6 +251,10 @@ pub fn resource_scope(
                 }
                 .into()
             }
+            "site.recoverContent" => format!(
+                "site-content-recovery/{}",
+                RequestId::parse(resource).map_err(|_| StatusError::InvalidScope)?
+            ),
             "site.migrateRuntime" => format!(
                 "site-migrate-runtime/{}",
                 crate::site::Domain::parse(resource).map_err(|_| StatusError::InvalidScope)?
