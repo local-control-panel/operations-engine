@@ -810,6 +810,102 @@ fn recover_original(
     })
 }
 
+/// Bounded metadata for a confirmed native recovery flow. Never includes SQL,
+/// snapshot hashes, credentials, request payloads or recorded outcome messages.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryInfo {
+    pub original_request_id: String,
+    pub database: String,
+    pub db_type: String,
+    pub container: String,
+    pub active: bool,
+    pub status: TransactionStatus,
+    pub recoverable: bool,
+}
+
+pub const RECOVERY_INFO_OPERATION: &str = "db.restoreRecoveryInfo";
+pub fn recovery_info(
+    context: &RestoreContext<'_>,
+    database: &str,
+    original_id: &str,
+) -> Result<RecoveryInfo, Error> {
+    use std::os::fd::AsRawFd;
+    let database = super::DatabaseName::parse(database).map_err(|_| Error::Invalid)?;
+    let id = RequestId::parse(original_id).map_err(|_| Error::Invalid)?;
+    let scope = context
+        .engine_state
+        .open_managed_dir(&rel(format!("db-restore/{}", database.as_str())))?;
+    let mut bytes = Vec::new();
+    scope
+        .open_regular_read(&state_path(id))?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(Error::RecoveryRequired);
+    }
+    let tx = state::decode(&bytes).map_err(|_| Error::RecoveryRequired)?;
+    if tx.request_id != id || tx.operation != OPERATION {
+        return Err(Error::Conflict);
+    }
+    let pending = read_pending(&scope)?.ok_or(Error::Conflict)?;
+    if pending.request_id != original_id
+        || pending.database != database.as_str()
+        || pending.container_id.len() != 64
+        || !pending.container_id.bytes().all(|b| b.is_ascii_hexdigit())
+        || pending.snapshot_sha256.len() != 64
+        || !pending
+            .snapshot_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(Error::RecoveryRequired);
+    }
+    let request = RestoreRequest::parse(
+        &pending.db_type,
+        &pending.database,
+        &pending.container,
+        "",
+        "",
+        original_id,
+        None,
+    )
+    .map_err(|_| Error::RecoveryRequired)?;
+    let snapshot = scope
+        .open_regular_read(&snapshot_path(id))
+        .map_err(|_| Error::RecoveryRequired)?;
+    if snapshot.metadata()?.len() == 0 {
+        return Err(Error::RecoveryRequired);
+    }
+    // Probe an existing regular descriptor: discovery must not create a missing lock.
+    let lock = scope
+        .open_regular_read(&preflight::lock_path())
+        .map_err(|_| Error::RecoveryRequired)?;
+    // SAFETY: the live File owns this valid descriptor for the whole lock probe.
+    let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let active = if result == 0 {
+        // SAFETY: unlock the same descriptor while its File remains alive.
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        false
+    } else if io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock {
+        true
+    } else {
+        return Err(Error::RecoveryRequired);
+    };
+    if container_id(context, &request)? != pending.container_id {
+        return Err(Error::Conflict);
+    }
+    Ok(RecoveryInfo {
+        original_request_id: original_id.into(),
+        database: pending.database,
+        db_type: pending.db_type,
+        container: pending.container,
+        active,
+        status: tx.status,
+        recoverable: !active && tx.status == TransactionStatus::InProgress,
+    })
+}
+
 /// Discovery never reads the SQL snapshot or exposes its hash/content.
 pub fn available(scope: &ManagedRoot, tx: &TransactionState) -> bool {
     tx.operation == OPERATION
@@ -1218,5 +1314,84 @@ printf '%s\n' "$input" > "$base/database"
         )
         .unwrap();
         assert_eq!(h.data(), "OLD DATA\n");
+    }
+    #[test]
+    fn native_recovery_info_is_bounded_redacted_and_refuses_other_identity() {
+        let h = Host::new();
+        h.pending();
+        let info = recovery_info(&h.context(), "site_db", ID).unwrap();
+        assert!(info.recoverable);
+        assert!(!info.active);
+        assert_eq!(info.db_type, "mariadb");
+        let json = serde_json::to_string(&info).unwrap();
+        for forbidden in [
+            "snapshotSha256",
+            "rootPassword",
+            "never-log-this-secret",
+            "filePath",
+            "OLD DATA",
+        ] {
+            assert!(!json.contains(forbidden));
+        }
+        assert!(recovery_info(&h.context(), "site_db", RETRY).is_err());
+        h.scope()
+            .write_atomic(
+                &state_path(RequestId::parse(ID).unwrap()),
+                &vec![b' '; 1024 * 1024 + 1],
+            )
+            .unwrap();
+        assert!(matches!(
+            recovery_info(&h.context(), "site_db", ID),
+            Err(Error::RecoveryRequired)
+        ));
+    }
+    #[test]
+    fn native_recovery_info_refuses_a_recreated_container() {
+        let h = Host::new();
+        h.pending();
+        let scope = h.scope();
+        let mut pending = read_pending(&scope).unwrap().unwrap();
+        pending.container_id = "1".repeat(64);
+        scope
+            .write_atomic_private(&marker(), &serde_json::to_vec(&pending).unwrap())
+            .unwrap();
+        assert!(matches!(
+            recovery_info(&h.context(), "site_db", ID),
+            Err(Error::Conflict)
+        ));
+    }
+    #[test]
+    fn native_recovery_info_never_offers_recovery_with_a_live_owner() {
+        let h = Host::new();
+        h.pending();
+        let scope = h.scope();
+        let _guard = crate::transaction::lock::acquire(
+            &scope,
+            &preflight::lock_path(),
+            RequestId::parse(RETRY).unwrap(),
+        )
+        .unwrap();
+        let info = recovery_info(&h.context(), "site_db", ID).unwrap();
+        assert!(info.active);
+        assert!(!info.recoverable);
+    }
+    #[test]
+    fn native_recovery_info_refuses_symlink_snapshot_and_corrupt_marker() {
+        let h = Host::new();
+        h.pending();
+        let scope = h.scope();
+        let path = snapshot_path(RequestId::parse(ID).unwrap());
+        scope.remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(
+            &h.input,
+            h.dir
+                .path()
+                .join("state/db-restore/site_db")
+                .join(path.as_path()),
+        )
+        .unwrap();
+        assert!(recovery_info(&h.context(), "site_db", ID).is_err());
+        scope.write_atomic_private(&marker(), b"{}").unwrap();
+        assert!(recovery_info(&h.context(), "site_db", ID).is_err());
     }
 }
