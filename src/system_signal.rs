@@ -665,10 +665,8 @@ mod tests {
         let req = Request::parse(child.id(), Some("KILL"), Some("php-fpm"), ID, None).unwrap();
         let err = execute(&ctx(&state), &req).unwrap_err();
         assert_eq!(err.protocol().0, ErrorCode::Conflict);
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "mismatched process must survive"
-        );
+        let st = child.try_wait().unwrap();
+        assert!(st.is_none(), "mismatched process must survive: {st:?} err={err:?}");
         child.kill().unwrap();
         child.wait().unwrap();
     }
