@@ -14,7 +14,7 @@ pub fn render(domain: &Domain, spa: bool) -> String {
     )
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]

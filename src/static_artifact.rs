@@ -273,7 +273,6 @@ mod tests {
         ManagedRoot::open(&TrustedRoot::parse(dir.path()).unwrap()).unwrap()
     }
     #[test]
-    #[ignore = "exp"]
     fn accepts_static_files_and_counts_them() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("index.html"), "ok").unwrap();
@@ -285,7 +284,6 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "exp"]
     fn rejects_secrets_php_and_symlinks() {
         for name in [
             ".env",
@@ -306,7 +304,6 @@ mod tests {
         assert!(inspect(&root(&d)).is_err());
     }
     #[test]
-    #[ignore = "exp"]
     fn refuses_hard_links_and_missing_index() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("a.txt"), "ok").unwrap();
@@ -317,7 +314,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exp"]
     fn rejects_large_files_and_excessive_depth() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("index.html"), "ok").unwrap();
@@ -336,7 +332,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exp"]
     fn rejects_dependency_and_symlinked_directories() {
         let d = tempfile::tempdir().unwrap();
         fs::write(d.path().join("index.html"), "ok").unwrap();
@@ -361,7 +356,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "exp"]
     fn refuses_to_copy_a_symlink_even_when_it_looks_like_an_asset() {
         let source = tempfile::tempdir().unwrap();
         let dest = tempfile::tempdir().unwrap();

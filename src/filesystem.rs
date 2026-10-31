@@ -578,9 +578,6 @@ impl ManagedRoot {
         self.directory.read_link(link.as_path())
     }
 
-    /// Renames `from` to `to` within this same directory. This is the
-    /// atomic commit point for callers that stage a temp file or symlink
-    /// under `from` and want it to become `to` in one step.
     /// Moves a private staged tree into another managed root. Cross-device
     /// renames fail closed; no copy fallback may expose partial content.
     pub fn rename_to(
@@ -593,6 +590,9 @@ impl ManagedRoot {
             .rename(from.as_path(), &destination.directory, to.as_path())
     }
 
+    /// Renames `from` to `to` within this same directory. This is the
+    /// atomic commit point for callers that stage a temp file or symlink
+    /// under `from` and want it to become `to` in one step.
     pub fn rename(&self, from: &SiteRelativePath, to: &SiteRelativePath) -> io::Result<()> {
         self.directory
             .rename(from.as_path(), &self.directory, to.as_path())

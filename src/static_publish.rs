@@ -423,7 +423,7 @@ pub fn recover(
     status(state_root, domain, id)
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::site::TrustedRoot;
