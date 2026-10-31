@@ -1145,7 +1145,7 @@ $settings['hash_salt'] = 'OLDSALTOLDSALT';
 $settings['config_sync_directory'] = '../config/sync';
 "#;
 
-    fn overrides<'a>(source: &'a std::path::Path, defaults: StagingDefaults) -> Overrides<'a> {
+    fn overrides(source: &std::path::Path, defaults: StagingDefaults) -> Overrides<'_> {
         Overrides {
             db_name: "staging_db",
             db_user: "staging_user",
