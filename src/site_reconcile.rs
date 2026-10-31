@@ -69,7 +69,7 @@ struct Kind {
     drop_db_dir: bool,
 }
 
-const KINDS: [Kind; 4] = [
+const KINDS: [Kind; 5] = [
     Kind {
         operation: "site.importArchive",
         scope: "site-archive-import",
@@ -100,6 +100,14 @@ const KINDS: [Kind; 4] = [
         scope_per_root: true,
         snapshot_prefix: ".wcp-jclone-",
         db_dir: Some("joomla-clone"),
+        drop_db_dir: false,
+    },
+    Kind {
+        operation: "drupal.clone",
+        scope: "drupal-clone",
+        scope_per_root: true,
+        snapshot_prefix: ".wcp-dclone-",
+        db_dir: Some("drupal-clone"),
         drop_db_dir: false,
     },
 ];

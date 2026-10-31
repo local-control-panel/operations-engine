@@ -635,6 +635,45 @@ rejected): `noindex` (`robots` = `noindex, nofollow`) and `blockMail`
 Joomla keeps few absolute URLs and a blind replace could damage serialized
 data.
 
+## `drupal.clone`
+
+`drupal clone` accepts a root-owned JSON request naming the source and staging
+project roots (each beneath a configured content root, neither nested inside the
+other), an optional `documentRoot` (a plain relative path, empty for the classic
+layout, `web` for a Composer project), the source and staging runtime containers
+with their UID/GID, the MariaDB container, the already-provisioned staging
+database, its user and password, the MariaDB root password, an optional
+`stagingDomain` (a lower-case DNS name) and `recoveryEvidence`. The source must be
+a single-site Drupal (`sites/default/settings.php`, a regular file with no
+symlinked component) whose own Drush (`drush status`, no password in its output)
+reports a `mysql` database on that same MariaDB container, different from the
+staging database; anything else is refused before the staging site is touched.
+
+Under locks on both roots the engine dumps the staging database and moves any
+existing staging files aside, copies the source with a bounded `cp -a`, and
+appends exactly one generated override block to the copy's `settings.php`:
+database name/user/password/host, a freshly generated 64-character `hash_salt`
+(a copy never shares the source's one-time-link and session trust), the optional
+`trusted_host_patterns` for `stagingDomain`, and, with `blockMail`, the
+`test_mail_collector` mail interface. `settings.php` is arbitrary PHP: the
+engine parses and evaluates nothing, refuses a file that closes PHP with `?>` or
+names the source directory, writes through a temporary file and a rename
+keeping the mode, and never writes the source. The source database is dumped
+read-only (`--single-transaction`) and imported with the `db.restore` client,
+the copy is re-chowned to the staging UID/GID, and Drush run against the copy
+must report the copy's own database as connected and bootstrapped. Only then
+does `sanitize` run `drush sql:sanitize --yes` (user emails and passwords), and
+the copy is checked again, so a rewrite that did not take effect can never
+sanitise the source. Failure restores the staging database and files; an
+interrupted run leaves `pending.json` that `site.reconcile` rolls back, like
+`wordpress.clone` and `joomla.clone`. A file or config directory the source
+keeps outside its project root (an absolute private path) is shared with the
+copy. Idempotent and transaction/audit recorded.
+
+`stagingDefaults` is a closed list (anything else is rejected): `sanitize` and
+`blockMail`. `recoveryEvidence` behaves as for `wordpress.clone` (pinned
+database container, retained checkpoint instead of speculative rollback).
+
 ## `wordpress.updateCore`
 
 `wordpress update-core` accepts a root-owned typed request containing the
@@ -1197,7 +1236,7 @@ Document: `{"target":{"operation":"wordpress.clone","resource":"/var/www/stage",
 "originalRequestId":"<uuid>","confirmOffline":true,"confirmClientsStopped":true},
 "mariadbRootPasswords":{"<container>":"<secret>"}}`. The confirmations mean the site is
 offline and every previous import, rollback and CMS database client has been stopped.
-Supported original operations: site.importArchive, wordpress.clone, joomla.clone,
+Supported original operations: site.importArchive, wordpress.clone, joomla.clone, drupal.clone,
 wordpress.migrateImport and site.migrateRuntime. Recovery has its own persisted status
 under `site-content-recovery/<original-id>`; resourceStatus uses operation site.recoverContent
 and resource original request UUID. Same-key recovery replays its own original outcome.
