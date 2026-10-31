@@ -524,6 +524,13 @@ mod tests {
         panic!("child never reached its comm");
     }
 
+    /// A refused request must leave the child running; when it did not, say how
+    /// it ended so a flaky runner shows whether it was signalled or exited.
+    fn assert_alive(child: &mut Child, message: &str) {
+        let status = child.try_wait().unwrap();
+        assert!(status.is_none(), "{message}: child ended with {status:?}");
+    }
+
     fn request(pid: u32, signal: &str, id: &str) -> Request {
         Request::parse(pid, Some(signal), None, id, None).unwrap()
     }
@@ -645,10 +652,7 @@ mod tests {
         let (_dir, mut child) = spawn_named("sshd");
         let err = execute(&ctx(&state), &request(child.id(), "KILL", ID)).unwrap_err();
         assert_eq!(err.protocol().0, ErrorCode::InvalidInput);
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "protected process must survive"
-        );
+        assert_alive(&mut child, "protected process must survive");
         child.kill().unwrap();
         child.wait().unwrap();
 
@@ -668,10 +672,7 @@ mod tests {
         let req = Request::parse(child.id(), Some("KILL"), Some("php-fpm"), ID, None).unwrap();
         let err = execute(&ctx(&state), &req).unwrap_err();
         assert_eq!(err.protocol().0, ErrorCode::Conflict);
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "mismatched process must survive"
-        );
+        assert_alive(&mut child, "mismatched process must survive");
         child.kill().unwrap();
         child.wait().unwrap();
     }
