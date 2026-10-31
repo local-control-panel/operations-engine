@@ -15,6 +15,17 @@ use crate::{
 
 pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
     match command {
+        SiteCommand::PublishStatic {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::static_publish_host::publish(&request_file, &request_id, &idempotency_key),
+        SiteCommand::StaticStatus { domain, request_id } => {
+            crate::static_publish_host::status(&domain, &request_id)
+        }
+        SiteCommand::RecoverStatic { domain, request_id } => {
+            crate::static_publish_host::recover(&domain, &request_id)
+        }
         SiteCommand::Create {
             request_file,
             request_id,

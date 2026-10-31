@@ -1458,6 +1458,27 @@ pub enum SiteCommand {
         #[arg(long = "request-id")]
         request_id: String,
     },
+    /// Publish a prebuilt static directory without running build scripts.
+    PublishStatic {
+        #[arg(long)]
+        request_file: PathBuf,
+        #[arg(long)]
+        request_id: String,
+        #[arg(long)]
+        idempotency_key: String,
+    },
+    StaticStatus {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        request_id: String,
+    },
+    RecoverStatic {
+        #[arg(long)]
+        domain: String,
+        #[arg(long)]
+        request_id: String,
+    },
     /// Create a PHP site as one server-owned, recoverable operation.
     Create {
         #[arg(long = "request-file")]
@@ -1825,6 +1846,9 @@ impl SiteCommand {
             Self::List => "site.list",
             Self::AdminUsers { .. } => "site.adminUsers",
             Self::AdminLogin { .. } => "site.adminLogin",
+            Self::PublishStatic { .. } => "site.publishStatic",
+            Self::StaticStatus { .. } => "site.staticStatus",
+            Self::RecoverStatic { .. } => "site.recoverStatic",
             Self::Create { .. } => "site.create",
             Self::RecoverCreate { .. } => "site.recoverCreate",
             Self::RecoverDeployment { .. } => "site.recoverDeployment",
