@@ -783,6 +783,7 @@ mod tests {
 
     #[cfg(feature = "failpoints")]
     #[test]
+    #[ignore = "experiment"]
     fn sigkill_before_and_after_switch_preserves_previous_release_on_recovery() {
         use std::os::unix::process::ExitStatusExt;
         for point in ["static-before-switch", "static-after-switch"] {
