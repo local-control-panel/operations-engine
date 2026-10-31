@@ -666,7 +666,10 @@ mod tests {
         let err = execute(&ctx(&state), &req).unwrap_err();
         assert_eq!(err.protocol().0, ErrorCode::Conflict);
         let st = child.try_wait().unwrap();
-        assert!(st.is_none(), "mismatched process must survive: {st:?} err={err:?}");
+        assert!(
+            st.is_none(),
+            "mismatched process must survive: {st:?} err={err:?}"
+        );
         child.kill().unwrap();
         child.wait().unwrap();
     }
