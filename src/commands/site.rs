@@ -92,7 +92,12 @@ pub fn run(command: SiteCommand) -> Result<Response, ResponseBuildError> {
         SiteCommand::Reconcile {
             request_id,
             request_file,
-        } => reconcile(&request_id, request_file.as_deref()),
+        } => reconcile(&request_id, request_file.as_deref(), None),
+        SiteCommand::RecoverContent {
+            request_id,
+            idempotency_key,
+            request_file,
+        } => reconcile(&request_id, Some(&request_file), Some(&idempotency_key)),
         SiteCommand::MigrateRuntime {
             domain,
             target_runtime_id,
@@ -1129,11 +1134,17 @@ fn import_archive(
 fn reconcile(
     request_id: &str,
     request_file: Option<&std::path::Path>,
+    idempotency_key: Option<&str>,
 ) -> Result<Response, ResponseBuildError> {
-    use crate::site_reconcile::{self as rec, OPERATION};
+    use crate::site_reconcile::{self as rec};
+    let operation = if idempotency_key.is_some() {
+        rec::TARGET_OPERATION
+    } else {
+        rec::OPERATION
+    };
     #[cfg(unix)]
     {
-        let fail = |code, message: &str| Ok(Response::failure(OPERATION, code, message));
+        let fail = |code, message: &str| Ok(Response::failure(operation, code, message));
         let document = match request_file {
             None => None,
             Some(path) => match crate::commands::read_root_owned_content_file_bounded(
@@ -1149,7 +1160,13 @@ fn reconcile(
                 }
             },
         };
-        let request = match rec::Request::parse(request_id, document.as_deref()) {
+        let parsed = match idempotency_key {
+            Some(key) => {
+                rec::Request::parse_targeted(request_id, document.as_deref().unwrap_or(""), key)
+            }
+            None => rec::Request::parse(request_id, document.as_deref()),
+        };
+        let request = match parsed {
             Ok(request) => request,
             Err(rec::RequestError::InvalidRequestId) => {
                 return fail(
@@ -1225,21 +1242,21 @@ fn reconcile(
                 .map(|b| b as &dyn crate::site_migrate_runtime::Backend),
         };
         match rec::reconcile(&context, &request) {
-            Ok(result) => Response::success(OPERATION, result),
+            Ok(result) => Response::success(operation, result),
             Err(crate::site_archive::Error::PostCommit(value)) => {
-                Response::success(OPERATION, value)
+                Response::success(operation, value)
             }
             Err(error) => {
                 let (code, message) = error.protocol();
-                Ok(Response::failure(OPERATION, code, &message))
+                Ok(Response::failure(operation, code, &message))
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = (request_id, request_file);
+        let _ = (request_id, request_file, idempotency_key);
         Ok(Response::failure(
-            OPERATION,
+            operation,
             ErrorCode::UnsupportedPlatform,
             "site.reconcile requires a Unix host",
         ))

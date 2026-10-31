@@ -255,6 +255,7 @@ pub enum Error {
     OtherFilesystem,
     Extract(ExtractError),
     RecoveryRequired,
+    RecoveryUncertain,
     /// The operation committed but its record could not be saved; the result
     /// is still good.
     PostCommit(serde_json::Value),
@@ -355,6 +356,7 @@ impl Error {
                 ErrorCode::InvalidInput,
                 "the site archive is corrupt; the destination was restored".into(),
             ),
+            Self::RecoveryUncertain => (ErrorCode::Conflict,"recovery completion is unknown; stop all prior clients before a new explicit recovery".into()),
             Self::RecoveryRequired => (
                 ErrorCode::Conflict,
                 "the sync failed and restoring the destination also failed; pending.json and \
@@ -703,7 +705,7 @@ pub(crate) fn unix_now_secs() -> u64 {
 /// operation here. `body` gets the operation's scope directory.
 pub(crate) fn run_admitted<T, F>(
     engine_state: &ManagedRoot,
-    scope_name: &'static str,
+    scope_name: &str,
     operation: &'static str,
     request_id: RequestId,
     key: Option<&IdempotencyKey>,
@@ -728,6 +730,10 @@ where
     let value = match body(&scope) {
         Ok(value) => value,
         Err(error) => {
+            // An in-container client may outlive a failed transport. Preserve unknown.
+            if matches!(error, Error::RecoveryUncertain) {
+                return Err(error);
+            }
             let (code, message) = error.protocol();
             let _ = state.mark_failed(code, message);
             let _ = state::save(&scope, &state_path, &state);

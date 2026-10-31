@@ -117,15 +117,56 @@ pub struct Context<'a> {
     pub migrate: Option<&'a dyn crate::site_migrate_runtime::Backend>,
 }
 
+/// Explicit, request-specific recovery consent. No directory scan is performed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Target {
+    pub operation: String,
+    pub resource: String,
+    pub original_request_id: String,
+    pub confirm_offline: bool,
+    pub confirm_clients_stopped: bool,
+}
+impl Target {
+    fn validate(&self) -> Result<(), RequestError> {
+        if !self.confirm_offline
+            || !self.confirm_clients_stopped
+            || RequestId::parse(&self.original_request_id).is_err()
+            || self.resource.len() > 4096
+            || self.resource.chars().any(char::is_control)
+            || !(KINDS.iter().any(|k| k.operation == self.operation)
+                || self.operation == "site.migrateRuntime")
+        {
+            return Err(RequestError::InvalidDocument);
+        }
+        if self.operation == "site.migrateRuntime" {
+            crate::site::Domain::parse(&self.resource)
+                .map_err(|_| RequestError::InvalidDocument)?;
+        } else if !std::path::Path::new(&self.resource).is_absolute()
+            || std::path::Path::new(&self.resource)
+                .components()
+                .any(|p| matches!(p, std::path::Component::ParentDir))
+        {
+            return Err(RequestError::InvalidDocument);
+        }
+        Ok(())
+    }
+}
+pub const TARGET_OPERATION: &str = "site.recoverContent";
+
 pub struct Request {
     pub request_id: RequestId,
     /// MariaDB root password per container, from the request file.
     mariadb_root_passwords: BTreeMap<String, String>,
+    target: Option<Target>,
+    idempotency_key: Option<crate::transaction::IdempotencyKey>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Secrets {
+    #[serde(default)]
+    target: Option<Target>,
     #[serde(default)]
     mariadb_root_passwords: BTreeMap<String, String>,
 }
@@ -140,11 +181,16 @@ impl Request {
     pub fn parse(request_id: &str, document: Option<&str>) -> Result<Self, RequestError> {
         let request_id =
             RequestId::parse(request_id).map_err(|_| RequestError::InvalidRequestId)?;
+        let mut target = None;
         let mariadb_root_passwords = match document {
             None => BTreeMap::new(),
             Some(text) => {
                 let secrets: Secrets =
                     serde_json::from_str(text).map_err(|_| RequestError::InvalidDocument)?;
+                if let Some(value) = secrets.target.as_ref() {
+                    value.validate()?;
+                }
+                target = secrets.target;
                 if secrets.mariadb_root_passwords.len() > 32
                     || secrets
                         .mariadb_root_passwords
@@ -163,9 +209,26 @@ impl Request {
         Ok(Self {
             request_id,
             mariadb_root_passwords,
+            target,
+            idempotency_key: None,
         })
     }
 
+    pub fn parse_targeted(
+        request_id: &str,
+        document: &str,
+        key: &str,
+    ) -> Result<Self, RequestError> {
+        let mut request = Self::parse(request_id, Some(document))?;
+        if request.target.is_none() {
+            return Err(RequestError::InvalidDocument);
+        }
+        request.idempotency_key = Some(
+            crate::transaction::IdempotencyKey::parse(key)
+                .map_err(|_| RequestError::InvalidDocument)?,
+        );
+        Ok(request)
+    }
     pub const fn max_document_bytes() -> usize {
         MAX_PASSWORDS_BYTES
     }
@@ -221,9 +284,20 @@ struct Marker {
     /// before milestone 088 do not say.
     #[serde(default)]
     had_target: Option<bool>,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    database_container_id: Option<String>,
+    #[serde(default)]
+    database_snapshot_sha256: Option<String>,
+    #[serde(default)]
+    recovery_evidence_version: Option<u8>,
+    #[serde(default)]
+    mutation_started: Option<bool>,
 }
 
 enum Outcome {
+    Uncertain,
     NeedsPassword(String),
     RolledBack,
     Cleared,
@@ -232,6 +306,9 @@ enum Outcome {
 }
 
 pub fn reconcile(ctx: &Context<'_>, req: &Request) -> Result<ReconcileResult, Error> {
+    if req.target.is_some() {
+        return reconcile_target(ctx, req);
+    }
     run_admitted(
         ctx.engine_state,
         RECONCILE_SCOPE,
@@ -256,6 +333,238 @@ pub fn reconcile(ctx: &Context<'_>, req: &Request) -> Result<ReconcileResult, Er
             Ok(result)
         },
     )
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryInfo {
+    pub available: bool,
+    pub reason: &'static str,
+    pub requires_database: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database_container: Option<String>,
+}
+pub fn recovery_info(
+    state: &ManagedRoot,
+    roots: &[TrustedRoot],
+    operation: &str,
+    resource: &str,
+    id: &str,
+    active: bool,
+) -> RecoveryInfo {
+    let unavailable = |reason| RecoveryInfo {
+        available: false,
+        reason,
+        requires_database: false,
+        database_container: None,
+    };
+    if active {
+        return unavailable("The original operation is still running");
+    }
+    let Ok(original) = RequestId::parse(id) else {
+        return unavailable("Invalid original request");
+    };
+    let Ok(selected) = crate::operation_status::resource_scope(roots, operation, resource) else {
+        return unavailable("No targeted recovery contract for this operation");
+    };
+    let Ok(scope) = state.open_managed_dir(&selected) else {
+        return unavailable("Recovery scope is unavailable");
+    };
+    if operation == "site.migrateRuntime" {
+        let journal = crate::site_archive::rel(&format!("pending/{original}.json"));
+        return if read_bounded(&scope, &journal).is_some() {
+            RecoveryInfo {
+                available: true,
+                reason: "Recover this runtime migration from its exact journal",
+                requires_database: false,
+                database_container: None,
+            }
+        } else {
+            unavailable("No retained runtime journal")
+        };
+    }
+    let Some(kind) = KINDS.iter().find(|k| k.operation == operation) else {
+        return unavailable(
+            "No verified automatic recovery primitive; inspect the remote service and retained artifacts manually",
+        );
+    };
+    let hash = resource_lock::canonical_hash(std::path::Path::new(resource));
+    let path = crate::site_archive::rel(&if kind.scope_per_root {
+        "pending.json".into()
+    } else {
+        format!("pending/{hash}.json")
+    });
+    let Some(marker) =
+        read_bounded(&scope, &path).and_then(|s| serde_json::from_str::<Marker>(&s).ok())
+    else {
+        return unavailable("No readable checkpoint for this resource");
+    };
+    if marker.request_id != id || marker.dest_root != std::path::Path::new(resource) {
+        return unavailable("Checkpoint does not belong to this exact request");
+    }
+    if transaction_committed(&scope, original) {
+        return RecoveryInfo {
+            available: true,
+            reason: "The original operation committed; clear only its retained checkpoint",
+            requires_database: false,
+            database_container: None,
+        };
+    }
+    if kind.db_dir.is_some() {
+        if marker.recovery_evidence_version != Some(1) || marker.mutation_started.is_none() {
+            return unavailable(
+                "Legacy checkpoint lacks immutable database recovery evidence; manual review required",
+            );
+        }
+        let Some(name) = marker
+            .database_container
+            .filter(|n| ContainerName::parse(n).is_ok())
+        else {
+            return unavailable("Database identity is unavailable");
+        };
+        return RecoveryInfo {
+            available: true,
+            reason: "Recover only after the site is offline and every previous database client is stopped",
+            requires_database: marker.mutation_started == Some(true),
+            database_container: Some(name),
+        };
+    }
+    RecoveryInfo {
+        available: true,
+        reason: "Restore the previous content from this exact retained checkpoint",
+        requires_database: false,
+        database_container: None,
+    }
+}
+
+fn reconcile_target(ctx: &Context<'_>, req: &Request) -> Result<ReconcileResult, Error> {
+    let target = req.target.as_ref().ok_or(Error::UnsafeTarget)?;
+    target.validate().map_err(|_| Error::UnsafeTarget)?;
+    let scope_name = format!("site-content-recovery/{}", target.original_request_id);
+    let scope_path = crate::site_archive::rel(&scope_name);
+    ctx.engine_state
+        .create_dir_all(&scope_path)
+        .map_err(Error::Io)?;
+    let scope = ctx
+        .engine_state
+        .open_managed_dir(&scope_path)
+        .map_err(Error::Io)?;
+    // Immutable non-secret identity binds every replay key to this exact target.
+    let path = crate::site_archive::rel("target.json");
+    let encoded = serde_json::to_vec(target).map_err(|_| Error::UnsafeTarget)?;
+    match scope.create_new(&path, &encoded) {
+        Ok(()) => {
+            scope.sync_all().map_err(Error::Io)?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let stored: Target = read_bounded(&scope, &path)
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .ok_or(Error::UnsafeTarget)?;
+            if stored != *target {
+                return Err(Error::UnsafeTarget);
+            }
+        }
+        Err(e) => return Err(Error::Io(e)),
+    }
+    run_admitted(
+        ctx.engine_state,
+        &scope_name,
+        TARGET_OPERATION,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        |_| {
+            let mut result = ReconcileResult::default();
+            let entry = |reason: &str| Entry {
+                operation: target.operation.clone(),
+                dest_root: target.resource.clone(),
+                request_id: target.original_request_id.clone(),
+                reason: reason.into(),
+                needs_password_for: String::new(),
+            };
+            if target.operation == "site.migrateRuntime" {
+                let backend = ctx.migrate.ok_or(Error::UnsafeTarget)?;
+                let domain = crate::site::Domain::parse(&target.resource)
+                    .map_err(|_| Error::UnsafeTarget)?;
+                use crate::site_migrate_runtime::{Recovery, recover};
+                match recover(
+                    ctx.engine_state,
+                    backend,
+                    &domain,
+                    &format!("{}.json", target.original_request_id),
+                    req.request_id,
+                ) {
+                    Recovery::RolledBack => result.rolled_back.push(entry("")),
+                    Recovery::Completed => result.completed.push(entry("")),
+                    Recovery::Cleared => result.cleared.push(entry("")),
+                    Recovery::Busy => return Err(Error::ResourceBusy),
+                    Recovery::Attention(_) => return Err(Error::RecoveryUncertain),
+                }
+                return Ok(result);
+            }
+            let kind = KINDS
+                .iter()
+                .find(|k| k.operation == target.operation)
+                .ok_or(Error::UnsafeTarget)?;
+            let selected = crate::operation_status::resource_scope(
+                ctx.content_roots,
+                &target.operation,
+                &target.resource,
+            )
+            .map_err(|_| Error::UnsafeTarget)?;
+            let original_scope = ctx
+                .engine_state
+                .open_managed_dir(&selected)
+                .map_err(Error::Io)?;
+            // Never recover a live original owner, even if its resource lock is absent.
+            let status = crate::operation_status::load_resource(
+                ctx.engine_state,
+                ctx.content_roots,
+                &target.operation,
+                &target.resource,
+                &target.original_request_id,
+            )
+            .map_err(|_| Error::UnsafeTarget)?;
+            if status.active {
+                return Err(Error::ResourceBusy);
+            }
+            let hash = crate::transaction::resource_lock::canonical_hash(std::path::Path::new(
+                &target.resource,
+            ));
+            let marker_path = crate::site_archive::rel(&if kind.scope_per_root {
+                "pending.json".into()
+            } else {
+                format!("pending/{hash}.json")
+            });
+            let marker: Marker = read_bounded(&original_scope, &marker_path)
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .ok_or(Error::UnsafeTarget)?;
+            if marker.request_id != target.original_request_id
+                || marker.dest_root != std::path::Path::new(&target.resource)
+            {
+                return Err(Error::UnsafeTarget);
+            }
+            match recover(ctx, kind, &original_scope, &marker_path, &marker, req, true) {
+                Outcome::RolledBack => result.rolled_back.push(entry("")),
+                Outcome::Cleared => result.cleared.push(entry("")),
+                Outcome::Busy => return Err(Error::ResourceBusy),
+                Outcome::Uncertain => return Err(Error::RecoveryUncertain),
+                Outcome::NeedsPassword(_) | Outcome::Attention(_) => {
+                    return Err(Error::UnsafeTarget);
+                }
+            }
+            Ok(result)
+        },
+    )
+}
+fn read_bounded(scope: &ManagedRoot, path: &SiteRelativePath) -> Option<String> {
+    let mut text = String::new();
+    scope
+        .open_regular_read(path)
+        .ok()?
+        .take(65537)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() <= 65536).then_some(text)
 }
 
 /// Finishes every interrupted `site.migrateRuntime` from its journal.
@@ -376,11 +685,12 @@ fn recover_one(
         reason: reason.to_owned(),
         needs_password_for: String::new(),
     };
-    match recover(ctx, kind, scope, marker_path, &marker, req) {
+    match recover(ctx, kind, scope, marker_path, &marker, req, false) {
         Outcome::RolledBack => result.rolled_back.push(entry("")),
         Outcome::Cleared => result.cleared.push(entry("")),
         Outcome::Busy => result.busy.push(entry("")),
         Outcome::Attention(reason) => result.needs_attention.push(entry(reason)),
+        Outcome::Uncertain => result.needs_attention.push(entry("database client completion is unknown; stop every prior client before explicit recovery")),
         Outcome::NeedsPassword(container) => result.needs_attention.push(Entry {
             needs_password_for: container,
             ..entry(
@@ -397,6 +707,7 @@ fn recover(
     marker_path: &SiteRelativePath,
     marker: &Marker,
     req: &Request,
+    strict: bool,
 ) -> Outcome {
     let Ok(id) = RequestId::parse(&marker.request_id) else {
         return Outcome::Attention("the marker names an invalid request id");
@@ -450,6 +761,22 @@ fn recover(
     let Ok(content) = ManagedRoot::open(root) else {
         return Outcome::Attention("the content root cannot be opened");
     };
+    if strict
+        && kind.db_dir.is_some()
+        && (marker.recovery_evidence_version != Some(1) || marker.mutation_started.is_none())
+    {
+        return Outcome::Attention("this checkpoint predates verified database recovery evidence");
+    }
+    if strict && kind.db_dir.is_some() && marker.mutation_started == Some(false) {
+        if !fail_interrupted(scope, id) {
+            return Outcome::Attention("untouched original status could not be saved");
+        }
+        return if scope.remove_file(marker_path).is_ok() && scope.sync_all().is_ok() {
+            Outcome::Cleared
+        } else {
+            Outcome::Attention("untouched checkpoint could not be cleared")
+        };
+    }
     let saved_exists = content.symlink_metadata(&saved).is_ok();
     let snapshot_exists = content.symlink_metadata(&snapshot).is_ok();
     let dest_exists = content.symlink_metadata(&relative).is_ok();
@@ -469,8 +796,23 @@ fn recover(
         return Outcome::Attention("an older marker: cannot tell whether the destination is new");
     }
 
-    // The database goes back first, as in the in-process rollback.
-    if let (true, Some((recovery, _, snapshot_rel))) = (touched, &db) {
+    if strict
+        && kind.db_dir.is_some()
+        && marker.mutation_started == Some(true)
+        && marker.had_target == Some(true)
+        && !saved_exists
+    {
+        return Outcome::Attention(
+            "the prior files are unavailable; no file state is inferred from an incomplete rollback",
+        );
+    }
+    // The database goes back first; strict mode requires immutable evidence and client proof.
+    let restore_db = if strict && kind.db_dir.is_some() {
+        marker.mutation_started == Some(true)
+    } else {
+        touched
+    };
+    if let (true, Some((recovery, _, snapshot_rel))) = (restore_db, &db) {
         let Some(container) = marker.database_container.as_deref() else {
             return Outcome::Attention("the marker names no database container");
         };
@@ -486,7 +828,76 @@ fn recover(
         let Some(password) = req.mariadb_root_passwords.get(container) else {
             return Outcome::NeedsPassword(container.to_owned());
         };
-        if !restore_database(ctx.docker_program, container, password, &path) {
+        if strict {
+            let Some(database) = marker.database.as_deref() else {
+                return Outcome::Attention("checkpoint names no database");
+            };
+            if ["mysql", "sys", "information_schema", "performance_schema"]
+                .iter()
+                .any(|name| database.eq_ignore_ascii_case(name))
+            {
+                return Outcome::Attention("system database recovery is forbidden");
+            }
+            let Some(immutable) = marker
+                .database_container_id
+                .as_deref()
+                .filter(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            else {
+                return Outcome::Attention("checkpoint names no immutable database target");
+            };
+            let Some(expected) = marker.database_snapshot_sha256.as_deref() else {
+                return Outcome::Attention("checkpoint names no snapshot hash");
+            };
+            let Ok(managed) = ManagedRoot::open(recovery) else {
+                return Outcome::Attention("snapshot root unavailable");
+            };
+            let Ok(mut file) = managed.open_regular_read(snapshot_rel) else {
+                return Outcome::Attention("snapshot is not a regular private file");
+            };
+            use std::os::unix::fs::MetadataExt;
+            let Ok(meta) = file.metadata() else {
+                return Outcome::Attention("snapshot metadata unavailable");
+            };
+            if meta.mode() & 0o777 != 0o600
+                || meta.nlink() != 1
+                || meta.uid() != unsafe { libc::geteuid() }
+            {
+                return Outcome::Attention("snapshot must be privately owned with one link");
+            }
+            let Ok(hash_file) = file.try_clone() else {
+                return Outcome::Attention("snapshot cannot be read");
+            };
+            if crate::recovery_evidence::digest(hash_file).ok().as_deref() != Some(expected) {
+                return Outcome::Attention("snapshot integrity check failed");
+            }
+            let Ok(request) = crate::db_restore::RestoreRequest::parse(
+                "mariadb",
+                database,
+                container,
+                "",
+                password,
+                &req.request_id.to_string(),
+                None,
+            ) else {
+                return Outcome::Attention("invalid database target");
+            };
+            use std::io::{Seek, SeekFrom};
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return Outcome::Attention("snapshot cannot be rewound");
+            }
+            let context = crate::db_restore::execute::RestoreContext {
+                engine_state: ctx.engine_state,
+                docker_program: ctx.docker_program,
+                gunzip_program: "gunzip",
+            };
+            if crate::db_restore::protected::restore_snapshot_file(
+                &context, &request, file, immutable,
+            )
+            .is_err()
+            {
+                return Outcome::Uncertain;
+            }
+        } else if !restore_database(ctx.docker_program, container, password, &path) {
             return Outcome::Attention("the database snapshot could not be replayed");
         }
     }
@@ -515,10 +926,15 @@ fn recover(
             let _ = managed.remove_dir_all(&dir);
         }
     }
-    if scope.remove_file(marker_path).is_err() {
+    if strict && content.sync_all().is_err() {
+        return Outcome::Uncertain;
+    }
+    if !fail_interrupted(scope, id) && strict {
+        return Outcome::Uncertain;
+    }
+    if scope.remove_file(marker_path).is_err() || (strict && scope.sync_all().is_err()) {
         return Outcome::Attention("the content is restored but the marker could not be removed");
     }
-    fail_interrupted(scope, id);
     outcome
 }
 
@@ -574,23 +990,24 @@ fn restore_database(
 }
 
 /// Marks the interrupted operation's `InProgress` transaction `Failed`.
-fn fail_interrupted(scope: &ManagedRoot, id: RequestId) {
-    let Ok(path) = SiteRelativePath::parse(format!("transactions/{id}.json")) else {
-        return;
-    };
+fn fail_interrupted(scope: &ManagedRoot, id: RequestId) -> bool {
+    let path = crate::site_archive::rel(&format!("transactions/{id}.json"));
     let Ok(mut transaction) = state::load(scope, &path) else {
-        return;
+        return false;
     };
-    if transaction.status == TransactionStatus::InProgress
-        && transaction
+    if transaction.status == TransactionStatus::InProgress {
+        if transaction
             .mark_failed(
                 crate::error::ErrorCode::Internal,
-                "interrupted; rolled back by site.reconcile",
+                "interrupted; restored by explicit content recovery",
             )
-            .is_ok()
-    {
-        let _ = state::save(scope, &path, &transaction);
+            .is_err()
+        {
+            return false;
+        }
+        return state::save(scope, &path, &transaction).is_ok() && scope.sync_all().is_ok();
     }
+    true
 }
 
 #[cfg(all(test, unix))]
@@ -598,6 +1015,161 @@ mod tests {
     use super::*;
     use crate::transaction::state::TransactionState;
     use std::{fs, os::unix::fs::PermissionsExt};
+
+    fn targeted(fx: &Fx, operation: &str) -> Request {
+        Request::parse_targeted(
+            RECONCILE_ID,
+            &serde_json::json!({"target":{
+            "operation":operation,"resource":fx.www("site"),"originalRequestId":ID,
+            "confirmOffline":true,"confirmClientsStopped":true}})
+            .to_string(),
+            "targeted-recovery",
+        )
+        .unwrap()
+    }
+    #[test]
+    fn targeted_archive_recovers_only_exact_marker_and_replays_without_touching_new_files() {
+        let fx = Fx::new();
+        fx.interrupted_import(true, true, true);
+        let pending = fx.base.join("state/site-archive-import/pending");
+        let hash = resource_lock::canonical_hash(&fx.www("site"));
+        fs::rename(
+            pending.join("abc.json"),
+            pending.join(format!("{hash}.json")),
+        )
+        .unwrap();
+        fs::write(pending.join("unrelated.json"), "unrelated").unwrap();
+        let req = targeted(&fx, "site.importArchive");
+        let result = reconcile(&fx.context(), &req).unwrap();
+        assert_eq!(result.rolled_back.len(), 1);
+        assert_eq!(fs::read_to_string(fx.www("site/old.txt")).unwrap(), "old");
+        assert!(pending.join("unrelated.json").exists());
+        fs::write(fx.www("site/new-sentinel"), "preserve").unwrap();
+        assert_eq!(reconcile(&fx.context(), &req).unwrap(), result);
+        assert!(fx.www("site/new-sentinel").exists());
+    }
+    #[test]
+    fn targeted_recovery_rejects_wrong_original_and_live_owner() {
+        let fx = Fx::new();
+        fx.interrupted_import(true, true, true);
+        let pending = fx.base.join("state/site-archive-import/pending");
+        let hash = resource_lock::canonical_hash(&fx.www("site"));
+        fs::rename(
+            pending.join("abc.json"),
+            pending.join(format!("{hash}.json")),
+        )
+        .unwrap();
+        let scope = fx
+            .state
+            .open_managed_dir(&crate::site_archive::rel("site-archive-import"))
+            .unwrap();
+        let _lock = crate::transaction::lock::acquire(
+            &scope,
+            &crate::site_archive::rel("locks/mutation.lock"),
+            RequestId::parse(ID).unwrap(),
+        )
+        .unwrap();
+        assert!(reconcile(&fx.context(), &targeted(&fx, "site.importArchive")).is_err());
+        assert!(fx.www("site/partial.txt").exists());
+    }
+    fn verified_checkpoint(fx: &Fx, started: bool) -> PathBuf {
+        fx.interrupted_db_operation(true, Some(true), Some(DUMP), (started, true, true));
+        let hash = resource_lock::canonical_hash(&fx.www("site"));
+        let scope = fx.base.join(format!("state/wordpress-clone/{hash}"));
+        fs::rename(fx.base.join("state/wordpress-clone/abc"), &scope).unwrap();
+        let path = scope.join("pending.json");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["recoveryEvidenceVersion"] = 1.into();
+        value["mutationStarted"] = started.into();
+        value["databaseContainerId"] = "a".repeat(64).into();
+        let dump = fx
+            .base
+            .join(format!("recovery/wordpress-clone/{ID}/target.sql"));
+        fs::set_permissions(&dump, fs::Permissions::from_mode(0o600)).unwrap();
+        value["databaseSnapshotSha256"] =
+            crate::recovery_evidence::digest(fs::File::open(dump).unwrap())
+                .unwrap()
+                .into();
+        fs::write(&path, value.to_string()).unwrap();
+        path
+    }
+    #[test]
+    fn untouched_verified_checkpoint_only_clears_without_writing_current_files_or_sql() {
+        let fx = Fx::new();
+        let path = verified_checkpoint(&fx, false);
+        fs::write(fx.www("site/partial.txt"), "external sentinel").unwrap();
+        let result = reconcile(&fx.context(), &targeted(&fx, "wordpress.clone")).unwrap();
+        assert_eq!(result.cleared.len(), 1);
+        assert!(!path.exists());
+        assert!(fx.calls().is_empty());
+        assert_eq!(
+            fs::read_to_string(fx.www("site/partial.txt")).unwrap(),
+            "external sentinel"
+        );
+    }
+    #[test]
+    fn missing_phase_and_modified_snapshot_refuse_content_mutation() {
+        for corrupt_phase in [true, false] {
+            let fx = Fx::new();
+            let path = verified_checkpoint(&fx, true);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            if corrupt_phase {
+                value.as_object_mut().unwrap().remove("mutationStarted");
+            } else {
+                value["databaseSnapshotSha256"] = "0".repeat(64).into();
+            }
+            fs::write(&path, value.to_string()).unwrap();
+            let mut req = targeted(&fx, "wordpress.clone");
+            req.mariadb_root_passwords
+                .insert("mariadb".into(), "s3cret".into());
+            assert!(reconcile(&fx.context(), &req).is_err());
+            assert!(path.exists());
+            assert!(fx.calls().is_empty());
+            assert!(fx.www("site/partial.txt").exists());
+        }
+    }
+    #[test]
+    fn unproven_database_client_preserves_unknown_recovery_and_checkpoint() {
+        let fx = Fx::new();
+        let path = verified_checkpoint(&fx, true);
+        let mut req = targeted(&fx, "wordpress.clone");
+        req.mariadb_root_passwords
+            .insert("mariadb".into(), "s3cret".into());
+        assert!(matches!(
+            reconcile(&fx.context(), &req),
+            Err(Error::RecoveryUncertain)
+        ));
+        let scope = fx
+            .state
+            .open_managed_dir(&crate::site_archive::rel(&format!(
+                "site-content-recovery/{ID}"
+            )))
+            .unwrap();
+        let status = state::load(
+            &scope,
+            &crate::site_archive::rel(&format!("transactions/{RECONCILE_ID}.json")),
+        )
+        .unwrap();
+        assert_eq!(status.status, TransactionStatus::InProgress);
+        assert!(path.exists());
+        assert!(fx.www("site/partial.txt").exists());
+    }
+    #[test]
+    fn targeted_db_legacy_checkpoint_never_replays_sql() {
+        let fx = Fx::new();
+        fx.interrupted_db_operation(true, Some(true), Some(DUMP), (true, true, true));
+        let hash = resource_lock::canonical_hash(&fx.www("site"));
+        fs::rename(
+            fx.base.join("state/wordpress-clone/abc"),
+            fx.base.join(format!("state/wordpress-clone/{hash}")),
+        )
+        .unwrap();
+        assert!(reconcile(&fx.context(), &targeted(&fx, "wordpress.clone")).is_err());
+        assert!(fx.calls().is_empty());
+        assert!(fx.www("site/partial.txt").exists());
+    }
 
     const ID: &str = "123e4567-e89b-12d3-a456-426614174001";
     const RECONCILE_ID: &str = "123e4567-e89b-12d3-a456-426614174099";
@@ -650,6 +1222,16 @@ mod tests {
             fs::set_permissions(&self.docker, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
+        fn context(&self) -> Context<'_> {
+            Context {
+                engine_state: &self.state,
+                state_root: self.base.as_path(),
+                content_roots: &self.roots,
+                recovery_root: Some(&self.recovery_root),
+                docker_program: &self.docker,
+                migrate: None,
+            }
+        }
         fn www(&self, path: &str) -> PathBuf {
             self.base.join("www").join(path)
         }
@@ -663,6 +1245,7 @@ mod tests {
         }
 
         fn start_transaction(&self, scope_dir: &str, operation: &'static str) {
+            fs::create_dir_all(self.base.join("state").join(scope_dir).join("locks")).unwrap();
             fs::create_dir_all(self.base.join("state").join(scope_dir).join("transactions"))
                 .unwrap();
             let scope = self

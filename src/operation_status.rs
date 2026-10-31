@@ -195,6 +195,123 @@ pub fn list_create(
         limit,
     )
 }
+/// Closed mapping: resource strings can never select arbitrary state directories.
+pub fn resource_scope(
+    content_roots: &[crate::site::TrustedRoot],
+    operation: &str,
+    resource: &str,
+) -> Result<SiteRelativePath, StatusError> {
+    let root_prefix = match operation {
+        "wordpress.clone" => Some("wordpress-clone"),
+        "joomla.clone" => Some("joomla-clone"),
+        "wordpress.import" => Some("wordpress-import"),
+        "wordpress.install" => Some("wordpress-install"),
+        "wordpress.updateCore" | "wordpress.updatePlugins" | "wordpress.updateThemes" => {
+            Some("wordpress-update")
+        }
+        "wordpress.boundedAction" | "wordpress.typedActions" => Some("wordpress-bounded-action"),
+        _ => None,
+    };
+    let path = if let Some(prefix) = root_prefix {
+        let root = std::path::Path::new(resource);
+        if resource.len() > 4096
+            || !root.is_absolute()
+            || root
+                .components()
+                .any(|p| matches!(p, std::path::Component::ParentDir))
+            || !content_roots
+                .iter()
+                .any(|base| root.starts_with(base.as_path()) && root != base.as_path())
+        {
+            return Err(StatusError::InvalidScope);
+        }
+        format!(
+            "{prefix}/{}",
+            crate::transaction::resource_lock::canonical_hash(root)
+        )
+    } else {
+        match operation {
+            "site.importArchive" | "wordpress.migrateImport" | "wordpress.migrateExport" => {
+                let root = std::path::Path::new(resource);
+                if resource.len() > 4096
+                    || !root.is_absolute()
+                    || root
+                        .components()
+                        .any(|p| matches!(p, std::path::Component::ParentDir))
+                    || !content_roots
+                        .iter()
+                        .any(|base| root.starts_with(base.as_path()) && root != base.as_path())
+                {
+                    return Err(StatusError::InvalidScope);
+                }
+                match operation {
+                    "site.importArchive" => "site-archive-import",
+                    "wordpress.migrateImport" => "wordpress-migrate-import",
+                    _ => "wordpress-migrate-export",
+                }
+                .into()
+            }
+            "site.recoverContent" => format!(
+                "site-content-recovery/{}",
+                RequestId::parse(resource).map_err(|_| StatusError::InvalidScope)?
+            ),
+            "site.migrateRuntime" => format!(
+                "site-migrate-runtime/{}",
+                crate::site::Domain::parse(resource).map_err(|_| StatusError::InvalidScope)?
+            ),
+            "runtime.activateConfig" => format!(
+                "runtime-config/{}",
+                crate::site::RuntimeId::parse(resource).map_err(|_| StatusError::InvalidScope)?
+            ),
+            "meilisearch.upgrade" => {
+                let name = crate::db_restore::ContainerName::parse(resource)
+                    .map_err(|_| StatusError::InvalidScope)?;
+                if resource.starts_with(['.', '-']) {
+                    return Err(StatusError::InvalidScope);
+                }
+                format!("meilisearch/{}", name.as_str())
+            }
+            "docker.imagePull"
+                if !resource.is_empty()
+                    && resource.len() <= 2048
+                    && !resource.chars().any(char::is_control) =>
+            {
+                "docker-resource".into()
+            }
+            "system.installDocker" if resource == "server" => "system-install-docker".into(),
+            "system.startDocker" if resource == "server" => "system-start-docker".into(),
+            _ => return Err(StatusError::InvalidScope),
+        }
+    };
+    SiteRelativePath::parse(path).map_err(|_| StatusError::InvalidScope)
+}
+pub fn load_resource(
+    root: &ManagedRoot,
+    content_roots: &[crate::site::TrustedRoot],
+    operation: &str,
+    resource: &str,
+    id: &str,
+) -> Result<OperationStatus, StatusError> {
+    let scope = resource_scope(content_roots, operation, resource)?;
+    let mut status = load_scoped(root, &scope, id)?;
+    if status.transaction.operation != operation {
+        return Err(StatusError::Corrupt);
+    }
+    if let Some(outcome) = status.transaction.outcome.as_mut() {
+        outcome.result = if outcome.ok {
+            Some(serde_json::json!({"outcomeKnown":true}))
+        } else {
+            None
+        };
+        outcome.error_message = if outcome.ok {
+            None
+        } else {
+            Some("The remote operation failed; inspect its original invocation result".into())
+        };
+    }
+    Ok(status)
+}
+
 fn list_scoped(
     engine_state: &ManagedRoot,
     scope: &SiteRelativePath,
@@ -516,11 +633,28 @@ fn load_scoped(
     })?;
     let transaction_path = SiteRelativePath::parse(format!("transactions/{request_id}.json"))
         .expect("a canonical request id always produces a safe relative path");
-    let transaction = state::load(&site_state, &transaction_path).map_err(|error| match error {
-        state::StateError::NotFound => StatusError::NotFound,
-        state::StateError::Corrupt => StatusError::Corrupt,
-        state::StateError::AlreadyExists | state::StateError::Io => StatusError::Io,
-    })?;
+    let metadata = site_state
+        .symlink_metadata(&transaction_path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StatusError::NotFound
+            } else {
+                StatusError::Io
+            }
+        })?;
+    if !metadata.is_file() || metadata.len() > LIST_RECORD_MAX_BYTES as u64 {
+        return Err(StatusError::Corrupt);
+    }
+    let mut remaining = LIST_RECORD_MAX_BYTES;
+    let transaction = read_list_record(
+        &site_state,
+        &transaction_path,
+        LIST_RECORD_MAX_BYTES,
+        &mut remaining,
+    )?;
+    if transaction.request_id != request_id {
+        return Err(StatusError::Corrupt);
+    }
     let active = if transaction.status == TransactionStatus::InProgress {
         let lock_path = SiteRelativePath::parse("locks/mutation.lock").unwrap();
         lock::holder(&site_state, &lock_path).map_err(|_| StatusError::Io)?
@@ -995,5 +1129,81 @@ mod tests {
         let root = ManagedRoot::open(&TrustedRoot::parse(directory.path()).unwrap()).unwrap();
         let found = incomplete(&root, directory.path()).unwrap();
         assert!(found.interrupted.is_empty() && found.markers.is_empty());
+    }
+    #[test]
+    fn fixed_resource_scopes_are_bounded_and_cannot_select_arbitrary_state() {
+        let base = tempfile::tempdir().unwrap();
+        let content = crate::site::TrustedRoot::parse(base.path()).unwrap();
+        let roots = [content];
+        let resource = base.path().join("target");
+        let resource = resource.to_str().unwrap();
+        let hash =
+            crate::transaction::resource_lock::canonical_hash(std::path::Path::new(resource));
+        assert_eq!(
+            resource_scope(&roots, "wordpress.clone", resource)
+                .unwrap()
+                .as_path(),
+            std::path::Path::new(&format!("wordpress-clone/{hash}"))
+        );
+        assert_eq!(
+            resource_scope(&roots, "wordpress.updatePlugins", resource)
+                .unwrap()
+                .as_path(),
+            std::path::Path::new(&format!("wordpress-update/{hash}"))
+        );
+        assert!(resource_scope(&roots, "arbitrary.operation", resource).is_err());
+        assert!(resource_scope(&roots, "wordpress.clone", "/etc/passwd").is_err());
+        assert!(
+            resource_scope(&roots, "wordpress.clone", &format!("{resource}/../escape")).is_err()
+        );
+        assert!(resource_scope(&roots, "meilisearch.upgrade", "../escape").is_err());
+        assert_eq!(
+            resource_scope(&roots, "meilisearch.upgrade", "wp-stack")
+                .unwrap()
+                .as_path(),
+            std::path::Path::new("meilisearch/wp-stack")
+        );
+        assert_eq!(
+            resource_scope(
+                &roots,
+                "docker.imagePull",
+                "ghcr.io/example/image@sha256:abc"
+            )
+            .unwrap()
+            .as_path(),
+            std::path::Path::new("docker-resource")
+        );
+    }
+    #[test]
+    fn resource_status_redacts_arbitrary_plugin_output_and_errors() {
+        let (directory, root) = state_root();
+        let content = TrustedRoot::parse(directory.path()).unwrap();
+        let roots = [content];
+        let target = directory.path().join("target");
+        let target = target.to_str().unwrap();
+        let scope = resource_scope(&roots, "wordpress.updateCore", target).unwrap();
+        root.create_dir_all(&scope).unwrap();
+        let scope = root.open_managed_dir(&scope).unwrap();
+        scope
+            .create_dir_all(&SiteRelativePath::parse("transactions").unwrap())
+            .unwrap();
+        let id = RequestId::parse(REQUEST_ID).unwrap();
+        let mut tx = TransactionState::start(id, None, "wordpress.updateCore");
+        tx.mark_committed(serde_json::json!({"output":"fixture-secret-never-return"}))
+            .unwrap();
+        create(
+            &scope,
+            &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
+            &tx,
+        )
+        .unwrap();
+        let status =
+            load_resource(&root, &roots, "wordpress.updateCore", target, REQUEST_ID).unwrap();
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("fixture-secret-never-return"));
+        assert!(json.contains("outcomeKnown"));
+        assert!(
+            load_resource(&root, &roots, "wordpress.updatePlugins", target, REQUEST_ID).is_err()
+        );
     }
 }

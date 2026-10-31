@@ -37,6 +37,7 @@ struct Features {
     /// `wordpress.rotateDebugLog` accepts `--compress` (gzip of the rotated
     /// copy). An engine without this field rejects the flag.
     debug_log_gzip: bool,
+    content_recovery_evidence: bool,
     /// The sensitive-path catalog `ingress.applyAdminPaths` accepts, per site
     /// kind. Absent on an engine without the operation.
     admin_paths: Vec<AdminPathsKind>,
@@ -86,6 +87,7 @@ pub const OPERATIONS: &[&str] = &[
     "capabilities",
     "doctor",
     "operation.status",
+    "operation.resourceStatus",
     "operation.list",
     "operation.incomplete",
     "backup.delete",
@@ -234,6 +236,7 @@ pub const OPERATIONS: &[&str] = &[
     "site.importArchive",
     "site.discardArchive",
     "site.reconcile",
+    "site.recoverContent",
     "site.migrateRuntime",
     "system.service",
     "compose.action",
@@ -263,6 +266,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 clone_staging_defaults: true,
                 drupal_update_db_safety: true,
                 debug_log_gzip: true,
+                content_recovery_evidence: true,
                 admin_paths: admin_paths_catalog(),
                 admin_paths_combined: true,
             },
