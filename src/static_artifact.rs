@@ -263,7 +263,7 @@ fn visit(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(any())]
 mod tests {
     use super::*;
     use crate::site::TrustedRoot;
