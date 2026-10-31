@@ -496,40 +496,32 @@ mod tests {
     /// Spawns `sleep` under `name` (a copy of the binary) in its own
     /// directory, and waits until the new image's comm is visible.
     fn spawn_named(name: &str) -> (tempfile::TempDir, Child) {
-        // A copied binary can occasionally die right after it starts on a
-        // busy runner (seen as an exit before the test's first signal).
-        // Nothing has been signalled yet, so start a fresh one a few times.
-        for _ in 0..5 {
-            let dir = tempfile::tempdir().unwrap();
-            let program = dir.path().join(name);
-            fs::copy(which_sleep(), &program).unwrap();
-            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
-            // Another test thread may have forked while this binary was being
-            // copied. Reuse the runner's bounded ETXTBSY handling until that
-            // child's inherited writable descriptor closes at exec.
-            let mut command = Command::new(&program);
-            command.arg("300");
-            let mut child = crate::process::spawn_retrying_busy(&mut command).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            let want: String = name.chars().take(MAX_COMM_LEN).collect();
-            let mut named = false;
-            while Instant::now() < deadline {
-                if let Ok(id) = read_identity(Path::new(PROC_ROOT), child.id()) {
-                    if id.comm == want {
-                        named = true;
-                        break;
-                    }
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join(name);
+        fs::copy(which_sleep(), &program).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test thread may have forked while this binary was being
+        // copied. Reuse the runner's bounded ETXTBSY handling until that
+        // child's inherited writable descriptor closes at exec.
+        // The runner's `sleep` may be a multi-call binary that dispatches on
+        // argv[0], so keep that as "sleep" while the file (and comm) is `name`.
+        let mut command = Command::new(&program);
+        std::os::unix::process::CommandExt::arg0(&mut command, "sleep");
+        command.arg("300");
+        let mut child = crate::process::spawn_retrying_busy(&mut command).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let want: String = name.chars().take(MAX_COMM_LEN).collect();
+        while Instant::now() < deadline {
+            if let Ok(id) = read_identity(Path::new(PROC_ROOT), child.id()) {
+                if id.comm == want {
+                    return (dir, child);
                 }
-                std::thread::sleep(Duration::from_millis(10));
             }
-            std::thread::sleep(Duration::from_millis(100));
-            if named && child.try_wait().unwrap().is_none() {
-                return (dir, child);
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            std::thread::sleep(Duration::from_millis(10));
         }
-        panic!("child never stayed running under its comm");
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child never reached its comm");
     }
 
     fn request(pid: u32, signal: &str, id: &str) -> Request {
