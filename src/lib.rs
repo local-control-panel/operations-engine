@@ -94,6 +94,8 @@ pub mod site_root;
 #[cfg(unix)]
 pub mod stack_deploy;
 pub mod stack_service;
+#[cfg(unix)]
+pub mod static_artifact;
 pub mod system_autoupdates;
 pub mod system_autoupdates_install;
 #[cfg(unix)]
@@ -173,3 +175,10 @@ fn internal_error(operation: &'static str, _error: ResponseBuildError) -> Respon
         "The operation result could not be encoded safely",
     )
 }
+
+#[cfg(unix)]
+pub mod static_ingress;
+#[cfg(unix)]
+pub mod static_publish;
+#[cfg(unix)]
+pub mod static_publish_host;

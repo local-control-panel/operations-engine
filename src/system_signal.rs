@@ -503,7 +503,10 @@ mod tests {
         // Another test thread may have forked while this binary was being
         // copied. Reuse the runner's bounded ETXTBSY handling until that
         // child's inherited writable descriptor closes at exec.
+        // The runner's `sleep` may be a multi-call binary that dispatches on
+        // argv[0], so keep that as "sleep" while the file (and comm) is `name`.
         let mut command = Command::new(&program);
+        std::os::unix::process::CommandExt::arg0(&mut command, "sleep");
         command.arg("300");
         let mut child = crate::process::spawn_retrying_busy(&mut command).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);

@@ -46,7 +46,7 @@ pub fn execute(
     )
 }
 
-fn remove(
+pub(crate) fn remove(
     context: &ActivateContext<'_>,
     request: &RemoveRouteRequest,
 ) -> Result<RemoveRouteResult, RemoveRouteError> {

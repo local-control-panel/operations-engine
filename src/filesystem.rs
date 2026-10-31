@@ -258,6 +258,25 @@ impl ManagedRoot {
         Ok(children)
     }
 
+    /// Enumerate at most `limit` children, failing closed on overflow.
+    pub fn child_entries_bounded(&self, limit: usize) -> io::Result<Vec<ChildEntry>> {
+        let mut children = Vec::new();
+        for entry in self.directory.entries()? {
+            if children.len() == limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory entry limit exceeded",
+                ));
+            }
+            let entry = entry?;
+            children.push(ChildEntry {
+                name: entry.file_name(),
+                is_dir: entry.file_type()?.is_dir(),
+            });
+        }
+        Ok(children)
+    }
+
     /// Removes the empty directory `path` (never recursive).
     pub fn remove_dir(&self, path: &SiteRelativePath) -> io::Result<()> {
         self.directory.remove_dir(path.as_path())
@@ -557,6 +576,18 @@ impl ManagedRoot {
 
     pub fn read_link(&self, link: &SiteRelativePath) -> io::Result<PathBuf> {
         self.directory.read_link(link.as_path())
+    }
+
+    /// Moves a private staged tree into another managed root. Cross-device
+    /// renames fail closed; no copy fallback may expose partial content.
+    pub fn rename_to(
+        &self,
+        from: &SiteRelativePath,
+        destination: &Self,
+        to: &SiteRelativePath,
+    ) -> io::Result<()> {
+        self.directory
+            .rename(from.as_path(), &destination.directory, to.as_path())
     }
 
     /// Renames `from` to `to` within this same directory. This is the
