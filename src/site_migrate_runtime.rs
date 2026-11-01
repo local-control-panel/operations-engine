@@ -720,7 +720,7 @@ fn run(
                 )
             }
             Err(problem) => StepError::new(
-                error.code,
+                ErrorCode::RollbackIncomplete,
                 format!(
                     "{}; the rollback is incomplete and needs site.reconcile: {problem}",
                     error.message
