@@ -204,6 +204,7 @@ pub fn resource_scope(
     let root_prefix = match operation {
         "wordpress.clone" => Some("wordpress-clone"),
         "joomla.clone" => Some("joomla-clone"),
+        "drupal.clone" => Some("drupal-clone"),
         "wordpress.import" => Some("wordpress-import"),
         "wordpress.install" => Some("wordpress-install"),
         "wordpress.updateCore" | "wordpress.updatePlugins" | "wordpress.updateThemes" => {
@@ -483,11 +484,12 @@ pub struct IncompleteOperation {
 }
 
 /// Operations whose interrupted runs `site.reconcile` rolls back.
-const RECONCILED: [&str; 5] = [
+const RECONCILED: [&str; 6] = [
     "site.importArchive",
     "wordpress.migrateImport",
     "wordpress.clone",
     "joomla.clone",
+    "drupal.clone",
     "site.migrateRuntime",
 ];
 

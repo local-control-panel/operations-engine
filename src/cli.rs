@@ -363,6 +363,18 @@ pub enum DrupalCommand {
         #[arg(long = "request-file")]
         request_file: PathBuf,
     },
+    /// Clone a Drupal site's files and database into a staging directory on
+    /// the same server, with its own database credentials, a new hash salt
+    /// and the chosen safety defaults, under one lock/idempotency/
+    /// transaction/audit-backed request.
+    Clone {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl DrupalCommand {
@@ -375,6 +387,7 @@ impl DrupalCommand {
             Self::InstallDrush { .. } => "drupal.installDrush",
             Self::UpdateDb { .. } => "drupal.updateDb",
             Self::Watchdog { .. } => "drupal.watchdog",
+            Self::Clone { .. } => "drupal.clone",
         }
     }
 }

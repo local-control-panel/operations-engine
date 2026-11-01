@@ -42,6 +42,7 @@ pub mod docker_container;
 pub mod docker_prune;
 pub mod docker_resource;
 pub mod drupal_action;
+pub mod drupal_clone;
 #[cfg(unix)]
 pub mod drupal_watchdog;
 pub mod engine;
