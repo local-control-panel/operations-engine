@@ -485,29 +485,24 @@ mod tests {
         }
     }
 
-    fn which_sleep() -> std::path::PathBuf {
-        ["/bin/sleep", "/usr/bin/sleep"]
-            .iter()
-            .map(std::path::PathBuf::from)
-            .find(|p| p.exists())
-            .unwrap()
-    }
-
-    /// Spawns `sleep` under `name` (a copy of the binary) in its own
-    /// directory, and waits until the new image's comm is visible.
+    /// Spawns a shell blocked on stdin under `name` (a copy of the binary) in
+    /// its own directory, and waits until the new image's comm is visible. The
+    /// shell is used because a multi-call `sleep` (uutils on newer runners)
+    /// dispatches on its own file name and exits for an unknown one.
     fn spawn_named(name: &str) -> (tempfile::TempDir, Child) {
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join(name);
-        fs::copy(which_sleep(), &program).unwrap();
+        fs::copy("/bin/sh", &program).unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
         // Another test thread may have forked while this binary was being
         // copied. Reuse the runner's bounded ETXTBSY handling until that
         // child's inherited writable descriptor closes at exec.
-        // The runner's `sleep` may be a multi-call binary that dispatches on
-        // argv[0], so keep that as "sleep" while the file (and comm) is `name`.
+        // `read` is a builtin, so the image (and comm) stays `name`; the
+        // piped stdin the child keeps open holds it until it is signalled.
         let mut command = Command::new(&program);
-        std::os::unix::process::CommandExt::arg0(&mut command, "sleep");
-        command.arg("300");
+        command
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped());
         let mut child = crate::process::spawn_retrying_busy(&mut command).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let want: String = name.chars().take(MAX_COMM_LEN).collect();
