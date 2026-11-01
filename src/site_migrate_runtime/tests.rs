@@ -371,7 +371,8 @@ fn when_the_route_cannot_be_restored_the_target_stays_and_the_journal_is_kept() 
     fake.fail("probe:ingress");
     fake.fail("restore_route");
     let error = execute(&fx.state, &fake, &fx.request("php84", ID)).unwrap_err();
-    let (_, message) = error.protocol();
+    let (code, message) = error.protocol();
+    assert_eq!(code, ErrorCode::RollbackIncomplete, "{message}");
     assert!(message.contains("site.reconcile"), "{message}");
     assert!(
         fake.route().contains("runtime-php84"),

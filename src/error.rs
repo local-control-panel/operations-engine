@@ -64,6 +64,12 @@ pub enum ErrorCode {
     ConfigRecoveryFailed,
     /// A database import cannot be proven complete; its private rollback snapshot is retained.
     DatabaseRecoveryRequired,
+    /// The operation failed and the engine could not finish undoing its work;
+    /// the journal stays on the host for `site.reconcile`. Unlike the failing
+    /// step's own code (a compensated failure keeps that code), this one says
+    /// the outcome is not known to be clean, so a client never has to read the
+    /// message to tell the two apart.
+    RollbackIncomplete,
     /// An `ingress.unpark` was requested for a domain with no
     /// `.maintenance-backup` file — there is nothing to restore. Distinct
     /// from every `Config*` code above, since this is not a problem with
@@ -97,6 +103,7 @@ impl ErrorCode {
             Self::ConfigReloadFailed => "CONFIG_RELOAD_FAILED",
             Self::ConfigRecoveryFailed => "CONFIG_RECOVERY_FAILED",
             Self::DatabaseRecoveryRequired => "DATABASE_RECOVERY_REQUIRED",
+            Self::RollbackIncomplete => "ROLLBACK_INCOMPLETE",
             Self::IngressNotParked => "INGRESS_NOT_PARKED",
             Self::PermissionDenied => "PERMISSION_DENIED",
         }
@@ -194,6 +201,7 @@ mod tests {
                 ErrorCode::DatabaseRecoveryRequired,
                 "DATABASE_RECOVERY_REQUIRED",
             ),
+            (ErrorCode::RollbackIncomplete, "ROLLBACK_INCOMPLETE"),
         ];
         for (code, expected) in codes {
             assert_eq!(code.as_str(), expected);
