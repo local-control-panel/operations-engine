@@ -33,6 +33,13 @@ pub enum DatabaseType {
     Postgresql,
 }
 
+/// Database services a tool may point at: the closed set of Compose services
+/// the stack catalog can run, per database type.
+pub const MARIADB_SERVICES: &[&str] = &["mariadb-11", "mariadb-13"];
+pub const POSTGRES_SERVICES: &[&str] = &["postgres-17"];
+pub const DEFAULT_MARIADB_SERVICE: &str = "mariadb-11";
+pub const DEFAULT_POSTGRES_SERVICE: &str = "postgres-17";
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Plan {
@@ -40,6 +47,7 @@ struct Plan {
     action: Action,
     domain: Option<String>,
     database_type: Option<DatabaseType>,
+    database_service: Option<String>,
 }
 
 #[derive(Debug)]
@@ -48,6 +56,9 @@ pub struct Request {
     pub action: Action,
     pub domain: Option<Domain>,
     pub database_type: Option<DatabaseType>,
+    /// Compose service the tool connects to; `None` means the default of the
+    /// database type (`mariadb-11`, `postgres-17`).
+    pub database_service: Option<&'static str>,
     pub request_id: RequestId,
     pub idempotency_key: Option<IdempotencyKey>,
 }
@@ -66,7 +77,10 @@ impl Request {
         if plan.action == Action::Install && plan.domain.is_none() {
             return Err(RequestError::InvalidShape);
         }
-        if plan.action != Action::Install && (plan.domain.is_some() || plan.database_type.is_some())
+        if plan.action != Action::Install
+            && (plan.domain.is_some()
+                || plan.database_type.is_some()
+                || plan.database_service.is_some())
         {
             return Err(RequestError::InvalidShape);
         }
@@ -77,6 +91,16 @@ impl Request {
         {
             return Err(RequestError::InvalidShape);
         }
+        let allowed = match plan.database_type {
+            Some(DatabaseType::Postgresql) => POSTGRES_SERVICES,
+            _ => MARIADB_SERVICES,
+        };
+        let database_service = plan
+            .database_service
+            .as_deref()
+            .map(|v| allowed.iter().copied().find(|s| *s == v))
+            .map(|v| v.ok_or(RequestError::InvalidShape))
+            .transpose()?;
         let domain = plan
             .domain
             .as_deref()
@@ -88,6 +112,7 @@ impl Request {
             action: plan.action,
             domain,
             database_type: plan.database_type,
+            database_service,
             request_id: RequestId::parse(request_id).map_err(|_| RequestError::InvalidRequestId)?,
             idempotency_key: key
                 .map(IdempotencyKey::parse)
@@ -100,6 +125,13 @@ impl Request {
             Tool::PhpMyAdmin => "wcp-phpmyadmin",
             Tool::Adminer => "wcp-adminer",
         }
+    }
+    /// The database service the tool is wired to.
+    pub fn service(&self) -> &'static str {
+        self.database_service.unwrap_or(match self.database_type {
+            Some(DatabaseType::Postgresql) => DEFAULT_POSTGRES_SERVICE,
+            _ => DEFAULT_MARIADB_SERVICE,
+        })
     }
 }
 
