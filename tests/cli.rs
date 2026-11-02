@@ -112,6 +112,7 @@ fn capabilities_describe_only_implemented_operations() {
             "db.dropPostgres",
             "db.provisionPostgresUser",
             "db.dropPostgresUser",
+            "db.migrateMariadbLine",
             "dbTool.converge",
             "dbTool.remove",
             "compose.activateConfig",

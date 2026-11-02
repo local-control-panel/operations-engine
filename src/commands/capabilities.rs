@@ -155,6 +155,7 @@ pub const OPERATIONS: &[&str] = &[
     "db.dropPostgres",
     "db.provisionPostgresUser",
     "db.dropPostgresUser",
+    "db.migrateMariadbLine",
     "dbTool.converge",
     "dbTool.remove",
     "compose.activateConfig",
