@@ -11,6 +11,7 @@ pub mod engine;
 pub mod ingress;
 pub mod joomla;
 pub mod journal;
+pub mod mariadb_migrate;
 pub mod meilisearch;
 pub mod operation;
 pub mod permissions;

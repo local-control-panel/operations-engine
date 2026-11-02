@@ -264,6 +264,12 @@ pub fn resource_scope(
                 "runtime-config/{}",
                 crate::site::RuntimeId::parse(resource).map_err(|_| StatusError::InvalidScope)?
             ),
+            "db.migrateMariadbLine" => {
+                if resource != "wp-stack" {
+                    return Err(StatusError::InvalidScope);
+                }
+                "mariadb-migrate/wp-stack".into()
+            }
             "meilisearch.upgrade" => {
                 let name = crate::db_restore::ContainerName::parse(resource)
                     .map_err(|_| StatusError::InvalidScope)?;
