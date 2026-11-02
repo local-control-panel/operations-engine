@@ -158,29 +158,18 @@ fn commands(req: &Request) -> Vec<Vec<String>> {
         Action::Stop => vec![vec!["stop".into(), req.name().into()]],
         Action::Install => {
             let domain = req.domain.as_ref().unwrap().as_str();
+            let service = req.service();
             let (image, port_env, labels) = match req.tool {
                 Tool::PhpMyAdmin => (
                     PMA_IMAGE,
-                    vec!["-e", "PMA_HOST=mariadb-11", "-e", "PMA_PORT=3306"],
+                    vec![format!("PMA_HOST={service}"), "PMA_PORT=3306".to_string()],
                     vec![format!("wcp.pma.domain={domain}")],
                 ),
                 Tool::Adminer => {
                     let db = req.database_type.unwrap_or(DatabaseType::Mariadb);
-                    let server = if db == DatabaseType::Postgresql {
-                        "postgres-17"
-                    } else {
-                        "mariadb-11"
-                    };
                     (
                         ADMINER_IMAGE,
-                        vec![
-                            "-e",
-                            if server == "postgres-17" {
-                                "ADMINER_DEFAULT_SERVER=postgres-17"
-                            } else {
-                                "ADMINER_DEFAULT_SERVER=mariadb-11"
-                            },
-                        ],
+                        vec![format!("ADMINER_DEFAULT_SERVER={service}")],
                         vec![
                             format!("wcp.adminer.domain={domain}"),
                             format!(
@@ -211,7 +200,7 @@ fn commands(req: &Request) -> Vec<Vec<String>> {
                 run.extend(["--label".into(), l]);
             }
             for v in port_env {
-                run.push(v.into());
+                run.extend(["-e".into(), v]);
             }
             run.push(image.into());
             vec![
@@ -290,5 +279,59 @@ mod tests {
         let c = commands(&r);
         assert!(c[1].contains(&PMA_IMAGE.to_string()));
         assert!(!c.iter().flatten().any(|v| v.contains(';')));
+    }
+
+    const ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    fn env_of(json: &str) -> Vec<String> {
+        let r = Request::parse(json, ID, None).unwrap();
+        let run = &commands(&r)[1];
+        run.windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].clone())
+            .collect()
+    }
+    #[test]
+    fn a_request_without_a_service_keeps_the_old_targets() {
+        assert_eq!(
+            env_of(r#"{"tool":"phpMyAdmin","action":"install","domain":"db.example.com"}"#),
+            ["PMA_HOST=mariadb-11", "PMA_PORT=3306"]
+        );
+        assert_eq!(
+            env_of(
+                r#"{"tool":"adminer","action":"install","domain":"db.example.com","databaseType":"postgresql"}"#
+            ),
+            ["ADMINER_DEFAULT_SERVER=postgres-17"]
+        );
+    }
+    #[test]
+    fn the_requested_service_reaches_the_tool_environment() {
+        assert_eq!(
+            env_of(
+                r#"{"tool":"phpMyAdmin","action":"install","domain":"db.example.com","databaseType":"mariadb","databaseService":"mariadb-13"}"#
+            ),
+            ["PMA_HOST=mariadb-13", "PMA_PORT=3306"]
+        );
+        assert_eq!(
+            env_of(
+                r#"{"tool":"adminer","action":"install","domain":"db.example.com","databaseService":"mariadb-13"}"#
+            ),
+            ["ADMINER_DEFAULT_SERVER=mariadb-13"]
+        );
+    }
+    #[test]
+    fn a_service_outside_the_catalog_or_the_database_type_is_refused() {
+        for json in [
+            r#"{"tool":"phpMyAdmin","action":"install","domain":"db.example.com","databaseService":"mariadb-12"}"#,
+            r#"{"tool":"phpMyAdmin","action":"install","domain":"db.example.com","databaseService":"x --privileged"}"#,
+            r#"{"tool":"adminer","action":"install","domain":"db.example.com","databaseType":"postgresql","databaseService":"mariadb-13"}"#,
+            r#"{"tool":"adminer","action":"install","domain":"db.example.com","databaseType":"mariadb","databaseService":"postgres-17"}"#,
+            r#"{"tool":"adminer","action":"start","databaseService":"mariadb-13"}"#,
+        ] {
+            assert_eq!(
+                Request::parse(json, ID, None).unwrap_err(),
+                crate::db_tool::RequestError::InvalidShape,
+                "{json}"
+            );
+        }
     }
 }
