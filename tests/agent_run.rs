@@ -29,7 +29,7 @@ fn install(dir: &Path, name: &str, script: &str) {
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(
-        dir.join("agents/manifest.json"),
+        dir.join("manifest.json"),
         format!(r#"{{"{name}":{{"version":"1.0.0"}}}}"#),
     )
     .unwrap();

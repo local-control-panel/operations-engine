@@ -259,7 +259,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("agents")).unwrap();
         fs::write(
-            dir.path().join("agents/manifest.json"),
+            dir.path().join("manifest.json"),
             r#"{"demo":{"version":"1.0.0"}}"#,
         )
         .unwrap();
