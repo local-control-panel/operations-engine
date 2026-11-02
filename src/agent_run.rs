@@ -134,7 +134,7 @@ fn tail(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn installed(dir: &Path, name: &str) -> bool {
-    let Ok(text) = fs::read_to_string(dir.join("agents").join("manifest.json")) else {
+    let Ok(text) = fs::read_to_string(dir.join(crate::agent_lifecycle::MANIFEST_FILE)) else {
         return false;
     };
     matches!(serde_json::from_str::<Value>(&text), Ok(Value::Object(map)) if map.contains_key(name))
@@ -307,7 +307,7 @@ mod tests {
             let path = self.wcp().join("agents").join(format!("{name}.sh"));
             fs::write(&path, script).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-            let manifest = self.wcp().join("agents/manifest.json");
+            let manifest = self.wcp().join("manifest.json");
             let mut map: serde_json::Map<String, Value> = fs::read_to_string(&manifest)
                 .ok()
                 .and_then(|text| serde_json::from_str(&text).ok())
