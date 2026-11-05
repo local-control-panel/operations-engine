@@ -119,6 +119,19 @@ pub fn execute(
 }
 const IMAGE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// `docker run` pulls a missing image first, which takes longer than the
+/// default limit on a cold host.
+fn limits_for(args: &[String]) -> ProcessLimits {
+    if args.first().is_some_and(|a| a == "run") {
+        ProcessLimits {
+            timeout: IMAGE_PULL_TIMEOUT,
+            ..ProcessLimits::default()
+        }
+    } else {
+        ProcessLimits::default()
+    }
+}
+
 fn run(
     ctx: &Context<'_>,
     req: &Request,
@@ -126,16 +139,7 @@ fn run(
 ) -> std::result::Result<(), Error> {
     let commands = commands(req);
     for (index, args) in commands.into_iter().enumerate() {
-        // `docker run` pulls a missing image first, which takes longer than the
-        // default limit on a cold host.
-        let limits = if args.first().is_some_and(|a| a == "run") {
-            ProcessLimits {
-                timeout: IMAGE_PULL_TIMEOUT,
-                ..ProcessLimits::default()
-            }
-        } else {
-            ProcessLimits::default()
-        };
+        let limits = limits_for(&args);
         let out = process::run(
             &ProcessRequest::new(ctx.docker_program).args(args),
             &limits,
@@ -293,8 +297,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let firsts: Vec<_> = commands(&r).into_iter().map(|c| c[0].clone()).collect();
-        assert_eq!(firsts, ["rm", "run", "network"]);
+        let timeouts: Vec<_> = commands(&r).iter().map(|c| limits_for(c).timeout).collect();
+        let short = ProcessLimits::default().timeout;
+        assert_eq!(timeouts, [short, IMAGE_PULL_TIMEOUT, short]);
+        assert!(IMAGE_PULL_TIMEOUT > short);
     }
     #[test]
     fn install_argv_is_fixed_and_pinned() {
