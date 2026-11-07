@@ -366,7 +366,7 @@ impl<'a> DockerDriver<'a> {
         let roles = self.sql(
             id,
             password,
-            "SELECT COUNT(*) FROM mysql.user WHERE is_role = 'Y'",
+            "SELECT COUNT(*) FROM mysql.user WHERE CAST(is_role AS BINARY) = 'Y'",
         )?;
         if roles.trim() != "0" {
             return Err(Error::UnsupportedName);
@@ -606,7 +606,8 @@ impl Driver for DockerDriver<'_> {
             self.checked(output)?;
         }
         // `mariadb-dump --system=users` joins `mysql.user` columns of two
-        // collations and fails on the 11.4 image, so the accounts are read
+        // collations and fails on the 11.4 image (comparing `is_role` to a
+        // literal does too, hence the cast), so the accounts are read
         // with `SHOW CREATE USER` / `SHOW GRANTS` instead.
         let accounts = self.account_statements(&id, password)?;
         {
