@@ -115,6 +115,15 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => provision_mariadb(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::MigrateMariadbLine {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::mariadb_migrate::run(
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         DbCommand::DropMariadb {
             request_file,
             request_id,

@@ -76,6 +76,16 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Move the databases and accounts to another MariaDB line's service and
+    /// give that server the old service name.
+    MigrateMariadbLine {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Drop a non-system MariaDB database through a fixed client invocation.
     DropMariadb {
         #[arg(long = "request-file")]
@@ -287,6 +297,7 @@ impl DbCommand {
             Self::ToolConverge { .. } => "dbTool.converge",
             Self::ToolRemove { .. } => "dbTool.remove",
             Self::ProvisionMariadb { .. } => "db.provisionMariaDb",
+            Self::MigrateMariadbLine { .. } => "db.migrateMariadbLine",
             Self::DropMariadb { .. } => "db.dropMariaDb",
             Self::DropMariadbUser { .. } => "db.dropMariaDbUser",
             Self::ClearMariadbSlowLog { .. } => "db.clearMariaSlowLog",
