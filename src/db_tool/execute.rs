@@ -117,6 +117,21 @@ pub fn execute(
     drop(lock);
     Ok(result)
 }
+const IMAGE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// `docker run` pulls a missing image first, which takes longer than the
+/// default limit on a cold host.
+fn limits_for(args: &[String]) -> ProcessLimits {
+    if args.first().is_some_and(|a| a == "run") {
+        ProcessLimits {
+            timeout: IMAGE_PULL_TIMEOUT,
+            ..ProcessLimits::default()
+        }
+    } else {
+        ProcessLimits::default()
+    }
+}
+
 fn run(
     ctx: &Context<'_>,
     req: &Request,
@@ -124,9 +139,10 @@ fn run(
 ) -> std::result::Result<(), Error> {
     let commands = commands(req);
     for (index, args) in commands.into_iter().enumerate() {
+        let limits = limits_for(&args);
         let out = process::run(
             &ProcessRequest::new(ctx.docker_program).args(args),
-            &ProcessLimits::default(),
+            &limits,
             cancel,
         )
         .map_err(Error::Run)?;
@@ -273,6 +289,19 @@ fn fail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_the_run_command_gets_the_long_pull_timeout() {
+        let r = Request::parse(
+            r#"{"tool":"adminer","action":"install","domain":"db.example.com"}"#,
+            "123e4567-e89b-12d3-a456-426614174000",
+            None,
+        )
+        .unwrap();
+        let timeouts: Vec<_> = commands(&r).iter().map(|c| limits_for(c).timeout).collect();
+        let short = ProcessLimits::default().timeout;
+        assert_eq!(timeouts, [short, IMAGE_PULL_TIMEOUT, short]);
+        assert!(IMAGE_PULL_TIMEOUT > short);
+    }
     #[test]
     fn install_argv_is_fixed_and_pinned() {
         let r=Request::parse(r#"{"tool":"phpMyAdmin","action":"install","domain":"db.example.com","databaseType":"mariadb"}"#,"123e4567-e89b-12d3-a456-426614174000",None).unwrap();
