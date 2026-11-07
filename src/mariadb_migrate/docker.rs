@@ -354,6 +354,48 @@ impl<'a> DockerDriver<'a> {
         self.stack_dir.join(".env")
     }
 
+    /// `CREATE OR REPLACE USER` and `GRANT` statements for every application
+    /// account. Roles are not carried (their default-role links are not
+    /// reproduced), so a server that has any is refused.
+    fn account_statements(&self, id: &str, password: &str) -> Result<String, Error> {
+        let built_in = BUILT_IN_ACCOUNTS
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let roles = self.sql(
+            id,
+            password,
+            "SELECT COUNT(*) FROM mysql.user WHERE is_role = 'Y'",
+        )?;
+        if roles.trim() != "0" {
+            return Err(Error::UnsupportedName);
+        }
+        let listed = self.sql(
+            id,
+            password,
+            &format!(
+                "SELECT user, host FROM mysql.user \
+                 WHERE user <> '' AND user NOT IN ({built_in}) ORDER BY 1, 2"
+            ),
+        )?;
+        let mut statements = String::new();
+        for line in listed.lines() {
+            let (user, host) = line.split_once('\t').ok_or(Error::InvalidOutput)?;
+            let account = format!("`{}`@`{}`", account_part(user)?, account_part(host)?);
+            for statement in [
+                format!("SHOW CREATE USER {account}"),
+                format!("SHOW GRANTS FOR {account}"),
+            ] {
+                for row in self.sql(id, password, &statement)?.lines() {
+                    statements.push_str(row);
+                    statements.push_str(";\n");
+                }
+            }
+        }
+        Ok(filter_account_statements(&statements))
+    }
+
     fn alias_variable(service: &str) -> String {
         format!("WCP_MARIADB_{}_ALIAS", major_of(service))
     }
@@ -373,7 +415,21 @@ fn plain_identifier(name: &str) -> Result<&str, Error> {
     Ok(name)
 }
 
-/// Keeps what a `mariadb-dump --system=users` dump says about application
+/// A user or host part that can sit inside backticks in a fixed statement:
+/// like `plain_identifier`, plus `.`, `%`, `:` (host patterns and addresses).
+fn account_part(name: &str) -> Result<&str, Error> {
+    if name.is_empty()
+        || name.len() > 80
+        || !name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$' | b'-' | b'.' | b'%' | b':')
+        })
+    {
+        return Err(Error::UnsupportedName);
+    }
+    Ok(name)
+}
+
+/// Keeps what the account statements say about application
 /// accounts: their `CREATE USER`, `GRANT`, role and default-role statements.
 /// The images' own accounts and the dump tool's helper role are dropped, and
 /// `CREATE USER` becomes `CREATE OR REPLACE USER` so the target's initial
@@ -549,24 +605,14 @@ impl Driver for DockerDriver<'_> {
                     .map_err(Error::Process)?;
             self.checked(output)?;
         }
-        let users_path = path.with_extension("users.tmp");
-        let users_file = private_file(&users_path, false).map_err(Error::Io)?;
-        let output = process::run_with_stdout_file(
-            &dump_client(&["--system=users"]),
-            users_file,
-            &limits,
-            cancellation,
-        )
-        .map_err(Error::Process)?;
-        let checked = self.checked(output);
-        let users = fs::read_to_string(&users_path);
-        let _ = fs::remove_file(&users_path);
-        checked?;
+        // `mariadb-dump --system=users` joins `mysql.user` columns of two
+        // collations and fails on the 11.4 image, so the accounts are read
+        // with `SHOW CREATE USER` / `SHOW GRANTS` instead.
+        let accounts = self.account_statements(&id, password)?;
         {
             use std::io::Write;
             let mut main = private_file(&path, true).map_err(Error::Io)?;
-            main.write_all(filter_account_statements(&users.map_err(Error::Io)?).as_bytes())
-                .map_err(Error::Io)?;
+            main.write_all(accounts.as_bytes()).map_err(Error::Io)?;
             main.sync_all().map_err(Error::Io)?;
         }
         let metadata = fs::symlink_metadata(&path).map_err(Error::Io)?;
@@ -800,6 +846,16 @@ GRANT ALL PRIVILEGES ON `site_a`.* TO `ua`@`%`;
         }
         for bad in ["", "a`b", "a b", "a;b", "a'b", "é", "a.b", &"x".repeat(65)] {
             assert!(plain_identifier(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_plain_account_parts_reach_a_statement() {
+        for ok in ["ua", "wp-1", "%", "10.0.0.%", "::1", "db.example.com"] {
+            assert!(account_part(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "a`b", "a b", "a'b", "a;b", "a\\b", &"x".repeat(81)] {
+            assert!(account_part(bad).is_err(), "{bad:?}");
         }
     }
 
