@@ -5,7 +5,7 @@
 //!
 //! Sibling to `crate::ingress` (`ingress.activateConfig`'s operation for the
 //! shared ingress route), but for the *other* directory `activate_caddyfile`
-//! writes: `website-control-panel`'s `RUNTIME_CONTAINER_CONFIG_DIR`
+//! writes: `orbden`'s `RUNTIME_CONTAINER_CONFIG_DIR`
 //! (`/etc/wcp/runtime.d` inside a `runtime-<id>` container, backed by
 //! `/etc/wcp/runtimes/<id>` on the host) — a per-site exec-config fragment
 //! for whichever runtime pool a site is currently assigned to, not the
@@ -47,7 +47,7 @@ pub const OPERATION: &str = "runtime.activateConfig";
 pub const REMOVE_OPERATION: &str = "runtime.removeConfig";
 
 /// Where a runtime-service container sees its config fragments, regardless
-/// of which `runtime_id` it is: `website-control-panel`'s
+/// of which `runtime_id` it is: `orbden`'s
 /// `RUNTIME_CONTAINER_CONFIG_DIR` (`runtime_pool/mod.rs`), reproduced here
 /// rather than shared across the process boundary. `runtime_root` on the
 /// host nests one directory per `runtime_id`

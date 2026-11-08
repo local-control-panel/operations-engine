@@ -89,7 +89,7 @@ Remaining release blockers, in order:
 1. Replace the deliberately public TEST-ONLY release signing key with a real
    production key and configure the release workflow secrets.
 2. Cut and verify a real tagged release.
-3. Wire `website-control-panel` to request an explicit engine version and use
+3. Wire `orbden` to request an explicit engine version and use
    the signed release instead of building its test fixture from source.
 4. Exercise the documented install, upgrade, failed-upgrade recovery, and
    rollback procedure on an opt-in Linux test server.

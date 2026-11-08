@@ -10,7 +10,7 @@
 //! preserve/report when they differ because that is also a normally parked
 //! site and cannot safely be guessed from filesystem state alone.
 //!
-//! A direct behavioral port of `website-control-panel`'s
+//! A direct behavioral port of `orbden`'s
 //! `reconciliation.rs::sweep`, narrowed to the two orphan classes that need
 //! only `ingressRoot` itself (see the milestone doc's "Scope" section for
 //! what is deliberately deferred and why). Unlike that raw-SSH `find`/`rm`/
@@ -410,7 +410,7 @@ fn with_ban_import(raw: &str) -> Option<String> {
     Some(format!("{}\n", lines.join("\n")))
 }
 
-/// `*.tmp` or `*.tmp-*`, matching `website-control-panel`'s
+/// `*.tmp` or `*.tmp-*`, matching `orbden`'s
 /// `reconciliation.rs::classify_staging_files`'s scope exactly (this
 /// engine's own `activate::activate` only ever produces the bare `.tmp`
 /// form; the `-suffix` form is a legacy client-side naming this sweep

@@ -43,7 +43,7 @@ auto-updates and every rollout is manual and per-server by construction.
 Before rolling a new version out broadly:
 
 1. Run `engine install`/`engine rollback` against the
-   `website-control-panel` repo's `docker/test-server` fixture first.
+   `orbden` repo's `docker/test-server` fixture first.
 2. Run it against exactly one real managed server and confirm
    `capabilities`/`version` report the expected result.
 3. Only then roll out to additional servers, one at a time.

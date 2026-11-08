@@ -13,7 +13,7 @@ configuration changes"
 
 ## Why this, why now, why scoped this way
 
-`website-control-panel`'s `src-tauri/src/commands/runtime_pool.rs` has one
+`orbden`'s `src-tauri/src/commands/runtime_pool.rs` has one
 function, `activate_caddyfile`/`activate_caddyfile_checked`
 (`runtime_pool.rs:834-1038`), that is the write path for essentially every
 site-config mutation: basic auth, redirects, security headers, access logs,
@@ -50,7 +50,7 @@ Two things this engine has never done before, both scoped narrowly:
 2. **Talking to Docker Compose.** Validating and reloading a config means
    running `docker compose exec -T <service> caddy validate|reload ...`
    inside the always-fixed shared "wcp" stack
-   (`website-control-panel/src-tauri/src/commands/mod.rs:39-40`:
+   (`orbden/src-tauri/src/commands/mod.rs:39-40`:
    `STACK_COMPOSE_PROJECT = "wcp"`, `STACK_REMOTE_BASE = "~/compose/wp-stack"`
    — both compiled-in constants there, never configurable at runtime; mirror
    that exactly here as compiled-in constants, not new config fields, per
@@ -83,7 +83,7 @@ Two things this engine has never done before, both scoped narrowly:
   locally. Tests fake the `docker` binary the same way Phase 7's
   `tests/engine.rs` faked the engine binary itself (a small script/binary
   stand-in exercised through the real `process::run` path) — see Task 5.
-  The *website-control-panel* side (Task 6) gets the real, Docker-backed
+  The *orbden* side (Task 6) gets the real, Docker-backed
   end-to-end proof, against the existing `docker/test-server` SSH fixture
   stack that already runs a real ingress container.
 
@@ -108,7 +108,7 @@ Exit: `cargo test config::` green, including a new test asserting
 
 New module `src/compose.rs`:
 
-- Compiled-in constants mirroring `website-control-panel`'s exactly:
+- Compiled-in constants mirroring `orbden`'s exactly:
   `COMPOSE_PROJECT = "wcp"`, `COMPOSE_BASE_DIR` — resolve `~` to the
   invoking user's actual home directory at runtime (this engine runs as
   root under `sudo`, so "the invoking user's home" needs a real answer —
@@ -158,14 +158,14 @@ using `compose::exec` from Task 2 instead of shell strings):
    Container-side path: same convention `activate_caddyfile` uses
    (`container_dest` mirrors `host_dest`'s relative position under the
    ingress container's own config mount — confirm the exact mount path
-   from `website-control-panel`'s Docker Compose stack definition, likely
+   from `orbden`'s Docker Compose stack definition, likely
    under `docker/` or `stack/` in that repo, rather than guessing).
    Non-zero exit → remove the `.tmp` file, fail closed, nothing live
    touched.
 5. If a prior file exists at `host_dest`, copy it to
    `host_dest.rollback-<random-hex>` first (reuse whatever random-suffix
    helper this engine already has, or add one matching
-   `website-control-panel`'s `random_hex_suffix` in spirit). Rename `.tmp`
+   `orbden`'s `random_hex_suffix` in spirit). Rename `.tmp`
    over `host_dest`.
 6. `compose::exec(INGRESS_SERVICE, ["caddy", "reload", "--config",
    "/etc/caddy/Caddyfile", "--adapter", "caddyfile"], ...)`. On failure:
@@ -219,7 +219,7 @@ failure with successful rollback (fake `docker` exits non-zero only on
 `reload`, only once). No real Docker Compose or Caddy involved here — that
 proof is Task 6's job, against the real stack.
 
-## Task 6 — `website-control-panel`: wire `disable_basic_auth`
+## Task 6 — `orbden`: wire `disable_basic_auth`
 
 In `commands/ops_engine.rs`, add `ops_engine_ingress_activate_config` (or
 match whatever this plan's Task 4 named the operation) mirroring the

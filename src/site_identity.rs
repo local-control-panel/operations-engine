@@ -1434,7 +1434,7 @@ mod tests {
 
     #[test]
     fn the_account_name_matches_the_panels_slug() {
-        // `site_user_slug("example.test")` in website-control-panel.
+        // `site_user_slug("example.test")` in orbden.
         assert_eq!(
             derived_user(&Domain::parse("example.test").unwrap()),
             "wcp-site-9b263fbcb5898531"

@@ -69,7 +69,7 @@ const LIBRARY: &str = include_str!("../resources/agents/wcp_agent_lib.py");
 /// third-party. The maintainers check the name when they review the pull
 /// request that adds an agent. The agents repository's checker and the panel
 /// hold the same constant.
-pub const FIRST_PARTY_AUTHOR: &str = "Website Control Panel";
+pub const FIRST_PARTY_AUTHOR: &str = "OrbDen";
 
 /// Whether `author` names the project itself.
 pub fn is_first_party(author: &str) -> bool {
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn the_built_in_agents_are_first_party_and_a_lookalike_is_not() {
         assert!(AGENTS.iter().all(|agent| is_first_party(agent.author)));
-        for other in ["", "website control panel", "Website Control Panel ", "Ada"] {
+        for other in ["", "orbden", "OrbDen ", "Ada"] {
             assert!(!is_first_party(other), "{other:?}");
         }
     }

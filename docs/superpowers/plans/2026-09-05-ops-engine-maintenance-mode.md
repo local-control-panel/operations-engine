@@ -6,32 +6,32 @@ Status: completed for `operations-engine`; archived 2026-09-28
 > `ingress.park`/`ingress.unpark` engine operations described here were
 > delivered. The unchecked boxes below preserve the original cross-repository
 > execution sequence; they are not an active backlog. Any current
-> `website-control-panel` integration status must be checked in that repository.
+> `orbden` integration status must be checked in that repository.
 > Current engine priorities live in
 > [`../../../PLAN.md`](../../../PLAN.md).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Teach `operations-engine` to model `website-control-panel`'s maintenance-mode `.maintenance-backup` file, so the 6 already-migrated ingress call sites (`disable_basic_auth`, `update_raw_ingress_route`, `enable_access_log`, `set_security_headers`, `set_redirects`, `set_ip_acl`) — and `set_maintenance` itself — can go through the engine instead of falling back to legacy raw-SSH when a site is parked.
+**Goal:** Teach `operations-engine` to model `orbden`'s maintenance-mode `.maintenance-backup` file, so the 6 already-migrated ingress call sites (`disable_basic_auth`, `update_raw_ingress_route`, `enable_access_log`, `set_security_headers`, `set_redirects`, `set_ip_acl`) — and `set_maintenance` itself — can go through the engine instead of falling back to legacy raw-SSH when a site is parked.
 
-**Architecture:** Two new engine operations, `ingress.park` and `ingress.unpark`, model the park/unpark transition itself (each its own transaction/audit record). `ingress.activateConfig` gains a `target: RouteTarget` field (`Live` | `Backup`) so the 6 already-migrated call sites can write to a parked domain's backup file — hash-guarded, but with no Caddy validate/reload, since the backup file is never imported by the live Caddyfile. `website-control-panel`'s `set_maintenance` splits into an engine-or-legacy dispatcher exactly like `disable_basic_auth`/`disable_basic_auth_legacy` already does.
+**Architecture:** Two new engine operations, `ingress.park` and `ingress.unpark`, model the park/unpark transition itself (each its own transaction/audit record). `ingress.activateConfig` gains a `target: RouteTarget` field (`Live` | `Backup`) so the 6 already-migrated call sites can write to a parked domain's backup file — hash-guarded, but with no Caddy validate/reload, since the backup file is never imported by the live Caddyfile. `orbden`'s `set_maintenance` splits into an engine-or-legacy dispatcher exactly like `disable_basic_auth`/`disable_basic_auth_legacy` already does.
 
-**Tech Stack:** Rust (both repos). `operations-engine`: `cap-std`-backed `ManagedRoot`, `compose::exec` for `docker compose exec`, existing `mutation::preflight`/`transaction::{state,audit,commit}` pipeline. `website-control-panel`: Tauri commands over SSH, existing `ops_engine::invoke` CLI-shell-out pattern.
+**Tech Stack:** Rust (both repos). `operations-engine`: `cap-std`-backed `ManagedRoot`, `compose::exec` for `docker compose exec`, existing `mutation::preflight`/`transaction::{state,audit,commit}` pipeline. `orbden`: Tauri commands over SSH, existing `ops_engine::invoke` CLI-shell-out pattern.
 
 **Spec:** No separate spec document — the design below was agreed interactively in chat (four explicit decisions, recorded here so the plan is self-contained):
 1. Model park/unpark as two new first-class engine operations (`ingress.park`, `ingress.unpark`), not as a mode flag on `activateConfig`.
 2. The backup file (`<domain>.maintenance-backup`) stays under the existing `ingressRoot` — no new `TrustedRoot`/schema field, no schema bump. It gets a second deterministic filename-derivation function alongside `route_path`.
-3. `website-control-panel`'s `set_maintenance()` itself migrates to call the new engine operations (not just future/other consumers of the backup format) — same engine-or-legacy dispatch shape as `disable_basic_auth`.
+3. `orbden`'s `set_maintenance()` itself migrates to call the new engine operations (not just future/other consumers of the backup format) — same engine-or-legacy dispatch shape as `disable_basic_auth`.
 4. `ingress.activateConfig` gains a `target: Live | Backup` field so the 6 already-migrated call sites can write to a parked domain's backup while it stays parked, instead of falling back to legacy. `Backup` skips Caddy validate/reload entirely (the backup file is inert).
 
 ## Global Constraints
 
-- Work directly on `main` (operations-engine) / `master` (website-control-panel), no feature branches.
+- Work directly on `main` (operations-engine) / `master` (orbden), no feature branches.
 - Commit only when the user explicitly asks; never add a `Co-Authored-By:` trailer.
-- `operations-engine`'s protocol surface (Tasks 1–6) must land and be pushed to `origin/main` (Task 6's final step) before `website-control-panel`'s client-side tasks (7–10) are built or tested against it — same sequencing the ingress-config-activation pilot used. Task 11 (`PLAN.md` sync) is back in `operations-engine`, after both repos are done.
+- `operations-engine`'s protocol surface (Tasks 1–6) must land and be pushed to `origin/main` (Task 6's final step) before `orbden`'s client-side tasks (7–10) are built or tested against it — same sequencing the ingress-config-activation pilot used. Task 11 (`PLAN.md` sync) is back in `operations-engine`, after both repos are done.
 - Every new filesystem operation on the engine side goes through `ManagedRoot`/`TrustedRoot` — never a bare `std::fs` call reachable from a request.
 - No protocol response message may contain a path, subprocess output, or a config fragment (`docs/protocol.md`'s `details` allowlist — see `ActivateConfigError::protocol()` for the existing pattern to match).
-- Docker-backed website-control-panel tests: an isolated single-test run against the long-lived shared fixture stack is unreliable; `cargo test --lib workflow_tests:: -- --test-threads=1` is the authoritative check on any mismatch.
+- Docker-backed orbden tests: an isolated single-test run against the long-lived shared fixture stack is unreliable; `cargo test --lib workflow_tests:: -- --test-threads=1` is the authoritative check on any mismatch.
 - After Task 12, `operations-engine/PLAN.md`'s Phase 8 section must reflect this sub-project as shipped (it has desynced twice before in this initiative).
 
 ---
@@ -355,7 +355,7 @@ git commit -m "Wire ingress.park/ingress.unpark into the CLI and capabilities"
 
 ---
 
-## Task 7 — `website-control-panel`: target-aware backup writes for the 6 migrated call sites
+## Task 7 — `orbden`: target-aware backup writes for the 6 migrated call sites
 
 **Files:**
 - Modify: `src-tauri/src/commands/runtime_pool.rs` (`activate_ingress_route_via_engine_or`, its call to `ops_engine_activate_ingress_config_inner`)
@@ -529,7 +529,7 @@ git add PLAN.md
 git commit -m "Sync Phase 8 status: maintenance-mode park/unpark is shipped"
 ```
 
-- [ ] **Step 3: Push both repos** (`operations-engine main`, `website-control-panel master`) after confirming with the user.
+- [ ] **Step 3: Push both repos** (`operations-engine main`, `orbden master`) after confirming with the user.
 
 ---
 
@@ -537,4 +537,4 @@ git commit -m "Sync Phase 8 status: maintenance-mode park/unpark is shipped"
 
 - Migrating any of the remaining ~21 non-maintenance-related `activate_caddyfile` call sites (`create_site`, `rename_site`, `migrate_site_runtime_impl`, etc.) — unrelated to maintenance-mode, already called out as out of scope in the pilot/batch-2 plans for their own reasons.
 - Reconciliation/orphan-detection awareness of `.maintenance-backup` files left behind by a crashed `park`/`unpark` (Task 4's Step 1 "orphaned backup" test covers the one specific race this plan's own operations can cause; a broader reconciliation sweep for maintenance-backup files is a separate concern, parallel to how `reconciliation.rs`'s existing scope excludes `set_maintenance` today per the pilot plan's own "out of scope" section).
-- Any UI/UX change to how `website-control-panel`'s maintenance-mode toggle is presented — this plan is purely about which write path (engine vs. legacy) executes underneath, not the feature's user-facing behavior, which must be unchanged before and after.
+- Any UI/UX change to how `orbden`'s maintenance-mode toggle is presented — this plan is purely about which write path (engine vs. legacy) executes underneath, not the feature's user-facing behavior, which must be unchanged before and after.

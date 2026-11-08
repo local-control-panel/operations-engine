@@ -1,7 +1,7 @@
 # Operations Engine
 
 Operations Engine is a Linux command-line execution layer for typed server
-mutations. A control plane, currently `website-control-panel`, invokes
+mutations. A control plane, currently OrbDen, invokes
 `ops-engine` over SSH and receives a versioned JSON response. The engine runs
 on the managed host; it has no daemon or inbound API.
 
@@ -13,7 +13,7 @@ those gates.
 ## How it works
 
 ```text
-website-control-panel or another client
+OrbDen or another client
     -> SSH: ops-engine <command> --output json
     -> validated operation on the managed Linux host
     -> Docker, Git, filesystem, database, or system service

@@ -224,7 +224,7 @@ pub fn execute(
 
 /// `crontab -l`. A non-zero exit (typically "no crontab for <user>") is
 /// treated as an absent tab, not an error - the same tolerance
-/// `website-control-panel`'s own `crontab -l 2>/dev/null || echo ""` already
+/// `orbden`'s own `crontab -l 2>/dev/null || echo ""` already
 /// applies client-side.
 pub(crate) fn read_current_tab(
     crontab_program: &str,

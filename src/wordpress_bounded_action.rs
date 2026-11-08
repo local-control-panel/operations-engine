@@ -1,6 +1,6 @@
 //! The `wordpress.boundedAction` operation: a small, fixed set of one-shot
 //! WordPress mutations that each previously ran as an unvalidated raw
-//! `docker exec ... wp ...` call from `website-control-panel` - creating a
+//! `docker exec ... wp ...` call from `orbden` - creating a
 //! subsite in a multisite network, flipping a multisite network between
 //! subdomain and subdirectory mode, and clearing all WooCommerce
 //! transients. None of the three has enough independent shape to justify

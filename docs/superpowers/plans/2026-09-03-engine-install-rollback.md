@@ -32,7 +32,7 @@ Status: completed for `operations-engine`; archived 2026-09-28
 
 ## Scope note
 
-This plan covers only the `operations-engine` repository (this repo). The companion `website-control-panel` changes (Tauri commands calling `engine install`/`engine rollback`, resolving which version to request, and rewriting `docker/test-server/build-ops-engine.sh` to download real signed releases instead of building locally) are **out of scope** for this plan and need their own plan once this ships a real tagged release to point at — the spec's §9 covers that side's design; it is not implemented here.
+This plan covers only the `operations-engine` repository (this repo). The companion `orbden` changes (Tauri commands calling `engine install`/`engine rollback`, resolving which version to request, and rewriting `docker/test-server/build-ops-engine.sh` to download real signed releases instead of building locally) are **out of scope** for this plan and need their own plan once this ships a real tagged release to point at — the spec's §9 covers that side's design; it is not implemented here.
 
 ## Deviation from the spec
 
@@ -485,7 +485,7 @@ Create `src/engine/release.rs`:
 //! URL (see the design spec's "no ambient discovery" rule). `base_url` is
 //! a parameter, not a hardcoded constant, purely so tests can point it at
 //! a local fixture server; every production call site passes the one
-//! `GITHUB_RELEASES_BASE` constant in `commands/engine.rs`.
+//! `ENGINE_RELEASES_BASE` constant in `commands/engine.rs`.
 
 use std::fmt;
 
@@ -1126,7 +1126,7 @@ pub struct InstallContext<'a> {
     /// The GitHub Releases base URL every asset is fetched relative to.
     /// A parameter (not a hardcoded constant in this file) purely so
     /// tests can point it at a local fixture server; every production
-    /// call site passes `commands::engine::GITHUB_RELEASES_BASE`.
+    /// call site passes `commands::engine::ENGINE_RELEASES_BASE`.
     pub release_base_url: &'a str,
 }
 
@@ -1890,7 +1890,7 @@ git commit -m "Add the engine install/rollback CLI subcommand tree"
 
 **Interfaces:**
 - Consumes: `EngineCommand` (Task 11); `EngineInstallRequest`/`EngineRollbackRequest` (Task 4); `install::{InstallContext, InstallError, execute}` (Task 9); `rollback::{RollbackContext, RollbackError, execute}` (Task 10); `EngineConfig` (`src/config.rs`).
-- Produces: `commands::engine::run(command: EngineCommand) -> Result<Response, ResponseBuildError>`, `commands::engine::GITHUB_RELEASES_BASE` — consumed by `src/lib.rs`'s `execute`.
+- Produces: `commands::engine::run(command: EngineCommand) -> Result<Response, ResponseBuildError>`, `commands::engine::ENGINE_RELEASES_BASE` — consumed by `src/lib.rs`'s `execute`.
 
 - [ ] **Step 1: Register the new module**
 
@@ -1917,8 +1917,8 @@ use crate::{
 /// `engine install`/`engine rollback` call fetches from. Never a CLI
 /// flag or protocol input — see `InstallContext::release_base_url`'s
 /// doc comment for why tests pass a different value directly.
-pub const GITHUB_RELEASES_BASE: &str =
-    "https://github.com/skanevi/operations-engine/releases/download";
+pub const ENGINE_RELEASES_BASE: &str =
+    "https://get.orbden.com/releases/download";
 
 const INSTALL_OPERATION: &str = "engine.install";
 const ROLLBACK_OPERATION: &str = "engine.rollback";
@@ -1996,7 +1996,7 @@ fn run_install(request: &EngineInstallRequest) -> Result<Response, ResponseBuild
     let context = InstallContext {
         bin_root: &bin_root,
         engine_state: &engine_state,
-        release_base_url: GITHUB_RELEASES_BASE,
+        release_base_url: ENGINE_RELEASES_BASE,
     };
 
     match execute_install(&context, request, &CancellationToken::default()) {
@@ -2630,12 +2630,12 @@ git commit -m "Add the reproducible-build, checksum, and signing release workflo
 # Compatibility matrix
 
 Tracks which published `ops-engine` versions speak which protocol
-version, and the minimum control-plane (`website-control-panel`) build
+version, and the minimum control-plane (`orbden`) build
 known to work with them. Update this table as part of cutting each
 release (`docs/release.md`); it is documentation only — runtime
 compatibility is enforced independently by the control plane's protocol
 version negotiation (`MIN_PROTOCOL_VERSION`/`MAX_PROTOCOL_VERSION` in
-`website-control-panel`'s `ops_engine::mod.rs`).
+`orbden`'s `ops_engine::mod.rs`).
 
 | Engine version | Protocol version | Notes |
 | --- | --- | --- |
@@ -2657,9 +2657,9 @@ version negotiation (`MIN_PROTOCOL_VERSION`/`MAX_PROTOCOL_VERSION` in
 4. Verify a downloaded artifact by hand before trusting the automation:
 
    ```console
-   curl -LO https://github.com/skanevi/operations-engine/releases/download/vX.Y.Z/SHA256SUMS
-   curl -LO https://github.com/skanevi/operations-engine/releases/download/vX.Y.Z/SHA256SUMS.minisig
-   curl -LO https://github.com/skanevi/operations-engine/releases/download/vX.Y.Z/ops-engine-X.Y.Z-x86_64-unknown-linux-gnu
+   curl -LO https://get.orbden.com/releases/download/vX.Y.Z/SHA256SUMS
+   curl -LO https://get.orbden.com/releases/download/vX.Y.Z/SHA256SUMS.minisig
+   curl -LO https://get.orbden.com/releases/download/vX.Y.Z/ops-engine-X.Y.Z-x86_64-unknown-linux-gnu
    minisign -V -p release/minisign.pub -m SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing
    ```
@@ -2715,7 +2715,7 @@ auto-updates and every rollout is manual and per-server by construction.
 Before rolling a new version out broadly:
 
 1. Run `engine install`/`engine rollback` against the
-   `website-control-panel` repo's `docker/test-server` fixture first.
+   `orbden` repo's `docker/test-server` fixture first.
 2. Run it against exactly one real managed server and confirm
    `capabilities`/`version` report the expected result.
 3. Only then roll out to additional servers, one at a time.
@@ -2741,7 +2741,7 @@ Read through every `ErrorCode`/message pair produced by `src/engine/install.rs`,
 
 - [ ] **Step 2: Record delivered Phase 7 items and remaining scope**
 
-Under Phase 7, mark as delivered: reproducible Linux AMD64+ARM64 builds; checksums and signed release artifacts; atomic upgrade and downgrade with previous-binary recovery (`engine install`/`engine rollback`); release compatibility matrix; redaction/bounded-log review (Step 1 above); package and incident-recovery documentation; opt-in rollout procedure. Note explicitly that "explicit, pinned installation through the control plane" is only half-delivered by this work: the engine-side `engine install`/`engine rollback` commands exist and are tested, but `website-control-panel` does not yet call them (its own plan is separate — see this plan's "Scope note"). Add a decision-log entry recording the base-URL parameterization (`InstallContext::release_base_url`), the two-slot (not N-version) retention choice, and the write-temp-then-rename activation of a regular file in place of the originally-specced cross-root symlink (this plan's "Deviation from the spec" section) — per this plan's Tasks 5 and 9.
+Under Phase 7, mark as delivered: reproducible Linux AMD64+ARM64 builds; checksums and signed release artifacts; atomic upgrade and downgrade with previous-binary recovery (`engine install`/`engine rollback`); release compatibility matrix; redaction/bounded-log review (Step 1 above); package and incident-recovery documentation; opt-in rollout procedure. Note explicitly that "explicit, pinned installation through the control plane" is only half-delivered by this work: the engine-side `engine install`/`engine rollback` commands exist and are tested, but `orbden` does not yet call them (its own plan is separate — see this plan's "Scope note"). Add a decision-log entry recording the base-URL parameterization (`InstallContext::release_base_url`), the two-slot (not N-version) retention choice, and the write-temp-then-rename activation of a regular file in place of the originally-specced cross-root symlink (this plan's "Deviation from the spec" section) — per this plan's Tasks 5 and 9.
 
 - [ ] **Step 3: Update `Last updated`**
 

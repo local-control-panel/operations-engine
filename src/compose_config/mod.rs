@@ -6,12 +6,12 @@
 //!
 //! Sibling to `crate::runtime_config` in shape (a per-identifier
 //! subdirectory of one trusted root, service/target varies per request) but
-//! for `website-control-panel`'s `docker.rs::compose_write` instead of a
+//! for `orbden`'s `docker.rs::compose_write` instead of a
 //! Caddyfile fragment: `<compose_root>/<stackName>/docker-compose.yml` on
 //! the host, where `compose_root` (unlike every other trusted root in this
 //! engine) is resolved dynamically via `crate::compose::compose_root_dir`
 //! rather than sourced from `EngineConfig` - it is inherently relative to
-//! whichever account this process runs as (`website-control-panel`'s
+//! whichever account this process runs as (`orbden`'s
 //! `COMPOSE_DIR = "~/compose"`), not a fixed absolute path an operator
 //! configures, so no `EngineConfig` schema change was needed for this
 //! operation. No park/unpark, no `Backup`-style inert-file target - every

@@ -168,7 +168,7 @@ fn open_content_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 /// entitled to learn.
 ///
 /// **This exact text is a cross-repo contract, not an implementation
-/// detail.** The `website-control-panel` client keys its engine-config
+/// detail.** The `orbden` client keys its engine-config
 /// self-heal off this literal string: on seeing `INTERNAL` +
 /// `"engine configuration is unavailable"` it rewrites the host's
 /// `/etc/operations-engine/config.json` to the current schema and retries,
@@ -198,7 +198,7 @@ mod tests {
     fn the_config_unavailable_message_is_a_pinned_cross_repo_contract() {
         assert_eq!(
             CONFIG_UNAVAILABLE_MESSAGE, "engine configuration is unavailable",
-            "website-control-panel's engine-config self-heal matches this \
+            "orbden's engine-config self-heal matches this \
              exact string; changing it here degrades that client silently. \
              See CONFIG_UNAVAILABLE_MESSAGE's doc comment."
         );

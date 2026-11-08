@@ -30,7 +30,7 @@ pub struct RestoreContext<'a> {
     pub docker_program: &'a str,
     /// The `gunzip` binary, used only for `.gz` dumps - integrity-checked
     /// (`-t`) before the actual `-c | client` pipe, mirroring
-    /// `website-control-panel`'s own pre-check (see `run`'s doc comment).
+    /// `orbden`'s own pre-check (see `run`'s doc comment).
     pub gunzip_program: &'a str,
 }
 

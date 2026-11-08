@@ -81,7 +81,7 @@ impl ProcessRequest {
     /// inheriting this process's own. Still argv-only: this sets the
     /// standard `Command::current_dir`, never `cd <dir> &&` prepended to a
     /// shell string, so callers that previously modeled "run in this
-    /// directory" as a shell one-liner (e.g. `website-control-panel`'s
+    /// directory" as a shell one-liner (e.g. `orbden`'s
     /// `cd {base} && docker compose ...`) have a direct, shell-free
     /// equivalent here.
     pub fn current_dir(mut self, dir: impl Into<PathBuf>) -> Self {
@@ -501,7 +501,7 @@ pub fn run_with_stdin_bytes(
 /// produced nothing because it failed" from "upstream produced nothing
 /// because the input was empty" should validate upstream's own success
 /// *and* pair this with their own separate integrity check beforehand
-/// (mirroring `website-control-panel`'s existing `gunzip -t` pre-check
+/// (mirroring `orbden`'s existing `gunzip -t` pre-check
 /// before its own `gunzip -c | client` pipeline, for the exact same
 /// pipefail-avoidance reason - this primitive does not add pipefail
 /// semantics either).

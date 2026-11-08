@@ -4,7 +4,7 @@
 //! reload fails, put the previous fragment back and reload it again.
 //!
 //! Structurally identical to `ingress::activate::activate_live` (the same
-//! validate/write/rename/reload/rollback sequence `website-control-panel`'s
+//! validate/write/rename/reload/rollback sequence `orbden`'s
 //! `activate_caddyfile` already runs against any `service`/host path pair —
 //! see that function's own doc comment, `runtime_pool.rs:955-1045`, which
 //! this is also a port of), just parameterized by which container and
@@ -167,7 +167,7 @@ pub(crate) fn activate(
     // (see that constant's doc comment), dropping the `<runtime_id>`
     // segment. So the path `caddy validate` is given is built from that
     // fixed prefix and the fragment's own name — the same way
-    // `website-control-panel`'s `activate_caddyfile` call sites build
+    // `orbden`'s `activate_caddyfile` call sites build
     // `exec_container_dest` alongside (not from) `exec_host_dest`
     // (`runtime_pool/lifecycle.rs:122-131`).
     if let Err(error) = runtime_root.resolve_existing(&paths.staged) {
@@ -222,7 +222,7 @@ pub(crate) fn activate(
 }
 
 /// The Compose service name a `RuntimeId` addresses — mirrors
-/// `website-control-panel`'s own `runtime_service_name`
+/// `orbden`'s own `runtime_service_name`
 /// (`runtime_pool.rs:90-92`, `format!("runtime-{runtime_id}")`) verbatim.
 fn runtime_service_name(id: &RuntimeId) -> String {
     format!("runtime-{id}")

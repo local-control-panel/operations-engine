@@ -136,7 +136,7 @@ fn parse_root(value: String) -> Result<PathBuf, RequestError> {
     Ok(root)
 }
 
-/// Mirrors `website-control-panel`'s own `validate_db_credentials`: no NUL,
+/// Mirrors `orbden`'s own `validate_db_credentials`: no NUL,
 /// CR or LF.
 fn validate_db_password(value: &str) -> Result<(), RequestError> {
     if value.is_empty()
@@ -511,7 +511,7 @@ fn write_safety_plugin(root: &std::path::Path, defaults: StagingDefaults) -> Res
         Err(e) => return Err(Error::Io(e)),
     }
     let mut body = String::from(
-        "<?php\n/**\n * Plugin Name: WCP staging safety\n * Description: Written by Website Control Panel when this copy was cloned, so it cannot mail or charge real customers. Delete this file to turn it off.\n */\ndefined('ABSPATH') || exit;\ndefine('WCP_STAGING_SAFETY', true);\n",
+        "<?php\n/**\n * Plugin Name: WCP staging safety\n * Description: Written by OrbDen when this copy was cloned, so it cannot mail or charge real customers. Delete this file to turn it off.\n */\ndefined('ABSPATH') || exit;\ndefine('WCP_STAGING_SAFETY', true);\n",
     );
     if defaults.block_mail {
         body.push_str("add_filter('pre_wp_mail', '__return_false', PHP_INT_MAX);\n");

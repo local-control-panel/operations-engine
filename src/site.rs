@@ -84,7 +84,7 @@ impl fmt::Display for Domain {
     }
 }
 
-/// A validated runtime-pool identifier (`website-control-panel`'s
+/// A validated runtime-pool identifier (`orbden`'s
 /// `runtime_id`, e.g. `fp1-php83`) — 1-64 bytes of lowercase ASCII letters,
 /// digits, or hyphens, never starting or ending with a hyphen. The same
 /// per-label character-class rule `Domain::parse` applies to each of its
@@ -128,7 +128,7 @@ impl fmt::Display for RuntimeId {
     }
 }
 
-/// A validated Docker Compose stack identifier (`website-control-panel`'s
+/// A validated Docker Compose stack identifier (`orbden`'s
 /// `stack_name`) — mirrors that client's own `is_valid_stack_name`: 1-64
 /// bytes, first byte ASCII alphanumeric, every subsequent byte ASCII
 /// alphanumeric or one of `_`, `.`, `-`, and never exactly `.` or `..`.

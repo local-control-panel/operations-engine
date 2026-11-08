@@ -12,12 +12,25 @@ use crate::{
     protocol::{Response, ResponseBuildError, Warning},
 };
 
-/// The fixed, compiled-in GitHub Releases base URL every production
-/// `engine install`/`engine rollback` call fetches from. Never a CLI
-/// flag or protocol input — see `InstallContext::release_base_url`'s
-/// doc comment for why tests pass a different value directly.
-pub const GITHUB_RELEASES_BASE: &str =
-    "https://github.com/skanevi/operations-engine/releases/download";
+/// The default release base URL every production `engine install`/
+/// `engine rollback` call fetches from. Never a CLI flag or protocol input;
+/// the operator's environment may replace it with `ORBDEN_ENGINE_RELEASES_URL`
+/// (see [`release_base_url`]). Assets live at `<base>/v<version>/<asset>`.
+pub const ENGINE_RELEASES_BASE: &str = "https://get.orbden.com/releases/download";
+
+/// Environment variable that replaces [`ENGINE_RELEASES_BASE`].
+pub const ENGINE_RELEASES_ENV: &str = "ORBDEN_ENGINE_RELEASES_URL";
+
+/// The release base URL in effect: `ORBDEN_ENGINE_RELEASES_URL` when set to a
+/// non-empty value, otherwise [`ENGINE_RELEASES_BASE`]. Downloads stay
+/// HTTPS-only and the manifest signature is still verified.
+pub fn release_base_url() -> String {
+    std::env::var(ENGINE_RELEASES_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ENGINE_RELEASES_BASE.to_owned())
+}
 
 const INSTALL_OPERATION: &str = "engine.install";
 const ROLLBACK_OPERATION: &str = "engine.rollback";
@@ -97,11 +110,12 @@ fn run_install(request: &EngineInstallRequest) -> Result<Response, ResponseBuild
             ));
         }
     };
+    let release_base = release_base_url();
     let context = InstallContext {
         bin_root: &bin_root,
         engine_state: &engine_state,
         state_root: &engine_config.state_root,
-        release_base_url: GITHUB_RELEASES_BASE,
+        release_base_url: &release_base,
         verify_public_key: PRODUCTION_PUBLIC_KEY_FILE,
     };
 
