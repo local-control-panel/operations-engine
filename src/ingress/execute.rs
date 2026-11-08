@@ -279,7 +279,7 @@ pub fn execute(
     }
 
     // The backup file's suffix is this request's own `RequestId` rather
-    // than fresh randomness. `website-control-panel` has no request
+    // than fresh randomness. `orbden` has no request
     // identity to reach for at this point, so it mints a
     // `random_hex_suffix()`; here every mutation already carries a
     // caller-minted canonical UUID (`ReleaseId` reuses it for exactly this
@@ -348,7 +348,7 @@ pub fn execute(
 /// lock.
 ///
 /// That is a deliberate choice of granularity, not an oversight.
-/// `website-control-panel` locks per domain
+/// `orbden` locks per domain
 /// (`with_domain_lock!(server_id, &domain, ...)`), which is finer than the
 /// resource actually being mutated: the reload step reloads the *whole*
 /// imported config set, so two domains activating concurrently can each

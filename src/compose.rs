@@ -1,6 +1,6 @@
 //! `docker compose exec` primitive for the single WCP-managed stack.
 //!
-//! Ported from `website-control-panel`'s shell-string invocation
+//! Ported from `orbden`'s shell-string invocation
 //! (`src-tauri/src/commands/runtime_pool.rs`'s `compose_prefix()`, joined
 //! with `cd {STACK_REMOTE_BASE} &&` at each call site) to the argv-only
 //! form `process::run` (`src/process.rs`) requires: no shell, no
@@ -19,14 +19,14 @@ use crate::process::{
 };
 
 /// Stable Compose project identity for the one WCP-managed stack. Mirrors
-/// `website-control-panel`'s `STACK_COMPOSE_PROJECT` constant
+/// `orbden`'s `STACK_COMPOSE_PROJECT` constant
 /// (`src-tauri/src/commands/mod.rs`) verbatim, so both codebases address
 /// the same Compose project/network instead of Compose silently creating a
 /// second one for the same stack.
 pub const COMPOSE_PROJECT: &str = "wcp";
 
 /// Compose stack directory, relative to the invoking user's home. Mirrors
-/// `website-control-panel`'s `STACK_REMOTE_BASE` constant verbatim. `~` is
+/// `orbden`'s `STACK_REMOTE_BASE` constant verbatim. `~` is
 /// not expanded by any subprocess here (there is no shell to do it) — call
 /// `compose_base_dir` to resolve it to an absolute path first.
 pub const COMPOSE_BASE_DIR: &str = "~/compose/wp-stack";
@@ -151,7 +151,7 @@ fn compose_base_dir_inner(home: Option<PathBuf>) -> Result<PathBuf, Error> {
 }
 
 /// Resolves `~/compose` (the parent every Compose stack this host manages
-/// lives under — `website-control-panel`'s `COMPOSE_DIR`, one level above
+/// lives under — `orbden`'s `COMPOSE_DIR`, one level above
 /// `COMPOSE_BASE_DIR`'s own `wp-stack` subdirectory) to an absolute path,
 /// via the same `home_dir` resolution `compose_base_dir` uses. Exists for
 /// `crate::compose_config`'s `compose.activateConfig` operation, which
@@ -171,7 +171,7 @@ fn compose_root_dir_inner(home: Option<PathBuf>) -> Result<PathBuf, Error> {
 
 /// Runs `docker compose -p wcp --env-file .env -f stack/docker-compose.yml
 /// exec -T <service> <args...>` through the bounded, argv-only
-/// `process::run` — the shell-free equivalent of `website-control-panel`'s
+/// `process::run` — the shell-free equivalent of `orbden`'s
 /// `compose_prefix()` joined with `cd {STACK_REMOTE_BASE} &&` at each call
 /// site.
 ///

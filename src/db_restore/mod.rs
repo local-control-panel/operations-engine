@@ -31,7 +31,7 @@ impl DbType {
 }
 
 /// A database name: bounded, `[A-Za-z0-9_]` only - the same rule
-/// `website-control-panel`'s own `db::validate_db_name` already applies
+/// `orbden`'s own `db::validate_db_name` already applies
 /// client-side, mirrored here so a malformed name can never reach the
 /// subprocess argv regardless of which caller is validating it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,7 +90,7 @@ pub struct RestoreRequest {
     pub database: DatabaseName,
     pub container: ContainerName,
     /// The dump file's path on the remote host. Not validated against any
-    /// `TrustedRoot` here - the caller (`website-control-panel`) already
+    /// `TrustedRoot` here - the caller (`orbden`) already
     /// confirms it falls under its own backup/import directories
     /// (`validate_backup_path`) before ever reaching this request; this
     /// operation only runs a database client against whatever path it is

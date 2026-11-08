@@ -7,7 +7,7 @@ Scope: Operations Engine Phase 7 — "release and production hardening"
 signing, pinned installation, atomic upgrade/downgrade with recovery,
 compatibility matrix, log/redaction review, documentation, and opt-in
 rollout. Touches both `operations-engine` (this repo) and
-`website-control-panel` (the control plane).
+`orbden` (the control plane).
 
 ## 1. Goal and constraints
 
@@ -48,7 +48,7 @@ re-raise it rather than silently deviating:
    model.
 2. **Single signing authority**: GitHub Actions is the only place that
    builds and signs production release artifacts. The
-   `website-control-panel` local build script (`docker/test-server/build-ops-engine.sh`)
+   `orbden` local build script (`docker/test-server/build-ops-engine.sh`)
    stops building locally and instead downloads and verifies real,
    signed GitHub Releases — so it exercises the exact same trust path
    as production instead of a parallel one.
@@ -98,7 +98,7 @@ GH Actions (tag push vX.Y.Z)
   -> minisign-sign SHA256SUMS -> SHA256SUMS.minisig
   -> publish GitHub Release: both binaries + SHA256SUMS + SHA256SUMS.minisig
 
-website-control-panel (control plane)
+orbden (control plane)
   -> resolve the target version (explicit; from GitHub Releases API,
      never "latest") - this is the only thing it decides
   -> SSH, elevated: ops-engine engine install --version X.Y.Z
@@ -264,7 +264,7 @@ ops-engine engine rollback
   within protocol v1's existing envelope/error/warning shape, not a
   breaking change to it.
 
-## 9. Control plane (`website-control-panel`) changes
+## 9. Control plane (`orbden`) changes
 
 - A small new module resolves which published version to request —
   e.g. listing GitHub Releases via the API for an operator to pick in
@@ -352,7 +352,7 @@ Per the repo's Definition of Done, applied to the new surface:
   pair, covering: fresh install, install-over-existing (upgrade),
   corrupted-artifact rejection (no filesystem change), and
   `engine rollback` after that;
-- a website-control-panel integration test (alongside the existing
+- an orbden integration test (alongside the existing
   `ops_engine_deploy_rollback.rs` workflow test) exercising
   install/rollback the same way deploy/rollback are exercised today,
   against the rewritten `build-ops-engine.sh` fixtures;

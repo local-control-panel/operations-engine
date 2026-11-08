@@ -346,7 +346,7 @@ fn install_from_registry(
     // Downloaded before the transaction starts, so no lock is held on the
     // network.
     let verified = match agent_registry::fetch_verified(
-        &agent_registry::Source::default(),
+        &agent_registry::Source::from_env(),
         &agent_registry::network_fetch,
         &request,
         env!("CARGO_PKG_VERSION"),

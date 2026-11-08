@@ -1020,8 +1020,8 @@ mod tests {
         let manifest: serde_json::Value =
             serde_json::from_str(&host.file("manifest.json").unwrap()).unwrap();
         assert_eq!(manifest["cache-warmup"]["version"], "1.0.0");
-        assert_eq!(manifest["cache-warmup"]["author"], "Website Control Panel");
-        assert_eq!(result.author, "Website Control Panel");
+        assert_eq!(manifest["cache-warmup"]["author"], "OrbDen");
+        assert_eq!(result.author, "OrbDen");
         assert_eq!(
             host.tab(),
             "MAILTO=x\n0 4 * * * WCP_DIR=/root/.wcp OPS_ENGINE=/usr/local/bin/ops-engine PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin bash '/root/.wcp/agents/cache-warmup.sh' # [wcp-agent] cache-warmup\n"

@@ -35,9 +35,13 @@ pub const APPROVE_OPERATION: &str = "agent.approve";
 pub const UNAPPROVE_OPERATION: &str = "agent.unapprove";
 
 /// Where releases are published. These are the only addresses the engine
-/// fetches agents from; no request can change them.
-pub const RELEASES_BASE: &str = "https://github.com/local-control-panel/agents/releases/download";
-pub const RAW_BASE: &str = "https://raw.githubusercontent.com/local-control-panel/agents";
+/// fetches agents from; no request can change them. The operator's
+/// environment may replace them (`ORBDEN_AGENTS_RELEASES_URL`,
+/// `ORBDEN_AGENTS_RAW_URL`); see [`Source::from_env`].
+pub const RELEASES_BASE: &str = "https://agents.orbden.com/releases/download";
+pub const RAW_BASE: &str = "https://agents.orbden.com/raw";
+pub const RELEASES_ENV: &str = "ORBDEN_AGENTS_RELEASES_URL";
+pub const RAW_ENV: &str = "ORBDEN_AGENTS_RAW_URL";
 
 pub const MAX_REGISTRY_BYTES: u64 = 1024 * 1024;
 pub const MAX_WRITABLE_PATHS: usize = 16;
@@ -51,6 +55,25 @@ pub const APPROVALS_DIR: &str = "agent-approvals";
 pub struct Source {
     pub releases_base: String,
     pub raw_base: String,
+}
+
+impl Source {
+    /// The compiled-in addresses, each replaced by its environment variable
+    /// when that is set to a non-empty value. Production call sites use this;
+    /// `Default` never reads the environment, so tests cannot reach a live host.
+    pub fn from_env() -> Self {
+        let var = |name: &str, default: &str| {
+            std::env::var(name)
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| default.to_owned())
+        };
+        Self {
+            releases_base: var(RELEASES_ENV, RELEASES_BASE),
+            raw_base: var(RAW_ENV, RAW_BASE),
+        }
+    }
 }
 
 impl Default for Source {

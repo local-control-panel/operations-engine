@@ -3,7 +3,7 @@
 //! URL (see the design spec's "no ambient discovery" rule). `base_url` is
 //! a parameter, not a hardcoded constant, purely so tests can point it at
 //! a local fixture server; every production call site passes the one
-//! `GITHUB_RELEASES_BASE` constant in `commands/engine.rs`.
+//! `ENGINE_RELEASES_BASE` constant in `commands/engine.rs`.
 
 use std::fmt;
 

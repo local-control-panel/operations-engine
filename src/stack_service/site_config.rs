@@ -93,7 +93,7 @@ pub(crate) fn site_run_script(uid: u32, gid: u32, container_dir: &str) -> String
 /// Ported from the panel's `build_site_open_basedir_ini`.
 pub(crate) fn site_open_basedir_ini(root: &str) -> String {
     format!(
-        "; Managed by Website Control Panel - do not edit manually\nopen_basedir = {root}:/tmp:/var/tmp:/run/valkey/valkey.sock\n"
+        "; Managed by OrbDen - do not edit manually\nopen_basedir = {root}:/tmp:/var/tmp:/run/valkey/valkey.sock\n"
     )
 }
 

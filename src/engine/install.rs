@@ -42,10 +42,10 @@ pub struct InstallContext<'a> {
     /// pre-activation smoke test — a `ManagedRoot` is a capability handle
     /// and has no path to hand to `exec`. See `state::resolve_path`.
     pub state_root: &'a TrustedRoot,
-    /// The GitHub Releases base URL every asset is fetched relative to.
+    /// The release base URL every asset is fetched relative to.
     /// A parameter (not a hardcoded constant in this file) purely so
     /// tests can point it at a local fixture server; every production
-    /// call site passes `commands::engine::GITHUB_RELEASES_BASE`.
+    /// call site passes `commands::engine::ENGINE_RELEASES_BASE`.
     pub release_base_url: &'a str,
     /// The two-line `minisign.pub` content `verify::fetch_and_verify`
     /// checks the fetched manifest signature against. A parameter for the

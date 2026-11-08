@@ -10,9 +10,9 @@
 4. Verify a downloaded artifact by hand before trusting the automation:
 
    ```console
-   curl -LO https://github.com/skanevi/operations-engine/releases/download/vX.Y.Z/SHA256SUMS
-   curl -LO https://github.com/skanevi/operations-engine/releases/download/vX.Y.Z/SHA256SUMS.minisig
-   curl -LO https://github.com/skanevi/operations-engine/releases/download/vX.Y.Z/ops-engine-X.Y.Z-x86_64-unknown-linux-gnu
+   curl -LO https://get.orbden.com/releases/download/vX.Y.Z/SHA256SUMS
+   curl -LO https://get.orbden.com/releases/download/vX.Y.Z/SHA256SUMS.minisig
+   curl -LO https://get.orbden.com/releases/download/vX.Y.Z/ops-engine-X.Y.Z-x86_64-unknown-linux-gnu
    minisign -V -p release/minisign.pub -m SHA256SUMS
    sha256sum -c SHA256SUMS --ignore-missing
    ```
@@ -58,3 +58,16 @@ lets `install::execute` check against either key depending on caller:
 production always passes `verify::PRODUCTION_PUBLIC_KEY_FILE`
 (`release/minisign.pub`), tests always pass the fixture directory's own
 `minisign.pub`.
+
+## Download locations
+
+Releases are served from `https://get.orbden.com/releases/download/vX.Y.Z/`
+(`SHA256SUMS`, `SHA256SUMS.minisig` and the binaries). `engine install` and
+`engine rollback` use that base unless the `ORBDEN_ENGINE_RELEASES_URL`
+environment variable names another HTTPS base with the same layout. The
+signature check against `release/minisign.pub` applies either way.
+
+Registry agents are fetched from `https://agents.orbden.com/releases/download`
+(`<tag>/registry.json`) and `https://agents.orbden.com/raw`
+(`<tag>/agents/<name>/...`); `ORBDEN_AGENTS_RELEASES_URL` and
+`ORBDEN_AGENTS_RAW_URL` replace them.

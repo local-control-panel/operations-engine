@@ -22,7 +22,7 @@ pub enum WordpressCommand {
     /// object-cache wiring and `wp core install`, under one lock/
     /// idempotency/transaction/audit-backed request. The site's own
     /// directory must already exist beneath a configured content root
-    /// (`website-control-panel`'s `create_site` creates and owns it).
+    /// (`orbden`'s `create_site` creates and owns it).
     Install {
         #[arg(long = "request-file")]
         request_file: PathBuf,

@@ -3,7 +3,7 @@
 //! rename into place, reload — and, if that reload fails, put the previous
 //! file back and reload it again.
 //!
-//! A direct behavioral port of `website-control-panel`'s
+//! A direct behavioral port of `orbden`'s
 //! `activate_caddyfile`/`activate_caddyfile_checked`
 //! (`src-tauri/src/commands/runtime_pool.rs:834-1038`). Nothing here knows
 //! about transactions, locks, or audit records — `execute.rs` wraps this

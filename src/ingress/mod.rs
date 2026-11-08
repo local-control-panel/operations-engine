@@ -3,7 +3,7 @@
 //! before it can reach the live path and the previous content restored if
 //! the live reload rejects it.
 //!
-//! This is a port of `website-control-panel`'s
+//! This is a port of `orbden`'s
 //! `activate_caddyfile`/`activate_caddyfile_checked`
 //! (`src-tauri/src/commands/runtime_pool.rs:834-1038`) — the write path
 //! behind ~28 of that codebase's site-config mutations. The *behavior* is
@@ -74,7 +74,7 @@ pub const SET_ENABLED_OPERATION: &str = "ingress.setEnabled";
 pub const DISABLED_ROUTE_SUFFIX: &str = "caddyfile.disabled";
 
 /// The Compose service running the shared ingress Caddy. Mirrors
-/// `website-control-panel`'s `INGRESS_CONTAINER`
+/// `orbden`'s `INGRESS_CONTAINER`
 /// (`src-tauri/src/commands/runtime_pool.rs:39`) verbatim — a compiled-in
 /// constant there and here, never configurable at runtime.
 pub const INGRESS_SERVICE: &str = "ingress";
@@ -101,12 +101,12 @@ pub const BACKUP_ROUTE_EXTENSION: &str = "maintenance-backup";
 /// Upper bound on a submitted route file, so a single request cannot ask
 /// this root-privileged process to write an unbounded amount into
 /// `ingress_root`. Real route files are a few hundred bytes; the largest
-/// thing `website-control-panel` ever generates (every policy block
+/// thing `orbden` ever generates (every policy block
 /// enabled at once) is comfortably under a kilobyte.
 pub const MAX_CONTENT_BYTES: usize = 256 * 1024;
 
 /// A SHA-256 digest of a route file's exact bytes, in lowercase hex — the
-/// same value `website-control-panel`'s `hash_of`
+/// same value `orbden`'s `hash_of`
 /// (`runtime_pool.rs:817`) computes and passes as `expected_prior_hash`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -161,7 +161,7 @@ impl fmt::Display for ConfigHash {
 /// states a request can be in — either the caller believes there is no
 /// live file yet, or it read one and is telling us what it read.
 ///
-/// `website-control-panel` reaches the same two states through two
+/// `orbden` reaches the same two states through two
 /// different functions plus one overloaded `Option<&str>`:
 /// `activate_caddyfile_checked(.., None)` means "must not currently
 /// exist" (its own doc comment), while the ~27 call sites on unchecked
@@ -592,7 +592,7 @@ mod tests {
 
     #[test]
     fn config_hash_matches_the_known_sha256_of_its_input() {
-        // The same value `sha256sum` (and `website-control-panel`'s
+        // The same value `sha256sum` (and `orbden`'s
         // `hash_of`) produces for the empty input, so this pins the
         // interoperable encoding, not just self-consistency.
         assert_eq!(

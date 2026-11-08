@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn accepts_the_panel_layout_with_credentials_under_state() {
-        // Byte-for-byte the layout `website-control-panel` converges on
+        // Byte-for-byte the layout `orbden` converges on
         // every enrolled server.
         let panel = r#"{
           "schemaVersion": 4,

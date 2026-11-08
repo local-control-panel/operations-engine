@@ -143,7 +143,7 @@ mod tests {
         assert!(is_plain_http_loopback("http://[::1]:1/x"));
 
         assert!(!is_plain_http_loopback(
-            "https://github.com/skanevi/operations-engine/releases/download"
+            "https://get.orbden.com/releases/download"
         ));
         assert!(!is_plain_http_loopback("http://example.test/v1/SHA256SUMS"));
         // A host that merely starts with the loopback address, or carries

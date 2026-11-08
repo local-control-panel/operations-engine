@@ -2,12 +2,12 @@
 //! WordPress site (`docs/site-model.md`'s trusted-root model, per-site
 //! lock/idempotency/transaction/audit — the same shape as
 //! `wordpress_update`). Database provisioning is deliberately out of scope
-//! here: `website-control-panel`'s `wp_install` calls `db.provisionMariaDb`
+//! here: `orbden`'s `wp_install` calls `db.provisionMariaDb`
 //! itself before this operation runs, and passes the resulting credentials
 //! in as plain fields.
 //!
 //! The site's own directory is *not* created (or removed on failure) by
-//! this operation. By the time this runs, `website-control-panel`'s
+//! this operation. By the time this runs, `orbden`'s
 //! `create_site` (`runtime_pool.rs`) has already created it, chowned it to
 //! the site's own numeric UID/GID, and written its `.user.ini` — a
 //! separate, still-raw-shell step this migration does not touch. This
@@ -123,7 +123,7 @@ fn validate_email(value: &str) -> Result<(), RequestError> {
     Ok(())
 }
 
-/// Mirrors `website-control-panel`'s own `validate_db_credentials`: no NUL,
+/// Mirrors `orbden`'s own `validate_db_credentials`: no NUL,
 /// CR or LF. Unlike the DB name/user, a password is not restricted to
 /// `DatabaseName`'s alphanumeric/underscore charset.
 fn validate_db_password(value: &str) -> Result<(), RequestError> {
