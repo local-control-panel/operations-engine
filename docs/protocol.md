@@ -366,6 +366,37 @@ only over stdin; the account name and host contain no SQL quoting characters.
 Each `user@host` account has an independent mutation lock, idempotency state
 and audit trail.
 
+## `db.ensureReadonlyUser` and `db.revokeReadonlyUser`
+
+`db ensure-readonly-user` accepts a root-owned JSON request
+`{container, rootPassword, database, rotate?}` and maintains a SELECT-only
+MariaDB account on one database. The database must exist and must not be
+`mysql`, `information_schema`, `performance_schema` or `sys`
+(case-insensitive). The account is `ro_<database>@localhost`; when that is
+longer than 32 characters it is a prefix followed by `_` and eight hex digits
+of the SHA-256 of the database name. The host is always `localhost`.
+
+The engine creates the account if missing (`CREATE USER IF NOT EXISTS`),
+sets a freshly generated 32-character alphanumeric password when the account
+was just created or `rotate` is `true` (`ALTER USER`), and on every run
+re-asserts `GRANT SELECT ON <database>.*` (underscores escaped, so no other
+database matches) `WITH MAX_QUERIES_PER_HOUR 600 MAX_UPDATES_PER_HOUR 0
+MAX_USER_CONNECTIONS 2`, then `FLUSH PRIVILEGES`. The password is never taken
+from the request. It is returned once as a `secretResult` (`password` next to
+`username`, `host`, `database`, `created`, `passwordIssued: true`, `limits`).
+If the account exists and `rotate` is false, the result has
+`passwordIssued: false` and no password. An idempotent replay returns the
+stored public record with `alreadyIssued: true` and never a password. If the
+statements fail on an account the request created, the account is dropped
+again. The root password and all SQL travel only over stdin; neither the
+password nor any SQL is stored in state, audit or errors.
+
+`db revoke-readonly-user` accepts `{container, rootPassword, database}` and
+runs `DROP USER IF EXISTS`; a missing account is a success with
+`revoked: false`. Both operations share one lock, idempotency state and audit
+trail per container and account. Open sessions of a dropped account are not
+terminated by the engine.
+
 ## `db.clearMariaSlowLog`
 
 `db clear-mariadb-slow-log` accepts a root-owned request containing a validated

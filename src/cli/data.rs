@@ -104,6 +104,25 @@ pub enum DbCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Create or refresh a SELECT-only MariaDB account on one database. The
+    /// generated password is returned once as a secret result.
+    EnsureReadonlyUser {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Drop the SELECT-only MariaDB account of one database.
+    RevokeReadonlyUser {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Clear the configured MariaDB slow-query log and restore its enabled state.
     ClearMariadbSlowLog {
         #[arg(long = "request-file")]
@@ -300,6 +319,8 @@ impl DbCommand {
             Self::MigrateMariadbLine { .. } => "db.migrateMariadbLine",
             Self::DropMariadb { .. } => "db.dropMariaDb",
             Self::DropMariadbUser { .. } => "db.dropMariaDbUser",
+            Self::EnsureReadonlyUser { .. } => "db.ensureReadonlyUser",
+            Self::RevokeReadonlyUser { .. } => "db.revokeReadonlyUser",
             Self::ClearMariadbSlowLog { .. } => "db.clearMariaSlowLog",
             Self::ConfigureMariadbSlowLog { .. } => "db.configureMariaSlowLog",
             Self::DeleteValkeyKey { .. } => "db.deleteValkeyKey",

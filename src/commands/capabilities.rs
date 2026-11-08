@@ -142,6 +142,8 @@ pub const OPERATIONS: &[&str] = &[
     "db.provisionMariaDb",
     "db.dropMariaDb",
     "db.dropMariaDbUser",
+    "db.ensureReadonlyUser",
+    "db.revokeReadonlyUser",
     "db.clearMariaSlowLog",
     "db.configureMariaSlowLog",
     "db.deleteValkeyKey",

@@ -99,6 +99,8 @@ fn capabilities_describe_only_implemented_operations() {
             "db.provisionMariaDb",
             "db.dropMariaDb",
             "db.dropMariaDbUser",
+            "db.ensureReadonlyUser",
+            "db.revokeReadonlyUser",
             "db.clearMariaSlowLog",
             "db.configureMariaSlowLog",
             "db.deleteValkeyKey",
