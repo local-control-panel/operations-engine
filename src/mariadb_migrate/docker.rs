@@ -220,6 +220,11 @@ impl<'a> DockerDriver<'a> {
                 "-uroot",
                 "-N",
                 "-B",
+                // Batch mode doubles backslashes in the output. The account
+                // statements are read back and replayed, so a grant on
+                // `my\_db` (the escaped underscore) must not come back as
+                // `my\\_db`, which names a different schema.
+                "--raw",
                 "-e",
                 statement,
             ])
@@ -838,6 +843,30 @@ GRANT ALL PRIVILEGES ON `site_a`.* TO `ua`@`%`;
              GRANT USAGE ON *.* TO `ua`@`%` IDENTIFIED BY PASSWORD '*CC';\n\
              GRANT ALL PRIVILEGES ON `site_a`.* TO `ua`@`%`;\n"
         );
+    }
+
+    #[test]
+    fn statements_are_read_raw_so_an_escaped_underscore_is_not_doubled() {
+        let dir = tempfile::tempdir().unwrap();
+        let trusted = crate::site::TrustedRoot::parse(dir.path()).unwrap();
+        let driver = DockerDriver::new(dir.path(), &trusted);
+        let request = format!(
+            "{:?}",
+            driver.sql_request("c1", "pw", "SHOW GRANTS FOR `ua`@`%`")
+        );
+        assert!(request.contains("\"--raw\""), "{request}");
+        // The password travels in the environment only.
+        assert!(!request.contains("\"pw\"") || request.contains("MYSQL_PWD"));
+    }
+
+    #[test]
+    fn an_escaped_underscore_in_a_grant_is_carried_unchanged() {
+        let dump = "CREATE USER `ro`@`localhost` IDENTIFIED BY PASSWORD '*DD';\n\
+                    GRANT USAGE ON *.* TO `ro`@`localhost` IDENTIFIED BY PASSWORD '*DD';\n\
+                    GRANT SELECT ON `my\\_db`.* TO `ro`@`localhost`;\n";
+        let filtered = filter_account_statements(dump);
+        assert!(filtered.contains("GRANT SELECT ON `my\\_db`.* TO `ro`@`localhost`;"));
+        assert!(!filtered.contains("my\\\\_db"));
     }
 
     #[test]
