@@ -134,6 +134,26 @@ pub fn run(command: DbCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => drop_mariadb_user(&request_file, &request_id, idempotency_key.as_deref()),
+        DbCommand::EnsureReadonlyUser {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::maria_readonly_user::run(
+            crate::commands::maria_readonly_user::Action::Ensure,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        DbCommand::RevokeReadonlyUser {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => crate::commands::maria_readonly_user::run(
+            crate::commands::maria_readonly_user::Action::Revoke,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         DbCommand::ClearMariadbSlowLog {
             request_file,
             request_id,

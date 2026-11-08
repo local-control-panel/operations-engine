@@ -54,6 +54,7 @@ pub mod joomla_clone;
 #[cfg(unix)]
 pub mod journal;
 pub mod maria_drop;
+pub mod maria_readonly_user;
 pub mod maria_slow_log;
 pub mod maria_user;
 pub mod mariadb_migrate;
