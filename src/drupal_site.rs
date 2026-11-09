@@ -260,9 +260,10 @@ mod tests {
             SitesMap::parse(&"x".repeat(MAX_MAP_BYTES + 1)),
             Err(Error::MapTooLarge)
         );
-        let many: String = (0..=MAX_MAP_ENTRIES)
-            .map(|i| format!("$sites['h{i}.com'] = 'd{i}';\n"))
-            .collect();
+        let mut many = String::new();
+        for i in 0..=MAX_MAP_ENTRIES {
+            many.push_str(&format!("$sites['h{i}.com'] = 'd{i}';\n"));
+        }
         assert_eq!(SitesMap::parse(&many), Err(Error::MapTooLarge));
     }
 
