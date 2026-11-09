@@ -523,7 +523,9 @@ fn bundle(
             &rel(format!("{dir}/manifest.json")),
             &serde_json::to_vec_pretty(&manifest).unwrap(),
         )
-        .map_err(|_| Error::BundleFailed)
+        .map_err(|_| Error::BundleFailed)?;
+    record(ctx, req.request_id, Step::Bundled);
+    Ok(())
 }
 
 /// Removes bundles older than the retention window. Best effort: a bundle
@@ -672,12 +674,14 @@ fn apply(
         result.map_err(|error| format!("{label}: {}", error.protocol().1))
     };
     step("composer update", composer_update(ctx, req, names, cancel))?;
+    record(ctx, req.request_id, Step::ComposerDone);
     step(
         "database updates",
         drush(&action, &req.base, &["updatedb"], UPDATE_TIMEOUT, cancel)
             .map(|_| ())
             .map_err(Error::from),
     )?;
+    record(ctx, req.request_id, Step::DatabaseUpdated);
     step(
         "cache rebuild",
         drush(&action, &req.base, &["cache:rebuild"], RUN_TIMEOUT, cancel)
@@ -689,6 +693,7 @@ fn apply(
         .then(|| after.get("drupal/core").cloned())
         .flatten();
     probe(ctx, req, core.as_deref(), true, cancel)?;
+    record(ctx, req.request_id, Step::Probed);
     Ok(after)
 }
 
@@ -816,6 +821,7 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
         return Err(Error::BundleCorrupt);
     }
 
+    record(ctx, id, Step::RollbackStarted);
     // Files: empty the project root (links are removed, never followed),
     // then extract.
     for entry in std::fs::read_dir(req.root()).map_err(Error::Io)? {
@@ -850,6 +856,7 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
         ));
     }
 
+    record(ctx, id, Step::FilesRestored);
     // Database: Drush (restored with the files) names the connection.
     let action = ctx.action();
     let connection = drupal_action::read_db_connection(&action, &req.base, &cancel)?
@@ -865,10 +872,12 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
     if !exited_ok(&imported) {
         return Err(Error::RecoveryRequired("the database import failed".into()));
     }
+    record(ctx, id, Step::DatabaseRestored);
     drush(&action, &req.base, &["cache:rebuild"], RUN_TIMEOUT, &cancel)?;
     let before = manifest.versions_before.get("drupal/core").cloned();
     probe(ctx, req, before.as_deref(), false, &cancel)
         .map_err(|why| Error::RecoveryRequired(format!("after restoring: {why}")))?;
+    record(ctx, id, Step::RolledBack);
     Ok(manifest)
 }
 
@@ -934,6 +943,7 @@ fn run(
             drupal_action::set_maintenance(&action, &req.base, true, cancel)
                 .map_err(|e| format!("maintenance: {}", Error::from(e).protocol().1))?;
         }
+        record(ctx, req.request_id, Step::MaintenanceOn);
         apply(ctx, req, &names, cancel)
     })();
     relock_default_site(unlocked);
@@ -949,6 +959,7 @@ fn run(
                         )
                     })?;
             }
+            record(ctx, req.request_id, Step::Finished);
             let after = after
                 .into_iter()
                 .filter(|(name, _)| watched.contains_key(name))
@@ -1101,6 +1112,8 @@ fn fail(
 
 mod composer_reason;
 use composer_reason::ComposerReason;
+mod steps;
+use steps::{Step, record};
 
 #[cfg(all(test, unix))]
 mod tests;
