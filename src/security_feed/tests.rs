@@ -488,3 +488,65 @@ fn an_oversized_history_file_is_unavailable_not_empty() {
     record_history(&state, entry(NOW, "updated"), NOW);
     assert!(!history(&state, 10).available);
 }
+
+// ---- image rules ---------------------------------------------------------------
+
+fn d(c: char) -> String {
+    format!("sha256:{}", c.to_string().repeat(64))
+}
+
+fn fix(id: &str, from: &[char], to: char) -> String {
+    let from: Vec<String> = from
+        .iter()
+        .map(|c| format!("\"ghcr.io/x/frankenphp@{}\"", d(*c)))
+        .collect();
+    format!(
+        r#"{{"id":"{id}","version":"1.0.0","advisoryId":"php-rce","platforms":["linux/amd64"],"action":{{"type":"docker.image.replace","component":"php-runtime","fromImages":[{}],"toImage":"ghcr.io/x/frankenphp@{}"}}}}"#,
+        from.join(","),
+        d(to)
+    )
+}
+
+fn publish_with_fixes(fake: &Fake, fixes: &str) {
+    let m = format!(
+        r#"{{"schemaVersion":1,"sequence":2,"publishedAt":"2026-11-08T12:00:00Z","expiresAt":"2026-12-08T12:00:00Z","advisories":[],"fixes":[{fixes}],"revoked":[]}}"#
+    )
+    .into_bytes();
+    fake.serve(
+        "/feed/v1/index.json",
+        &index(2, "2026-11-08T12:00:00Z", "2026-12-08T12:00:00Z", &m),
+        None,
+    );
+    fake.serve("/releases/000002/manifest.json", &m, None);
+}
+
+#[test]
+fn image_rules_are_kept_as_digests_and_malformed_ones_are_counted() {
+    let (_dir, state) = enabled();
+    let fake = Fake::default();
+    let bad_tag = fix("tagged", &['a'], 'c').replace(&format!("@{}", d('a')), ":latest");
+    let self_replace = fix("same", &['a'], 'a');
+    let script = r#"{"id":"s","action":{"type":"script"}}"#;
+    publish_with_fixes(
+        &fake,
+        &[
+            fix("good", &['a', 'b'], 'c'),
+            bad_tag,
+            self_replace,
+            script.to_owned(),
+        ]
+        .join(","),
+    );
+    refresh(&state, &fake, ORIGIN, NOW, rid()).unwrap();
+    let accepted = status(&state, NOW).accepted.unwrap();
+    assert_eq!(accepted.image_rules.len(), 1);
+    let rule = &accepted.image_rules[0];
+    assert_eq!(rule.fix_id, "good");
+    assert_eq!(rule.component, "php-runtime");
+    assert_eq!(rule.from_digests, [d('a'), d('b')]);
+    assert_eq!(rule.to_digest, d('c'));
+    assert_eq!(
+        accepted.skipped_rules, 2,
+        "the script fix is another kind, not skipped"
+    );
+}
