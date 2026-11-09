@@ -17,6 +17,8 @@ pub mod meilisearch;
 pub mod operation;
 pub mod permissions;
 pub mod runtime_config;
+#[cfg(unix)]
+pub mod security;
 pub mod site;
 pub mod site_admin;
 pub mod stack;

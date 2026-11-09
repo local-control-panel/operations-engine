@@ -111,7 +111,7 @@ fn build_agent(https_only: bool) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
-fn is_plain_http_loopback(url: &str) -> bool {
+pub(crate) fn is_plain_http_loopback(url: &str) -> bool {
     let Some(authority) = url.strip_prefix("http://") else {
         return false;
     };

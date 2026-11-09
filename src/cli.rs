@@ -125,6 +125,12 @@ pub enum Command {
         command: ToolCommand,
     },
 
+    /// Security feed consumer (check only): policy, refresh and status.
+    Security {
+        #[command(subcommand)]
+        command: SecurityCommand,
+    },
+
     /// Configuration for bundled host agents.
     Agent {
         #[command(subcommand)]
@@ -174,6 +180,7 @@ impl Command {
             Self::Joomla { command } => command.operation(),
             Self::Cms { command } => command.operation(),
             Self::Tool { command } => command.operation(),
+            Self::Security { command } => command.operation(),
             Self::Agent { command } => command.operation(),
             Self::System { command } => command.operation(),
             Self::Stack { command } => command.operation(),
@@ -280,6 +287,34 @@ pub enum ToolCommand {
     },
     /// Report every catalog tool: pinned/installed version, selection, integrity.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecurityCommand {
+    /// Set the server policy: `off` (default, nothing is fetched) or `check-only`.
+    SetPolicy {
+        #[arg(long)]
+        mode: String,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
+    /// Fetch and validate the public feed once. Refused unless the policy is `check-only`.
+    Refresh {
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
+    /// Report the policy, the accepted feed revision, its freshness and the last check.
+    Status,
+}
+
+impl SecurityCommand {
+    pub const fn operation(&self) -> &'static str {
+        match self {
+            Self::SetPolicy { .. } => "security.setPolicy",
+            Self::Refresh { .. } => "security.refresh",
+            Self::Status => "security.status",
+        }
+    }
 }
 
 impl ToolCommand {
