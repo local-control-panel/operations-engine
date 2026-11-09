@@ -914,6 +914,45 @@ root) and no Drush output. `capabilities` advertises
 `features.drupalUpdateDbSafety`; an engine without it neither backs up nor
 toggles maintenance, so clients must keep their own warning.
 
+## `joomla.updateCore`, `joomla.restoreUpdate`
+
+`joomla update-core` and `joomla restore-update` accept a root-owned JSON
+request with `container`, `projectRoot`, `uid` and `gid` (and, for restore,
+`recoveryId`), one lock/idempotency/transaction/audit-backed request on a
+single-site Joomla 4 or later project. Nothing else is accepted; there is no
+command argument.
+
+Preflight changes nothing: the project must have `cli/joomla.php` and a
+regular `configuration.php` whose database is `mysqli`/`pdomysql` on a
+container name, the installed version is read from
+`administrator/manifests/files/joomla.xml`, and `core:update:check` must offer
+a version with the **same major number**. A site that is current, a major
+jump, an update server that cannot be reached and an answer the engine does
+not recognise are refused before anything is written.
+
+Then the engine writes a recovery bundle under
+`joomla-updates/<requestId>/` in the backup root (`files.tar.gz`, a
+`mariadb-dump` of the site database, `manifest.json` with SHA-256 sums, and
+`steps.json`, a journal of step names), puts the site offline (`site:down`),
+runs Joomla's own `php cli/joomla.php core:update` as the site user (the
+console fetches, verifies and unpacks the package and finalises the database;
+the engine downloads nothing), probes the site (installed version equals the
+offered one and `extension:list` boots and reads the database) and puts the
+site back to its earlier mode. Any failure after the bundle is rolled back by
+the engine itself: the project root is emptied and extracted from the bundle,
+the database is emptied and re-imported, and the probe runs again. The result
+is `updated` (`versionBefore`, `versionAfter`), `rolledBack` (with a fixed
+`reason`, never tool output) or, when the rollback itself fails, a
+`recovery required` error naming the `recoveryId`; a rollback that cannot be
+proved is never reported as success. `joomla.restoreUpdate` runs the same
+rollback from a kept bundle (bundles are pruned after seven days).
+
+A later `joomla.*` update request for the same project first rolls back an
+earlier update whose journal did not end in `finished` or `rolledBack`, and
+reports interrupted requests of these operations in `operation.incomplete`
+with `recoveredBy: joomla.restoreUpdate`. Extensions are not updated: Joomla's
+console has no command for it.
+
 ## `drupal.updateCore`, `drupal.updatePackages`, `drupal.restoreUpdate`
 
 `drupal update-core`, `drupal update-packages` and `drupal restore-update` take

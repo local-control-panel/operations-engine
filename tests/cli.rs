@@ -127,6 +127,8 @@ fn capabilities_describe_only_implemented_operations() {
             "wordpress.import",
             "wordpress.clone",
             "joomla.clone",
+            "joomla.restoreUpdate",
+            "joomla.updateCore",
             "drupal.clone",
             "wordpress.migrateExport",
             "wordpress.migrateDiscard",
