@@ -19,6 +19,7 @@
 
 use crate::{
     db_restore::{ContainerName, RestoreRequestError},
+    drupal_site,
     error::ErrorCode,
     filesystem::ManagedRoot,
     mutation::preflight,
@@ -1065,8 +1066,9 @@ pub fn execute(
             .create_dir_all(&SiteRelativePath::parse(child).unwrap())
             .map_err(Error::Io)?;
     }
+    // Project lock, then (once a request names a site) the site lock.
     let _resource_lock =
-        resource_lock::acquire(ctx.engine_state, &req.project_root, req.request_id)
+        drupal_site::acquire_locks(ctx.engine_state, &req.project_root, None, req.request_id)
             .map_err(|_| Error::ResourceBusy)?;
 
     let operation = req.action.operation();
