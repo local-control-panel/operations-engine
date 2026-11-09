@@ -941,6 +941,33 @@ on request and reports `outcome: "restored"`; it refuses a missing bundle
 before removing anything. A successful update reports `outcome: "updated"` and
 `versionsBefore`/`versionsAfter` for the requested packages and core. Results
 carry no Composer or Drush output.
+## `security.setPolicy`, `security.refresh`, `security.status`
+
+A check-only consumer of the public security feed. Nothing is fetched unless the
+stored policy is `checkOnly`; the default is `off`. `security set-policy --mode
+off|check-only --request-id <id>` writes the policy to the engine state root
+(`security-updates/policy.json`; an unknown mode or file is reported as
+`invalid` and never read as permission). `security refresh --request-id <id>` is
+refused with `INVALID_INPUT` unless the policy is `checkOnly`, and otherwise
+performs one check under a lock: a GET of `/feed/v1/index.json` on the origin
+(`https://updates.orbden.com`, replaced by `ORBDEN_UPDATES_URL`; plain HTTP is
+accepted only on loopback), then, for a higher `sequence`, a GET of the
+manifest path named by the index. Requests carry `User-Agent: ops-engine` and
+`If-None-Match` for the stored ETag; no identifier, cookie, inventory or result
+is sent. Redirects are not followed, sizes are bounded (index 16 KiB, manifest
+4 MiB), the manifest must match the index's size and SHA-256 before it is
+parsed, the manifest path must be `/releases/...json` with plain characters, and
+`sequence`, `publishedAt` and `expiresAt` must agree between the two documents.
+The highest accepted `sequence` and its manifest hash are persisted; a lower
+sequence, or another hash at the same sequence, is recorded as `replay` and
+never moves the accepted state. A clock before 2024 or a feed published more
+than five minutes ahead is `clockUnreliable`. An expired index is not accepted
+(`expired`); a `304` does not extend `expiresAt`. The result is
+`updated`, `unchanged`, `expired`, `unreachable`, `invalid`, `replay` or
+`clockUnreliable`, with `freshness` `fresh`, `expired` or `unknown`.
+`security status` reports the policy, the accepted revision (sequence, times,
+advisory ids, titles, severities, statuses, revocation count), freshness and the
+last check. Fixes in the manifest are not read, downloaded or run.
 
 ## `cms.clearCache`
 

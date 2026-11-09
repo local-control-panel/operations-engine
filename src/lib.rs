@@ -74,6 +74,8 @@ pub mod recovery_evidence;
 pub mod rollback;
 pub mod runtime_config;
 pub mod secret_result;
+#[cfg(unix)]
+pub mod security_feed;
 pub mod site;
 pub mod site_admin;
 #[cfg(unix)]
@@ -159,6 +161,14 @@ pub fn execute(cli: Cli) -> Response {
         Command::Joomla { command } => commands::joomla::run(command),
         Command::Cms { command } => commands::cms::run(command),
         Command::Tool { command } => commands::tool::run(command),
+        #[cfg(unix)]
+        Command::Security { command } => commands::security::run(command),
+        #[cfg(not(unix))]
+        Command::Security { command } => Ok(protocol::Response::failure(
+            command.operation(),
+            error::ErrorCode::UnsupportedPlatform,
+            "security updates require a Unix host",
+        )),
         Command::Agent { command } => commands::agent::run(command),
         Command::System { command } => commands::system::run(command),
         Command::Stack { command } => commands::stack::run(command),
