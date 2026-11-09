@@ -34,6 +34,10 @@ struct Features {
     /// maintenance mode, restoring the previous mode afterwards. Clients may
     /// then drop their own reminder to back up.
     drupal_update_db_safety: bool,
+    /// `drupal.watchdog` accepts `site` (`{host, directory}`) for a multisite
+    /// project and answers with the verified site. Without this field the
+    /// engine rejects the key.
+    drupal_watchdog_site: bool,
     /// `wordpress.rotateDebugLog` accepts `--compress` (gzip of the rotated
     /// copy). An engine without this field rejects the flag.
     debug_log_gzip: bool,
@@ -280,6 +284,7 @@ pub fn run() -> Result<Response, ResponseBuildError> {
                 admin_login_cms: ADMIN_LOGIN_CMS,
                 clone_staging_defaults: true,
                 drupal_update_db_safety: true,
+                drupal_watchdog_site: true,
                 debug_log_gzip: true,
                 content_recovery_evidence: true,
                 admin_paths: admin_paths_catalog(),

@@ -16,10 +16,20 @@
 //! locations are not returned at all: an entry is
 //! `{id, date, type, severity, message}`.
 //!
+//! In a multisite project the request names the site with `site`
+//! (`{"host", "directory"}`). The engine resolves the host from the static
+//! `sites.php` map ([`drupal_site`]), requires the named directory to be the
+//! mapped one, runs Drush with `--uri=<host>` and refuses unless Drush reports
+//! that same `sites/<directory>` with a connected database whose name agrees
+//! with `sql:conf`. There is no fallback to `default`. The answer carries the
+//! verified host, directory, database name and table prefix, never a
+//! credential.
+//!
 //! Nothing is written: no transaction, no lock, no audit record.
 
 use crate::{
     db_restore::{ContainerName, RestoreRequestError},
+    drupal_site::{self, DrupalSiteIdentity},
     error::ErrorCode,
     process::{
         self, CancellationToken, ProcessLimits, ProcessRequest, ProcessTermination,
@@ -66,6 +76,21 @@ struct Plan {
     severity_min: Option<String>,
     #[serde(rename = "type")]
     channel: Option<String>,
+    site: Option<SitePlan>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SitePlan {
+    host: String,
+    directory: String,
+}
+
+/// The site of a multisite project a request is about.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SiteSelector {
+    host: String,
+    directory: String,
 }
 
 #[derive(Debug)]
@@ -79,6 +104,7 @@ pub struct Request {
     severity: Option<&'static str>,
     severity_min: Option<&'static str>,
     channel: Option<String>,
+    site: Option<SiteSelector>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +115,7 @@ pub enum RequestError {
     InvalidCount,
     InvalidSeverity,
     InvalidType,
+    InvalidSite,
 }
 
 impl RequestError {
@@ -105,6 +132,9 @@ impl RequestError {
             }
             Self::InvalidType => {
                 "type must be 1-64 characters of letters, digits, space, dot, underscore or hyphen"
+            }
+            Self::InvalidSite => {
+                "site must name a host (letters, digits, dot, hyphen) and a directory under sites/"
             }
         }
     }
@@ -163,6 +193,18 @@ impl Request {
         if plan.channel.as_deref().is_some_and(|v| !valid_channel(v)) {
             return Err(RequestError::InvalidType);
         }
+        let site = match plan.site {
+            None => None,
+            Some(site) => {
+                drupal_site::check_host(&site.host).map_err(|_| RequestError::InvalidSite)?;
+                drupal_site::check_directory(&site.directory)
+                    .map_err(|_| RequestError::InvalidSite)?;
+                Some(SiteSelector {
+                    host: site.host,
+                    directory: site.directory,
+                })
+            }
+        };
         Ok(Self {
             container: ContainerName::parse(&plan.container)
                 .map_err(|_: RestoreRequestError| RequestError::InvalidContainer)?,
@@ -174,6 +216,7 @@ impl Request {
             severity,
             severity_min,
             channel: plan.channel,
+            site,
         })
     }
 
@@ -227,6 +270,77 @@ pub struct Entry {
 pub struct WatchdogResult {
     /// Newest first.
     pub entries: Vec<Entry>,
+    /// The site the entries belong to; present only for a multisite request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub site: Option<VerifiedSite>,
+}
+
+/// A site whose identity the engine checked against `sites.php` and Drush.
+/// No credential is part of it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifiedSite {
+    pub host: String,
+    pub directory: String,
+    pub database: String,
+    /// `None` when Drush did not report a usable prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table_prefix: Option<String>,
+}
+
+/// Why a multisite request was refused. Nothing was read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SiteError {
+    /// `sites.php` is dynamic, too large or not a plain file.
+    MapUnsupported,
+    NotMapped,
+    /// The requested directory is not the one `sites.php` maps the host to.
+    DirectoryMismatch,
+    DirectoryNotUsable,
+    /// Drush bootstrapped a different site than `sites.php` names.
+    DrushSelectedOther,
+    DatabaseNotReady,
+    DatabaseMismatch,
+}
+
+impl SiteError {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::MapUnsupported => {
+                "sites.php is not a plain list of $sites['host'] = 'directory'; assignments, so multisite requests are not supported for this project; nothing was read"
+            }
+            Self::NotMapped => "the host is not mapped in sites.php; nothing was read",
+            Self::DirectoryMismatch => {
+                "the requested directory is not the one sites.php maps the host to; nothing was read"
+            }
+            Self::DirectoryNotUsable => {
+                "the site directory is missing, a symlink or outside sites/; nothing was read"
+            }
+            Self::DrushSelectedOther => {
+                "Drush selected a different site than sites.php names for this host; nothing was read"
+            }
+            Self::DatabaseNotReady => {
+                "the selected site's database is not connected; nothing was read"
+            }
+            Self::DatabaseMismatch => {
+                "the selected site's database settings disagree; nothing was read"
+            }
+        }
+    }
+}
+
+impl From<drupal_site::Error> for SiteError {
+    fn from(error: drupal_site::Error) -> Self {
+        match error {
+            drupal_site::Error::MapTooLarge | drupal_site::Error::DynamicMap => {
+                Self::MapUnsupported
+            }
+            drupal_site::Error::NotMapped
+            | drupal_site::Error::InvalidHost
+            | drupal_site::Error::InvalidDirectory => Self::NotMapped,
+            drupal_site::Error::DirectoryNotUsable => Self::DirectoryNotUsable,
+        }
+    }
 }
 
 pub struct Context<'a> {
@@ -241,6 +355,7 @@ pub enum Error {
     DrushMissing,
     TooLarge,
     BadOutput,
+    Site(SiteError),
 }
 
 impl Error {
@@ -267,6 +382,7 @@ impl Error {
                 ErrorCode::DependencyUnavailable,
                 "Drush is not installed for this site; run drupal.installDrush first".into(),
             ),
+            Self::Site(error) => (ErrorCode::InvalidInput, error.message().into()),
             Self::TooLarge | Self::BadOutput => (
                 ErrorCode::Internal,
                 "Drush returned an unexpected answer".into(),
@@ -516,11 +632,14 @@ pub fn parse_output(bytes: &[u8], limit: usize) -> Result<Vec<Entry>, Error> {
 
 // ----------------------------------------------------------------- execution
 
-pub fn read(
+/// Runs `drush` as the site user in the project root with `--root` (and
+/// `--uri` for a multisite request) and returns its standard output.
+fn run_drush(
     ctx: &Context<'_>,
     req: &Request,
+    drush_args: &[String],
     cancel: &CancellationToken,
-) -> Result<WatchdogResult, Error> {
+) -> Result<Vec<u8>, Error> {
     let mut args: Vec<String> = vec![
         "exec".into(),
         "--user".into(),
@@ -537,7 +656,10 @@ pub fn read(
         format!("--root={}", req.document_root.display()),
         "--no-interaction".into(),
     ];
-    args.extend(req.drush_args());
+    if let Some(site) = &req.site {
+        args.push(format!("--uri={}", site.host));
+    }
+    args.extend(drush_args.iter().cloned());
     let output = process::run(
         &ProcessRequest::new(ctx.docker_program).args(args),
         &ProcessLimits {
@@ -564,13 +686,136 @@ pub fn read(
     if output.stdout.truncated || output.stderr.truncated {
         return Err(Error::TooLarge);
     }
-    let text = String::from_utf8_lossy(&output.stdout.bytes);
+    Ok(output.stdout.bytes)
+}
+
+/// The first JSON object in Drush output, after any leading notices.
+fn json_object(bytes: &[u8]) -> Option<serde_json::Value> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let value: serde_json::Value = serde_json::from_str(text[text.find('{')?..].trim()).ok()?;
+    value.is_object().then_some(value)
+}
+
+/// A table prefix Drupal would accept in a name: letters, digits, underscore.
+fn usable_prefix(value: &str) -> Option<String> {
+    (value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+    .then(|| value.to_owned())
+}
+
+/// Checks Drush's answers against the identity `sites.php` gave. Pure, so the
+/// refusals are tested without a server.
+///
+/// `status` is `drush status --fields=site,db-name,db-status --format=json`
+/// and `conf` is `drush sql:conf --format=json` (credentials in it are never
+/// read).
+pub fn verify_drush(
+    identity: &DrupalSiteIdentity,
+    status: &[u8],
+    conf: &[u8],
+) -> Result<VerifiedSite, SiteError> {
+    let status = json_object(status).ok_or(SiteError::DrushSelectedOther)?;
+    let text = |value: &serde_json::Value, key: &str| {
+        value.get(key).and_then(|v| v.as_str()).map(str::to_owned)
+    };
+    let selected = text(&status, "site").ok_or(SiteError::DrushSelectedOther)?;
+    let selected = selected.trim_end_matches('/');
+    let wanted = format!("sites/{}", identity.directory());
+    if selected != wanted && !selected.ends_with(&format!("/{wanted}")) {
+        return Err(SiteError::DrushSelectedOther);
+    }
+    if text(&status, "db-status").as_deref() != Some("Connected") {
+        return Err(SiteError::DatabaseNotReady);
+    }
+    let database = text(&status, "db-name")
+        .filter(|name| !name.is_empty())
+        .ok_or(SiteError::DatabaseNotReady)?;
+    let conf = json_object(conf).ok_or(SiteError::DatabaseMismatch)?;
+    // Some Drush versions nest the spec under `database.default.default`.
+    let spec = conf
+        .get("database")
+        .filter(|inner| inner.is_object())
+        .and_then(|inner| inner.get("default").and_then(|d| d.get("default")))
+        .unwrap_or(&conf);
+    if text(spec, "database").as_deref() != Some(database.as_str()) {
+        return Err(SiteError::DatabaseMismatch);
+    }
+    let table_prefix = match spec.get("prefix") {
+        Some(serde_json::Value::String(prefix)) => usable_prefix(prefix),
+        Some(serde_json::Value::Object(map)) => map
+            .get("default")
+            .and_then(|v| v.as_str())
+            .and_then(usable_prefix),
+        _ => None,
+    };
+    Ok(VerifiedSite {
+        host: identity.host().to_owned(),
+        directory: identity.directory().to_owned(),
+        database,
+        table_prefix,
+    })
+}
+
+fn verify_site(
+    ctx: &Context<'_>,
+    req: &Request,
+    selector: &SiteSelector,
+    cancel: &CancellationToken,
+) -> Result<VerifiedSite, Error> {
+    let map = drupal_site::read_sites_map(&req.document_root).map_err(SiteError::from)?;
+    let identity = DrupalSiteIdentity::resolve(&req.document_root, &map, &selector.host)
+        .map_err(SiteError::from)?;
+    if identity.directory() != selector.directory {
+        return Err(SiteError::DirectoryMismatch.into());
+    }
+    let status = run_drush(
+        ctx,
+        req,
+        &[
+            "status".into(),
+            "--fields=site,db-name,db-status".into(),
+            "--format=json".into(),
+        ],
+        cancel,
+    )?;
+    let conf = run_drush(
+        ctx,
+        req,
+        &["sql:conf".into(), "--format=json".into()],
+        cancel,
+    )?;
+    Ok(verify_drush(&identity, &status, &conf)?)
+}
+
+impl From<SiteError> for Error {
+    fn from(error: SiteError) -> Self {
+        Self::Site(error)
+    }
+}
+
+pub fn read(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<WatchdogResult, Error> {
+    let site = match &req.site {
+        None => None,
+        Some(selector) => Some(verify_site(ctx, req, selector, cancel)?),
+    };
+    let stdout = run_drush(ctx, req, &req.drush_args(), cancel)?;
+    let text = String::from_utf8_lossy(&stdout);
     // An empty log prints nothing or `[]`.
     if text.trim().is_empty() {
-        return Ok(WatchdogResult { entries: vec![] });
+        return Ok(WatchdogResult {
+            entries: vec![],
+            site,
+        });
     }
     Ok(WatchdogResult {
         entries: parse_output(text.as_bytes(), req.count as usize)?,
+        site,
     })
 }
 
@@ -831,5 +1076,146 @@ mod tests {
         assert!(!message.contains("zzz"));
         let garbage = run("#!/bin/sh\necho 'not json'\n").unwrap_err();
         assert_eq!(garbage.protocol().0, ErrorCode::Internal);
+    }
+
+    // ------------------------------------------------------------ multisite
+
+    fn identity(host: &str, directory: &str) -> (tempfile::TempDir, DrupalSiteIdentity) {
+        let docroot = tempfile::tempdir().unwrap();
+        fs::create_dir_all(docroot.path().join("sites").join(directory)).unwrap();
+        let map =
+            drupal_site::SitesMap::parse(&format!("$sites['{host}'] = '{directory}';")).unwrap();
+        let identity = DrupalSiteIdentity::resolve(docroot.path(), &map, host).unwrap();
+        (docroot, identity)
+    }
+
+    const STATUS: &str = r#"{"site":"sites/shop","db-name":"shop_db","db-status":"Connected"}"#;
+    const CONF: &str =
+        r#"{"driver":"mysql","host":"db","database":"shop_db","prefix":"shop_","username":"u"}"#;
+
+    #[test]
+    fn a_site_request_is_validated() {
+        let ok = Request::parse(&plan_with(
+            r#""site":{"host":"shop.example.com","directory":"shop"}"#,
+        ))
+        .unwrap();
+        assert_eq!(ok.site.as_ref().unwrap().host, "shop.example.com");
+        for bad in [
+            r#""site":{"host":"","directory":"shop"}"#,
+            r#""site":{"host":"a.com","directory":"../x"}"#,
+            r#""site":{"host":"a.com","directory":"all"}"#,
+            r#""site":{"host":"a b","directory":"shop"}"#,
+            r#""site":{"host":"a.com"}"#,
+            r#""site":{"host":"a.com","directory":"shop","uri":"x"}"#,
+        ] {
+            assert!(Request::parse(&plan_with(bad)).is_err(), "{bad}");
+        }
+        assert!(Request::parse(PLAN).unwrap().site.is_none());
+    }
+
+    #[test]
+    fn the_verified_site_is_the_one_drush_selected() {
+        let (_docroot, id) = identity("shop.example.com", "shop");
+        let verified = verify_drush(&id, STATUS.as_bytes(), CONF.as_bytes()).unwrap();
+        assert_eq!(
+            verified,
+            VerifiedSite {
+                host: "shop.example.com".into(),
+                directory: "shop".into(),
+                database: "shop_db".into(),
+                table_prefix: Some("shop_".into()),
+            }
+        );
+        // A path with a prefix and the nested spec of some Drush versions.
+        let nested = r#"{"database":{"default":{"default":{"database":"shop_db","prefix":{"default":"p_"}}}}}"#;
+        let status = r#"Notice\n{"site":"/var/www/s/web/sites/shop/","db-name":"shop_db","db-status":"Connected"}"#;
+        let again = verify_drush(&id, status.as_bytes(), nested.as_bytes()).unwrap();
+        assert_eq!(again.table_prefix.as_deref(), Some("p_"));
+    }
+
+    #[test]
+    fn drift_and_database_problems_are_refused() {
+        let (_docroot, id) = identity("shop.example.com", "shop");
+        let refused = |status: &str, conf: &str| {
+            verify_drush(&id, status.as_bytes(), conf.as_bytes()).unwrap_err()
+        };
+        // Drush fell back to another site (map drift, or the default site).
+        assert_eq!(
+            refused(
+                r#"{"site":"sites/default","db-name":"d","db-status":"Connected"}"#,
+                CONF
+            ),
+            SiteError::DrushSelectedOther
+        );
+        assert_eq!(
+            refused(
+                r#"{"site":"sites/shop2","db-name":"d","db-status":"Connected"}"#,
+                CONF
+            ),
+            SiteError::DrushSelectedOther
+        );
+        assert_eq!(refused("not json", CONF), SiteError::DrushSelectedOther);
+        assert_eq!(
+            refused(r#"{"site":"sites/shop","db-name":"shop_db"}"#, CONF),
+            SiteError::DatabaseNotReady
+        );
+        assert_eq!(
+            refused(
+                r#"{"site":"sites/shop","db-name":"shop_db","db-status":"Not connected"}"#,
+                CONF
+            ),
+            SiteError::DatabaseNotReady
+        );
+        // The two Drush answers name different databases.
+        assert_eq!(
+            refused(STATUS, r#"{"database":"other_db"}"#),
+            SiteError::DatabaseMismatch
+        );
+        assert_eq!(refused(STATUS, "nope"), SiteError::DatabaseMismatch);
+    }
+
+    #[test]
+    fn an_unusable_prefix_is_unknown_not_a_refusal() {
+        let (_docroot, id) = identity("shop.example.com", "shop");
+        let conf = r#"{"database":"shop_db","prefix":"a b;"}"#;
+        let verified = verify_drush(&id, STATUS.as_bytes(), conf.as_bytes()).unwrap();
+        assert_eq!(verified.table_prefix, None);
+    }
+
+    #[test]
+    fn the_answer_carries_no_credential_and_single_site_answers_are_unchanged() {
+        let (_docroot, id) = identity("shop.example.com", "shop");
+        let verified = verify_drush(&id, STATUS.as_bytes(), CONF.as_bytes()).unwrap();
+        let json = serde_json::to_string(&WatchdogResult {
+            entries: vec![],
+            site: Some(verified),
+        })
+        .unwrap();
+        assert!(!json.contains("username") && !json.contains("password"));
+        assert_eq!(
+            serde_json::to_string(&WatchdogResult {
+                entries: vec![],
+                site: None
+            })
+            .unwrap(),
+            r#"{"entries":[]}"#
+        );
+    }
+
+    #[test]
+    fn site_errors_say_nothing_was_read() {
+        for error in [
+            SiteError::MapUnsupported,
+            SiteError::NotMapped,
+            SiteError::DirectoryMismatch,
+            SiteError::DirectoryNotUsable,
+            SiteError::DrushSelectedOther,
+            SiteError::DatabaseNotReady,
+            SiteError::DatabaseMismatch,
+        ] {
+            let (code, message) = Error::Site(error).protocol();
+            assert_eq!(code, ErrorCode::InvalidInput);
+            assert!(message.ends_with("nothing was read"), "{message}");
+        }
     }
 }
