@@ -507,6 +507,9 @@ const DRUPAL_UPDATES: [&str; 3] = [
     "drupal.restoreUpdate",
 ];
 
+/// Joomla updates: same as the Drupal ones.
+const JOOMLA_UPDATES: [&str; 2] = ["joomla.updateCore", "joomla.restoreUpdate"];
+
 /// A recovery marker (`pending/*.json`) found by [`incomplete`].
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -598,6 +601,8 @@ pub fn incomplete(
                                 Some("site.reconcile")
                             } else if DRUPAL_UPDATES.contains(&record.operation.as_str()) {
                                 Some("drupal.restoreUpdate")
+                            } else if JOOMLA_UPDATES.contains(&record.operation.as_str()) {
+                                Some("joomla.restoreUpdate")
                             } else {
                                 None
                             },

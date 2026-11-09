@@ -319,7 +319,7 @@ fn checked(
 
 /// `offline` from the line `public $offline = <value>;` of Joomla's
 /// `configuration.php`. Anything else is unknown, never "online".
-fn joomla_offline(stdout: &[u8]) -> Option<bool> {
+pub(crate) fn joomla_offline(stdout: &[u8]) -> Option<bool> {
     let text = String::from_utf8_lossy(stdout);
     let value = text
         .lines()
