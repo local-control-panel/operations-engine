@@ -305,6 +305,8 @@ pub enum SecurityCommand {
     },
     /// Report the policy, the accepted feed revision, its freshness and the last check.
     Status,
+    /// Report which managed PHP runtimes run an image the accepted feed names (local, read-only).
+    Affected,
     /// List the most recent checks (read-only, newest first).
     History {
         #[arg(long)]
@@ -319,6 +321,7 @@ impl SecurityCommand {
             Self::Refresh { .. } => "security.refresh",
             Self::Status => "security.status",
             Self::History { .. } => "security.history",
+            Self::Affected => "security.affected",
         }
     }
 }

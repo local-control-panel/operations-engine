@@ -33,6 +33,7 @@ use std::{
 pub const REFRESH: &str = "security.refresh";
 pub const STATUS: &str = "security.status";
 pub const HISTORY: &str = "security.history";
+pub const AFFECTED: &str = "security.affected";
 pub const SET_POLICY: &str = "security.setPolicy";
 
 pub const DEFAULT_ORIGIN: &str = "https://updates.orbden.com";
@@ -48,6 +49,7 @@ const FUTURE_TOLERANCE_SECS: i64 = 300;
 /// The publisher renews at most 31 days ahead; a little slack, no more.
 const MAX_VALIDITY_SECS: i64 = 32 * 24 * 3600;
 const MAX_ADVISORIES: usize = 500;
+const MAX_FIXES: usize = 500;
 
 const DIR: &str = "security-updates";
 const POLICY_FILE: &str = "security-updates/policy.json";
@@ -302,6 +304,8 @@ struct Manifest {
     published_at: String,
     expires_at: String,
     advisories: Vec<Advisory>,
+    #[serde(default)]
+    fixes: Vec<serde_json::Value>,
     revoked: Vec<serde_json::Value>,
 }
 
@@ -358,8 +362,95 @@ pub struct Accepted {
     pub expires_at_unix: i64,
     pub advisories: Vec<AdvisorySummary>,
     pub revoked_count: u32,
+    /// The `docker.image.replace` rules of the accepted manifest, reduced to
+    /// the digests. Only read by `security.affected`; nothing applies them.
+    #[serde(default)]
+    pub image_rules: Vec<ImageRule>,
+    /// Image rules that were present but did not pass validation.
+    #[serde(default)]
+    pub skipped_rules: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index_etag: Option<String>,
+}
+
+/// A declarative image replacement from the feed, kept only to tell which
+/// local images it names. `from_digests` and `to_digest` are `sha256:<hex>`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageRule {
+    pub fix_id: String,
+    pub advisory_id: String,
+    pub component: String,
+    pub platforms: Vec<String>,
+    pub from_digests: Vec<String>,
+    pub to_digest: String,
+}
+
+fn plain(text: &str, max: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/'))
+}
+
+/// `sha256:<64 hex>` of a pinned `repository@sha256:<64 hex>` reference.
+fn pinned_digest(image: &str) -> Option<String> {
+    let (repo, digest) = image.split_once("@sha256:")?;
+    let ok = !repo.is_empty()
+        && repo.len() <= 256
+        && repo.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'.' | b'-' | b'_' | b'/' | b':')
+        })
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    ok.then(|| format!("sha256:{digest}"))
+}
+
+/// `Some(Ok(rule))` for a valid image rule, `Some(Err(()))` for one that is
+/// present but malformed, `None` for a fix of another kind.
+fn image_rule(fix: &serde_json::Value) -> Option<Result<ImageRule, ()>> {
+    let action = fix.get("action")?;
+    if action.get("type")?.as_str()? != "docker.image.replace" {
+        return None;
+    }
+    let text = |value: &serde_json::Value, key: &str| value.get(key)?.as_str().map(str::to_owned);
+    let build = || -> Option<ImageRule> {
+        let fix_id = text(fix, "id").filter(|v| plain(v, 128))?;
+        let advisory_id = text(fix, "advisoryId").filter(|v| plain(v, 128))?;
+        let component = text(action, "component").filter(|v| plain(v, 64) && !v.contains('/'))?;
+        let platforms: Vec<String> = fix
+            .get("platforms")?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str().filter(|p| plain(p, 32)).map(str::to_owned))
+            .collect::<Option<_>>()?;
+        let from: Vec<String> = action
+            .get("fromImages")?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_str().and_then(pinned_digest))
+            .collect::<Option<_>>()?;
+        let to_digest = pinned_digest(action.get("toImage")?.as_str()?)?;
+        (!platforms.is_empty()
+            && platforms.len() <= 8
+            && !from.is_empty()
+            && from.len() <= 32
+            && !from.contains(&to_digest))
+        .then_some(ImageRule {
+            fix_id,
+            advisory_id,
+            component,
+            platforms,
+            from_digests: from,
+            to_digest,
+        })
+    };
+    Some(build().ok_or(()))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -620,6 +711,7 @@ fn check(
         || manifest.published_at != index.published_at
         || manifest.expires_at != index.expires_at
         || manifest.advisories.len() > MAX_ADVISORIES
+        || manifest.fixes.len() > MAX_FIXES
         || manifest
             .advisories
             .iter()
@@ -627,7 +719,17 @@ fn check(
     {
         return Err("invalid");
     }
+    let mut image_rules = Vec::new();
+    let mut skipped_rules = 0u32;
+    for rule in manifest.fixes.iter().filter_map(image_rule) {
+        match rule {
+            Ok(rule) => image_rules.push(rule),
+            Err(()) => skipped_rules += 1,
+        }
+    }
     stored.accepted = Some(Accepted {
+        image_rules,
+        skipped_rules,
         sequence: index.sequence,
         manifest_sha256: index.manifest.sha256,
         published_at_unix: published,
