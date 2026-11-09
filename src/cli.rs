@@ -346,6 +346,33 @@ pub enum DrupalCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Update Drupal core in a single-site Composer project: recovery bundle first, then Composer, `updatedb`, a health probe, and an automatic rollback if anything fails.
+    UpdateCore {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Update named, already installed Composer packages the same recovery-first way.
+    UpdatePackages {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Put a kept recovery bundle back (files and database) and run the health probe.
+    RestoreUpdate {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Turn maintenance mode on or off (explicit `state` in the request)
     /// and verify the mode Drupal reports afterwards.
     Maintenance {
@@ -386,6 +413,9 @@ impl DrupalCommand {
             Self::Maintenance { .. } => "drupal.maintenance",
             Self::InstallDrush { .. } => "drupal.installDrush",
             Self::UpdateDb { .. } => "drupal.updateDb",
+            Self::UpdateCore { .. } => "drupal.updateCore",
+            Self::UpdatePackages { .. } => "drupal.updatePackages",
+            Self::RestoreUpdate { .. } => "drupal.restoreUpdate",
             Self::Watchdog { .. } => "drupal.watchdog",
             Self::Clone { .. } => "drupal.clone",
         }

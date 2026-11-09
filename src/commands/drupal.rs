@@ -1,7 +1,7 @@
 use crate::{
     cli::DrupalCommand,
     commands::read_root_owned_content_file,
-    drupal_action, drupal_clone,
+    drupal_action, drupal_clone, drupal_update,
     error::ErrorCode,
     protocol::{Response, ResponseBuildError},
 };
@@ -70,6 +70,39 @@ pub fn run(command: DrupalCommand) -> Result<Response, ResponseBuildError> {
         } => action(
             "maintenance",
             drupal_action::MAINTENANCE,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        DrupalCommand::UpdateCore {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => update(
+            "update-core",
+            drupal_update::CORE,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        DrupalCommand::UpdatePackages {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => update(
+            "update-packages",
+            drupal_update::PACKAGES,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        DrupalCommand::RestoreUpdate {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => update(
+            "restore-update",
+            drupal_update::RESTORE,
             &request_file,
             &request_id,
             idempotency_key.as_deref(),
@@ -263,6 +296,116 @@ fn action(
             operation,
             ErrorCode::UnsupportedPlatform,
             "Drupal actions require a Unix host",
+        ))
+    }
+}
+
+fn update(
+    kind: &str,
+    operation: &'static str,
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{backup_delete::BACKUP_ROOT, filesystem::ManagedRoot, site::TrustedRoot};
+        let config = match crate::config::EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match drupal_update::Request::parse(kind, &json, request_id, idempotency_key)
+        {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::InvalidInput,
+                    "request-file is not a valid Drupal update plan",
+                ));
+            }
+        };
+        if !config
+            .content_roots
+            .iter()
+            .any(|root| request.root().starts_with(root.as_path()))
+        {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::InvalidInput,
+                "Drupal root is outside configured content roots",
+            ));
+        }
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let _ = std::fs::create_dir_all(BACKUP_ROOT);
+        let backups = match TrustedRoot::parse(std::path::Path::new(BACKUP_ROOT)).and_then(|root| {
+            ManagedRoot::open(&root).map_err(|_| crate::site::ValidationError::PathResolutionFailed)
+        }) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    operation,
+                    ErrorCode::Internal,
+                    "backup root is unavailable",
+                ));
+            }
+        };
+        let context = drupal_update::Context {
+            engine_state: &state,
+            docker_program: "docker",
+            tar_program: "tar",
+            tools_dir: std::path::Path::new(crate::tool_manage::TOOLS_DIR),
+            backup_root: &backups,
+            backup_path: std::path::Path::new(BACKUP_ROOT),
+        };
+        match drupal_update::execute(
+            &context,
+            &request,
+            &crate::process::CancellationToken::default(),
+        ) {
+            Ok(v) | Err(drupal_update::Error::PostCommit { result: v }) => {
+                Response::success(operation, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(operation, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (kind, path, request_id, idempotency_key);
+        Ok(Response::failure(
+            operation,
+            ErrorCode::UnsupportedPlatform,
+            "Drupal updates require a Unix host",
         ))
     }
 }

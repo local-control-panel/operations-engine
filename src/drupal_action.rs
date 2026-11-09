@@ -53,19 +53,19 @@ const MAX_CRON_INTERVAL: u32 = 31_536_000;
 
 /// Path of the engine-managed Composer inside runtime containers (the tools
 /// directory is mounted read-only at `/opt/wcp-tools`).
-const CONTAINER_COMPOSER: &str = "/opt/wcp-tools/composer/current/composer.phar";
+pub(crate) const CONTAINER_COMPOSER: &str = "/opt/wcp-tools/composer/current/composer.phar";
 /// Writable by any site user; Composer's home and cache for one run.
-const COMPOSER_HOME: &str = "/tmp/wcp-composer";
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+pub(crate) const COMPOSER_HOME: &str = "/tmp/wcp-composer";
+pub(crate) const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Drush's `cache:rebuild` and `core:cron` can legitimately take minutes on a
 /// large site; anything longer is a hang.
-const RUN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+pub(crate) const RUN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Database updates (`hook_update_N`, post-updates) can legitimately run
 /// long on a big site.
-const UPDATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_OUTPUT: usize = 64 * 1024;
+pub(crate) const UPDATE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const MAX_OUTPUT: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
@@ -214,6 +214,10 @@ impl Request {
     pub fn root(&self) -> &std::path::Path {
         &self.project_root
     }
+
+    pub(crate) fn document_root_str(&self) -> String {
+        self.document_root.display().to_string()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -311,7 +315,7 @@ pub enum Error {
     },
 }
 
-fn subprocess_code(diagnostics: &SubprocessDiagnostics) -> ErrorCode {
+pub(crate) fn subprocess_code(diagnostics: &SubprocessDiagnostics) -> ErrorCode {
     if diagnostics.timed_out {
         ErrorCode::Timeout
     } else if diagnostics.cancelled {
@@ -435,7 +439,7 @@ impl Error {
 /// Runs `drush --root=<docroot> <args>` as the site user from the project
 /// root, preferring the project's own Drush. `sh` only selects the binary;
 /// every value reaches it as a positional parameter, never as shell text.
-fn drush(
+pub(crate) fn drush(
     ctx: &Context<'_>,
     req: &Request,
     drush_args: &[&str],
@@ -484,7 +488,7 @@ fn drush(
 /// Runs a fixed `docker exec` as the site user in the project root. Used for
 /// the Composer step of `installDrush`; `program_and_args` never contains
 /// caller-controlled text.
-fn container_exec(
+pub(crate) fn container_exec(
     ctx: &Context<'_>,
     req: &Request,
     env: &[&str],
@@ -518,7 +522,7 @@ fn container_exec(
     .map_err(Error::Run)
 }
 
-fn exited_ok(output: &process::ProcessOutput) -> bool {
+pub(crate) fn exited_ok(output: &process::ProcessOutput) -> bool {
     matches!(
         output.termination,
         ProcessTermination::Exited { success: true, .. }
@@ -711,7 +715,7 @@ fn automated_cron(
     })
 }
 
-fn update_status(
+pub(crate) fn update_status(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
@@ -726,7 +730,7 @@ fn update_status(
     pending_updates(&bytes).ok_or(Error::UpdateStatusUnreadable)
 }
 
-fn read_maintenance(
+pub(crate) fn read_maintenance(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
@@ -743,7 +747,7 @@ fn read_maintenance(
 
 /// Sets maintenance mode through Drupal's state API, rebuilds so cached pages
 /// follow, and reads it back.
-fn set_maintenance(
+pub(crate) fn set_maintenance(
     ctx: &Context<'_>,
     req: &Request,
     enabled: bool,
@@ -773,17 +777,17 @@ fn set_maintenance(
 /// The connection `drush sql:conf` reports for the site's default database.
 /// Never logged, returned or put in argv: only the password travels, in the
 /// environment of one `docker exec`.
-struct DbConnection {
-    host: String,
-    user: String,
-    password: String,
-    database: String,
+pub(crate) struct DbConnection {
+    pub(crate) host: String,
+    pub(crate) user: String,
+    pub(crate) password: String,
+    pub(crate) database: String,
 }
 
 /// Reads the MySQL/MariaDB connection with `drush sql:conf`. `Ok(None)` for
 /// another driver (the dump then falls back to `drush sql:dump`); an
 /// unreadable answer is an error, so nothing is guessed.
-fn read_db_connection(
+pub(crate) fn read_db_connection(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
@@ -841,7 +845,7 @@ fn read_db_connection(
 /// A MySQL/MariaDB site is dumped by the database container's own client
 /// (the PHP container usually has none), with the connection from `drush
 /// sql:conf`; any other driver uses `drush sql:dump`.
-fn backup_database(
+pub(crate) fn backup_database(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
