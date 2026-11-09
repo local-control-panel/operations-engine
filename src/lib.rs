@@ -43,6 +43,7 @@ pub mod docker_prune;
 pub mod docker_resource;
 pub mod drupal_action;
 pub mod drupal_clone;
+pub mod drupal_site;
 #[cfg(unix)]
 pub mod drupal_update;
 #[cfg(unix)]
