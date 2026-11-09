@@ -902,6 +902,46 @@ root) and no Drush output. `capabilities` advertises
 `features.drupalUpdateDbSafety`; an engine without it neither backs up nor
 toggles maintenance, so clients must keep their own warning.
 
+## `drupal.updateCore`, `drupal.updatePackages`, `drupal.restoreUpdate`
+
+`drupal update-core`, `drupal update-packages` and `drupal restore-update` take
+a root-owned JSON request `{container, projectRoot, documentRoot, uid, gid}`
+plus `packages` (`updatePackages`: 1 to 128 `vendor/name` identifiers of
+lowercase letters, digits, `.`, `_`, `-`; each must already be in
+`composer.lock`; `drupal/core*` is refused) or `recoveryId` (`restoreUpdate`: the
+request id of the update to undo). Unknown fields, versions and commands are
+rejected. Everything runs under the per-site lock shared with the other Drupal
+actions.
+
+Preflight changes nothing and refuses with `INVALID_INPUT` a multisite project
+(more than one `sites/*/settings.php`, or a `sites/sites.php` map), a project
+without `composer.json` and `composer.lock`, a database that is not MySQL/MariaDB
+reachable by container name, and (`updateCore`) a `composer.json` that requires
+no `drupal/core*` package. Then, in order: the maintenance mode is read; the
+recovery bundle is written to the backup root at
+`drupal-updates/<requestId>/` (`files.tar.gz` of the project root,
+`database.sql`, `manifest.json` with versions, the previous maintenance mode and
+SHA-256 sums; a failure here ends the request with nothing changed); maintenance
+mode goes on unless it already was; `composer update <names> --with-dependencies`
+runs as the site user with the managed Composer (`updateCore` names the
+`drupal/core*` packages composer.json requires); `drush updatedb` and `drush
+cache:rebuild` run; the health probe requires `drush status` to report
+`bootstrap: Successful`, no pending database update, and, for core, the
+version `composer.lock` now holds.
+
+When any step after the bundle fails, the engine rolls back by itself: the
+bundle's checksums and archive are verified, the project root is emptied and the
+archive extracted, the database is dropped and re-imported, the cache rebuilt
+and the probe run against the previous core version. The result then has
+`outcome: "rolledBack"` and a `reason`. If the rollback itself or its probe
+fails, the request fails with `SUBPROCESS_FAILED` and a message starting with
+`recovery required`; the bundle is kept. `restoreUpdate` runs the same rollback
+on request and reports `outcome: "restored"`; it refuses a missing bundle
+(`NOT_FOUND`) or one whose files do not match the manifest (`INVALID_INPUT`)
+before removing anything. A successful update reports `outcome: "updated"` and
+`versionsBefore`/`versionsAfter` for the requested packages and core. Results
+carry no Composer or Drush output.
+
 ## `cms.clearCache`
 
 `cms clear-cache` takes a root-owned JSON request `{kind, container,
