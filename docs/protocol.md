@@ -944,7 +944,7 @@ carry no Composer or Drush output. `composer update` is blocked by Composer itse
 locked core is affected by security advisories; such a request fails and is rolled back with
 nothing changed.
 
-## `security.setPolicy`, `security.refresh`, `security.status`, `security.history`
+## `security.setPolicy`, `security.refresh`, `security.status`, `security.history`, `security.affected`
 
 A check-only consumer of the public security feed. Nothing is fetched unless the
 stored policy is `checkOnly`; the default is `off`. `security set-policy --mode
@@ -980,6 +980,18 @@ and the first 12 characters of its manifest hash; no URL, body or error text. Th
 the newest 200 entries within 90 days. A line that cannot be parsed is skipped and counted in
 `unreadableLines`; a file that cannot be read (or is over 1 MiB) is reported as
 `available: false` with no entries, never as an empty history, and is not overwritten.
+
+`security affected` answers which managed PHP runtimes (compose services `runtime-<n>` of the
+`wcp` project) run an image that the accepted manifest's `docker.image.replace` rules name. It is
+local and read-only: it reads the rules stored at the last accepted refresh (reduced to `sha256`
+digests; a rule that is malformed, uses a tag or lists its own replacement is counted in
+`skippedRules`) and asks the local Docker daemon about the stack. The image's registry digests
+(`RepoDigests`) and platform decide, per rule: `affected` (a listed digest), `patched` (the
+replacement's digest) or `unknown` (a digest the catalog does not name, no registry digest, a
+platform the rule does not cover, an image that cannot be inspected). A runtime's verdict is the
+worst of its rules; with no published rule for the component it is `noRule`, never "safe". If
+Docker cannot list the stack, `inventory` is `unavailable` and there are no rows. Nothing is
+applied, no request leaves the machine.
 
 `set-policy` also syncs the schedule: `check-only` writes the fixed systemd units
 `wcp-security-refresh.service` and `.timer` (about hourly, `RandomizedDelaySec=10min`,

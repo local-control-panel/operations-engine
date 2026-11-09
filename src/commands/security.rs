@@ -52,6 +52,21 @@ pub fn run(command: SecurityCommand) -> Result<Response, ResponseBuildError> {
                 security_feed::status(state, security_feed::now_unix()),
             )
         }),
+        SecurityCommand::Affected => with_state(security_feed::AFFECTED, |state| {
+            let status = security_feed::status(state, security_feed::now_unix());
+            let (rules, skipped) = status.accepted.as_ref().map_or((Vec::new(), 0), |a| {
+                (a.image_rules.clone(), a.skipped_rules)
+            });
+            Response::success(
+                security_feed::AFFECTED,
+                crate::security_affected::evaluate(
+                    &crate::security_affected::Docker { program: "docker" },
+                    &rules,
+                    skipped,
+                    status.freshness,
+                ),
+            )
+        }),
         SecurityCommand::History { limit } => with_state(security_feed::HISTORY, |state| {
             Response::success(
                 security_feed::HISTORY,
