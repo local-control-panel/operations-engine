@@ -332,7 +332,7 @@ impl Error {
                 ErrorCode::SubprocessFailed,
                 format!(
                     "recovery required: {why}. The recovery bundle is kept; run restoreUpdate \
-                     with this update's id"
+                     with the recovery id of this update"
                 ),
             ),
             Self::Replayed { code, message } => (*code, message.clone()),
@@ -937,6 +937,11 @@ pub fn execute(
     }
     let result = match run(ctx, req, cancel) {
         Ok(value) => value,
+        Err(Error::RecoveryRequired(why)) => {
+            let id = req.recovery_id.unwrap_or(req.request_id);
+            let error = Error::RecoveryRequired(format!("{why} (recovery id {id})"));
+            return Err(fail(&scope, &state_path, &audit_path, state, error));
+        }
         Err(error) => return Err(fail(&scope, &state_path, &audit_path, state, error)),
     };
     state
