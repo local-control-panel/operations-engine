@@ -657,6 +657,86 @@ fn apply(
     Ok(after)
 }
 
+/// MySQL/MariaDB client call in the database container, with the password
+/// only in the environment of that one `docker exec`.
+fn db_client(ctx: &Context<'_>, connection: &drupal_action::DbConnection) -> ProcessRequest {
+    ProcessRequest::new(ctx.docker_program)
+        .env("MYSQL_PWD", &connection.password)
+        .args([
+            "exec".to_owned(),
+            "-i".into(),
+            "-e".into(),
+            "MYSQL_PWD".into(),
+            connection.host.clone(),
+            "mariadb".into(),
+            format!("-u{}", connection.user),
+            connection.database.clone(),
+        ])
+}
+
+/// Drops every table and view of the site's database through the database
+/// container's own client (the PHP container usually has none, which rules
+/// out `drush sql:drop`). Names are read back from `information_schema` and
+/// quoted here; a name with a backslash or control character is refused
+/// rather than guessed.
+fn empty_database(
+    ctx: &Context<'_>,
+    connection: &drupal_action::DbConnection,
+    limits: &ProcessLimits,
+    cancel: &CancellationToken,
+) -> Result<(), Error> {
+    let list_limits = ProcessLimits {
+        timeout: limits.timeout,
+        max_stdout_bytes: 4 * 1024 * 1024,
+        max_stderr_bytes: MAX_OUTPUT,
+    };
+    let mut request = db_client(ctx, connection);
+    request = request.args([
+        "-N".to_owned(),
+        "-B".into(),
+        "-e".into(),
+        "SELECT table_name, table_type FROM information_schema.tables WHERE table_schema = DATABASE()"
+            .into(),
+    ]);
+    let listed = process::run(&request, &list_limits, cancel).map_err(Error::Run)?;
+    if !exited_ok(&listed) {
+        return Err(Error::RecoveryRequired(
+            "the database tables could not be listed".into(),
+        ));
+    }
+    let text = String::from_utf8(listed.stdout.bytes)
+        .map_err(|_| Error::RecoveryRequired("the table list was unreadable".into()))?;
+    let mut script = String::from("SET FOREIGN_KEY_CHECKS=0;\n");
+    for line in text.lines().filter(|line| !line.is_empty()) {
+        let (name, kind) = line
+            .split_once('\t')
+            .ok_or_else(|| Error::RecoveryRequired("the table list was unreadable".into()))?;
+        if name.chars().any(|c| c == '\\' || c.is_control()) {
+            return Err(Error::RecoveryRequired(
+                "a table name cannot be quoted safely".into(),
+            ));
+        }
+        let object = if kind == "VIEW" { "VIEW" } else { "TABLE" };
+        script.push_str(&format!(
+            "DROP {object} IF EXISTS `{}`;\n",
+            name.replace('`', "``")
+        ));
+    }
+    let dropped = process::run_with_stdin_bytes(
+        &db_client(ctx, connection),
+        script.as_bytes(),
+        limits,
+        cancel,
+    )
+    .map_err(Error::Run)?;
+    if !exited_ok(&dropped) {
+        return Err(Error::RecoveryRequired(
+            "the database tables could not be dropped".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Replaces the project's files and database with the bundle's. The bundle
 /// is verified (checksums, readable archive) before anything is removed.
 fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest, Error> {
@@ -739,35 +819,14 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
     let action = ctx.action();
     let connection = drupal_action::read_db_connection(&action, &req.base, &cancel)?
         .ok_or(Error::UnsupportedDatabase)?;
-    drush(
-        &action,
-        &req.base,
-        &["sql:drop", "--yes"],
-        UPDATE_TIMEOUT,
-        &cancel,
-    )?;
+    empty_database(ctx, &connection, &limits, &cancel)?;
     let dump = ctx
         .backup_root
         .open_regular_read(&rel(format!("{dir}/database.sql")))
         .map_err(Error::Io)?;
-    let imported = process::run_with_stdin_handle(
-        &ProcessRequest::new(ctx.docker_program)
-            .env("MYSQL_PWD", &connection.password)
-            .args([
-                "exec".to_owned(),
-                "-i".into(),
-                "-e".into(),
-                "MYSQL_PWD".into(),
-                connection.host.clone(),
-                "mariadb".into(),
-                format!("-u{}", connection.user),
-                connection.database.clone(),
-            ]),
-        dump,
-        &limits,
-        &cancel,
-    )
-    .map_err(Error::Run)?;
+    let imported =
+        process::run_with_stdin_handle(&db_client(ctx, &connection), dump, &limits, &cancel)
+            .map_err(Error::Run)?;
     if !exited_ok(&imported) {
         return Err(Error::RecoveryRequired("the database import failed".into()));
     }
