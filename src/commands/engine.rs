@@ -16,7 +16,8 @@ use crate::{
 /// `engine rollback` call fetches from. Never a CLI flag or protocol input;
 /// the operator's environment may replace it with `ORBDEN_ENGINE_RELEASES_URL`
 /// (see [`release_base_url`]). Assets live at `<base>/v<version>/<asset>`.
-pub const ENGINE_RELEASES_BASE: &str = "https://get.orbden.com/releases/download";
+pub const ENGINE_RELEASES_BASE: &str =
+    "https://github.com/orbden/operations-engine/releases/download";
 
 /// Environment variable that replaces [`ENGINE_RELEASES_BASE`].
 pub const ENGINE_RELEASES_ENV: &str = "ORBDEN_ENGINE_RELEASES_URL";
