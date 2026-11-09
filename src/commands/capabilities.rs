@@ -201,6 +201,7 @@ pub const OPERATIONS: &[&str] = &[
     "drupal.updateDb",
     "drupal.updatePackages",
     "drupal.watchdog",
+    "security.history",
     "security.refresh",
     "security.setPolicy",
     "security.status",

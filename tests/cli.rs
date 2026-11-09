@@ -154,6 +154,7 @@ fn capabilities_describe_only_implemented_operations() {
             "drupal.updateDb",
             "drupal.updatePackages",
             "drupal.watchdog",
+            "security.history",
             "security.refresh",
             "security.setPolicy",
             "security.status",
