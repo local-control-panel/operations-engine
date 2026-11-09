@@ -1,0 +1,91 @@
+name: Mirror release
+
+# Copies the assets of a published GitHub Release to the object storage that
+# serves get.orbden.com, at the same paths the engine installer reads:
+# /releases/download/v<version>/{SHA256SUMS,SHA256SUMS.minisig,ops-engine-<version>-<target>}.
+#
+# Nothing is published until the repository variable ORBDEN_MIRROR_ENABLED is
+# "true" AND the `mirror` environment (which should require a reviewer) is
+# approved. The storage credentials are secrets of that environment.
+#
+# Variables:  ORBDEN_MIRROR_ENABLED, ORBDEN_MIRROR_BUCKET
+# Secrets (environment `mirror`): ORBDEN_MIRROR_ACCOUNT_ID,
+#   ORBDEN_MIRROR_ACCESS_KEY_ID, ORBDEN_MIRROR_SECRET_ACCESS_KEY
+
+on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to mirror (vMAJOR.MINOR.PATCH)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    name: Mirror to get.orbden.com storage
+    if: >-
+      vars.ORBDEN_MIRROR_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    environment: mirror
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUCKET: ${{ vars.ORBDEN_MIRROR_BUCKET }}
+      TAG_INPUT: ${{ inputs.tag }}
+      RUN_TAG: ${{ github.event.workflow_run.head_branch }}
+    steps:
+      - name: Choose and validate the tag
+        run: |
+          set -euo pipefail
+          tag="${TAG_INPUT:-$RUN_TAG}"
+          if ! printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$tag' is not vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          if [ -z "$BUCKET" ]; then
+            echo "::error::ORBDEN_MIRROR_BUCKET is not set"
+            exit 1
+          fi
+          echo "TAG=$tag" >> "$GITHUB_ENV"
+
+      - name: Download the release assets
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+
+      # The mirror must not hold anything the release does not: every binary
+      # has to match the checksum list, and the signature must be present.
+      - name: Verify the assets
+        run: |
+          set -euo pipefail
+          cd assets
+          test -s SHA256SUMS
+          test -s SHA256SUMS.minisig
+          sha256sum -c SHA256SUMS
+          ls ops-engine-* >/dev/null
+
+      - name: Upload to the bucket
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ORBDEN_MIRROR_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ORBDEN_MIRROR_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: auto
+          ACCOUNT_ID: ${{ secrets.ORBDEN_MIRROR_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          endpoint="https://${ACCOUNT_ID}.r2.cloudflarestorage.com"
+          dest="s3://${BUCKET}/releases/download/${TAG}/"
+          # An existing release path is never overwritten: published
+          # versions are immutable.
+          if aws s3 ls "$dest" --endpoint-url "$endpoint" | grep -q .; then
+            echo "::error::$dest already exists; releases are immutable"
+            exit 1
+          fi
+          aws s3 cp assets "$dest" --recursive --endpoint-url "$endpoint" \
+            --cache-control "public, max-age=31536000, immutable"
