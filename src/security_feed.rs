@@ -32,6 +32,7 @@ use std::{
 
 pub const REFRESH: &str = "security.refresh";
 pub const STATUS: &str = "security.status";
+pub const HISTORY: &str = "security.history";
 pub const SET_POLICY: &str = "security.setPolicy";
 
 pub const DEFAULT_ORIGIN: &str = "https://updates.orbden.com";
@@ -51,6 +52,12 @@ const MAX_ADVISORIES: usize = 500;
 const DIR: &str = "security-updates";
 const POLICY_FILE: &str = "security-updates/policy.json";
 const STATE_FILE: &str = "security-updates/state.json";
+const HISTORY_FILE: &str = "security-updates/history.jsonl";
+const MAX_HISTORY_ENTRIES: usize = 200;
+const MAX_HISTORY_AGE_SECS: i64 = 90 * 24 * 3600;
+/// A history file larger than this is not read (it is never this big unless changed by hand).
+const MAX_HISTORY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_HISTORY_LIMIT: u32 = 50;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -421,6 +428,95 @@ pub fn status(state: &ManagedRoot, now: i64) -> Status {
     }
 }
 
+// ---- history -----------------------------------------------------------------------
+
+/// One check, as kept in `history.jsonl`. No URL, body or error text: the
+/// result word, the accepted revision at that time and the start of its hash.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub at_unix: i64,
+    pub result: String,
+    pub sequence: Option<u64>,
+    pub manifest_prefix: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct History {
+    /// `false` when the file exists but cannot be read; then nothing is claimed.
+    pub available: bool,
+    /// Newest first.
+    pub entries: Vec<HistoryEntry>,
+    /// Lines that could not be parsed (skipped, never guessed).
+    pub unreadable_lines: u32,
+}
+
+/// Parses the file text: valid entries in file order and the count of lines
+/// that were not valid.
+fn parse_history(text: &str) -> (Vec<HistoryEntry>, u32) {
+    let mut entries = Vec::new();
+    let mut unreadable = 0u32;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str::<HistoryEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            Err(_) => unreadable = unreadable.saturating_add(1),
+        }
+    }
+    (entries, unreadable)
+}
+
+fn read_history_file(root: &ManagedRoot) -> Option<String> {
+    match root.read_to_string(&rel(HISTORY_FILE)) {
+        Ok(text) if text.len() <= MAX_HISTORY_BYTES => Some(text),
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(String::new()),
+        Err(_) => None,
+    }
+}
+
+/// Appends one entry and trims to the newest [`MAX_HISTORY_ENTRIES`] within
+/// [`MAX_HISTORY_AGE_SECS`]. Best effort: history never decides whether a
+/// check succeeded. Invalid lines are dropped when the file is rewritten.
+fn record_history(root: &ManagedRoot, entry: HistoryEntry, now: i64) {
+    let Some(text) = read_history_file(root) else {
+        return;
+    };
+    let (mut entries, _) = parse_history(&text);
+    entries.push(entry);
+    entries.retain(|e| e.at_unix >= now - MAX_HISTORY_AGE_SECS);
+    let start = entries.len().saturating_sub(MAX_HISTORY_ENTRIES);
+    let mut out = String::new();
+    for e in &entries[start..] {
+        if let Ok(line) = serde_json::to_string(e) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    let _ = root.create_dir_all(&rel(DIR));
+    let _ = root.write_atomic_private(&rel(HISTORY_FILE), out.as_bytes());
+}
+
+/// The newest `limit` checks (1..=200), newest first. Read-only.
+pub fn history(root: &ManagedRoot, limit: u32) -> History {
+    let limit = limit.clamp(1, MAX_HISTORY_ENTRIES as u32) as usize;
+    let Some(text) = read_history_file(root) else {
+        return History {
+            available: false,
+            entries: Vec::new(),
+            unreadable_lines: 0,
+        };
+    };
+    let (mut entries, unreadable_lines) = parse_history(&text);
+    entries.reverse();
+    entries.truncate(limit);
+    History {
+        available: true,
+        entries,
+        unreadable_lines,
+    }
+}
+
 // ---- refresh -----------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize)]
@@ -601,6 +697,19 @@ pub fn refresh(
         result: result.to_owned(),
     });
     save_state(state, &stored)?;
+    record_history(
+        state,
+        HistoryEntry {
+            at_unix: now,
+            result: result.to_owned(),
+            sequence: stored.accepted.as_ref().map(|a| a.sequence),
+            manifest_prefix: stored
+                .accepted
+                .as_ref()
+                .map(|a| a.manifest_sha256.chars().take(12).collect()),
+        },
+        now,
+    );
     let freshness = match &stored.accepted {
         Some(accepted) if accepted.expires_at_unix > now => Freshness::Fresh,
         Some(_) => Freshness::Expired,

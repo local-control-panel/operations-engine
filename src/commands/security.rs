@@ -52,6 +52,15 @@ pub fn run(command: SecurityCommand) -> Result<Response, ResponseBuildError> {
                 security_feed::status(state, security_feed::now_unix()),
             )
         }),
+        SecurityCommand::History { limit } => with_state(security_feed::HISTORY, |state| {
+            Response::success(
+                security_feed::HISTORY,
+                security_feed::history(
+                    state,
+                    limit.unwrap_or(security_feed::DEFAULT_HISTORY_LIMIT),
+                ),
+            )
+        }),
     }
 }
 

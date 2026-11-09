@@ -392,3 +392,99 @@ fn only_the_https_origin_or_loopback_is_used() {
     );
     assert_eq!(fake.requests(), 0);
 }
+
+// ---- history ---------------------------------------------------------------------
+
+fn entry(at: i64, result: &str) -> HistoryEntry {
+    HistoryEntry {
+        at_unix: at,
+        result: result.to_owned(),
+        sequence: None,
+        manifest_prefix: None,
+    }
+}
+
+#[test]
+fn every_check_is_recorded_and_listed_newest_first() {
+    let (_dir, state) = enabled();
+    let fake = Fake::default();
+    publish(&fake, 2);
+    refresh(&state, &fake, ORIGIN, NOW, rid()).unwrap();
+    refresh(&state, &Fake::default(), ORIGIN, NOW + 3600, rid()).unwrap();
+    let report = history(&state, 10);
+    assert!(report.available);
+    assert_eq!(report.unreadable_lines, 0);
+    let results: Vec<&str> = report.entries.iter().map(|e| e.result.as_str()).collect();
+    assert_eq!(results, ["unreachable", "updated"]);
+    assert_eq!(report.entries[1].sequence, Some(2));
+    assert_eq!(
+        report.entries[1].manifest_prefix.as_deref().map(str::len),
+        Some(12)
+    );
+    assert_eq!(history(&state, 1).entries.len(), 1);
+}
+
+#[test]
+fn a_check_refused_for_the_policy_leaves_no_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = managed(dir.path());
+    assert!(refresh(&state, &Fake::default(), ORIGIN, NOW, rid()).is_err());
+    let report = history(&state, 10);
+    assert!(report.available && report.entries.is_empty());
+}
+
+#[test]
+fn history_keeps_the_newest_200_entries_within_90_days() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = managed(dir.path());
+    for i in 0..205 {
+        record_history(&state, entry(NOW + i, "unchanged"), NOW + i);
+    }
+    let report = history(&state, 500);
+    assert_eq!(report.entries.len(), 200);
+    assert_eq!(report.entries[0].at_unix, NOW + 204);
+    assert_eq!(report.entries[199].at_unix, NOW + 5);
+
+    let later = NOW + 91 * 24 * 3600;
+    record_history(&state, entry(later, "updated"), later);
+    let report = history(&state, 500);
+    assert_eq!(report.entries.len(), 1, "older than 90 days is dropped");
+}
+
+#[test]
+fn unreadable_lines_are_counted_and_skipped_never_guessed() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = managed(dir.path());
+    record_history(&state, entry(NOW, "updated"), NOW);
+    state.create_dir_all(&rel(DIR)).unwrap();
+    let good = serde_json::to_string(&entry(NOW + 1, "unchanged")).unwrap();
+    state
+        .write_atomic_private(
+            &rel(HISTORY_FILE),
+            format!("{good}\nnot json\n{{\"atUnix\":1}}\n").as_bytes(),
+        )
+        .unwrap();
+    let report = history(&state, 10);
+    assert!(report.available);
+    assert_eq!(report.entries.len(), 1);
+    assert_eq!(report.unreadable_lines, 2);
+    // The next write drops the bad lines.
+    record_history(&state, entry(NOW + 2, "unchanged"), NOW + 2);
+    assert_eq!(history(&state, 10).unreadable_lines, 0);
+}
+
+#[test]
+fn an_oversized_history_file_is_unavailable_not_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = managed(dir.path());
+    state.create_dir_all(&rel(DIR)).unwrap();
+    state
+        .write_atomic_private(&rel(HISTORY_FILE), &vec![b'x'; MAX_HISTORY_BYTES + 1])
+        .unwrap();
+    let report = history(&state, 10);
+    assert!(!report.available);
+    assert!(report.entries.is_empty());
+    // And a write never overwrites what it could not read.
+    record_history(&state, entry(NOW, "updated"), NOW);
+    assert!(!history(&state, 10).available);
+}
