@@ -621,7 +621,7 @@ fn composer_update(
 /// `composer.lock` now holds.
 fn probe(
     ctx: &Context<'_>,
-    req: &Request,
+    base: &drupal_action::Request,
     expect_core: Option<&str>,
     require_no_pending: bool,
     cancel: &CancellationToken,
@@ -629,7 +629,7 @@ fn probe(
     let action = ctx.action();
     let bytes = drush(
         &action,
-        &req.base,
+        base,
         &["status", "--format=json"],
         READ_TIMEOUT,
         cancel,
@@ -656,7 +656,7 @@ fn probe(
     if !require_no_pending {
         return Ok(());
     }
-    match drupal_action::update_status(&action, &req.base, cancel) {
+    match drupal_action::update_status(&action, base, cancel) {
         Ok(0) => Ok(()),
         Ok(count) => Err(format!("{count} database update(s) are still pending")),
         Err(_) => Err("pending database updates could not be read".into()),
@@ -692,7 +692,7 @@ fn apply(
     let core = (req.kind == Kind::Core)
         .then(|| after.get("drupal/core").cloned())
         .flatten();
-    probe(ctx, req, core.as_deref(), true, cancel)?;
+    probe(ctx, &req.base, core.as_deref(), true, cancel)?;
     record(ctx, req.request_id, Step::Probed);
     Ok(after)
 }
@@ -779,7 +779,11 @@ fn empty_database(
 
 /// Replaces the project's files and database with the bundle's. The bundle
 /// is verified (checksums, readable archive) before anything is removed.
-fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest, Error> {
+fn rollback(
+    ctx: &Context<'_>,
+    base: &drupal_action::Request,
+    id: RequestId,
+) -> Result<Manifest, Error> {
     let cancel = CancellationToken::default();
     let dir = format!("drupal-updates/{id}");
     let manifest: Manifest = serde_json::from_str(
@@ -788,7 +792,7 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
             .map_err(|_| Error::BundleMissing)?,
     )
     .map_err(|_| Error::BundleCorrupt)?;
-    if manifest.project_root != req.root().display().to_string() {
+    if manifest.project_root != base.root().display().to_string() {
         return Err(Error::BundleCorrupt);
     }
     let bundle_dir = ctx.backup_path.join(&dir);
@@ -824,7 +828,7 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
     record(ctx, id, Step::RollbackStarted);
     // Files: empty the project root (links are removed, never followed),
     // then extract.
-    for entry in std::fs::read_dir(req.root()).map_err(Error::Io)? {
+    for entry in std::fs::read_dir(base.root()).map_err(Error::Io)? {
         let entry = entry.map_err(Error::Io)?;
         let path = entry.path();
         if entry.file_type().map_err(Error::Io)?.is_dir() {
@@ -840,7 +844,7 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
     let extracted = process::run_with_stdin_handle(
         &ProcessRequest::new(ctx.tar_program).args([
             "-C".to_owned(),
-            req.root().display().to_string(),
+            base.root().display().to_string(),
             "-xzpf".into(),
             "-".into(),
             "--numeric-owner".into(),
@@ -859,7 +863,7 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
     record(ctx, id, Step::FilesRestored);
     // Database: Drush (restored with the files) names the connection.
     let action = ctx.action();
-    let connection = drupal_action::read_db_connection(&action, &req.base, &cancel)?
+    let connection = drupal_action::read_db_connection(&action, base, &cancel)?
         .ok_or(Error::UnsupportedDatabase)?;
     empty_database(ctx, &connection, &limits, &cancel)?;
     let dump = ctx
@@ -873,9 +877,9 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
         return Err(Error::RecoveryRequired("the database import failed".into()));
     }
     record(ctx, id, Step::DatabaseRestored);
-    drush(&action, &req.base, &["cache:rebuild"], RUN_TIMEOUT, &cancel)?;
+    drush(&action, base, &["cache:rebuild"], RUN_TIMEOUT, &cancel)?;
     let before = manifest.versions_before.get("drupal/core").cloned();
-    probe(ctx, req, before.as_deref(), false, &cancel)
+    probe(ctx, base, before.as_deref(), false, &cancel)
         .map_err(|why| Error::RecoveryRequired(format!("after restoring: {why}")))?;
     record(ctx, id, Step::RolledBack);
     Ok(manifest)
@@ -889,7 +893,7 @@ fn run(
     let action = ctx.action();
     if req.kind == Kind::Restore {
         let id = req.recovery_id.unwrap();
-        let manifest = rollback(ctx, req, id)?;
+        let manifest = rollback(ctx, &req.base, id)?;
         return Ok(UpdateResult {
             outcome: "restored".into(),
             recovery_id: id.to_string(),
@@ -974,7 +978,7 @@ fn run(
             })
         }
         Err(reason) => {
-            rollback(ctx, req, req.request_id).map_err(|error| {
+            rollback(ctx, &req.base, req.request_id).map_err(|error| {
                 Error::RecoveryRequired(format!(
                     "the update failed ({reason}) and rolling back failed ({})",
                     error.protocol().1
@@ -1041,6 +1045,13 @@ pub fn execute(
             state,
             Error::Cancelled,
         ));
+    }
+    // An earlier update of this project that died half way is rolled back
+    // first, so this request starts from a consistent site.
+    if let Err(error) =
+        reconcile::reconcile(ctx, &req.base, &scope, req.request_id, req.recovery_id)
+    {
+        return Err(fail(&scope, &state_path, &audit_path, state, error));
     }
     let result = match run(ctx, req, cancel) {
         Ok(value) => value,
@@ -1112,6 +1123,7 @@ fn fail(
 
 mod composer_reason;
 use composer_reason::ComposerReason;
+mod reconcile;
 mod steps;
 use steps::{Step, record};
 
