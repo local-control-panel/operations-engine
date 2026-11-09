@@ -480,12 +480,34 @@ pub enum JoomlaCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Update Joomla core with its own console after writing a recovery
+    /// bundle (files and database); a failed update is rolled back by the
+    /// engine and a major-version jump is refused.
+    UpdateCore {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Put a kept recovery bundle back (files and database) and run the health probe.
+    RestoreUpdate {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl JoomlaCommand {
     pub const fn operation(&self) -> &'static str {
         match self {
             Self::Clone { .. } => "joomla.clone",
+            Self::UpdateCore { .. } => "joomla.updateCore",
+            Self::RestoreUpdate { .. } => "joomla.restoreUpdate",
         }
     }
 }

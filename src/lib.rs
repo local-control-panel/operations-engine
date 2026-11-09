@@ -54,6 +54,7 @@ pub mod failpoint;
 pub mod filesystem;
 pub mod ingress;
 pub mod joomla_clone;
+pub mod joomla_update;
 #[cfg(unix)]
 pub mod journal;
 pub mod maria_drop;

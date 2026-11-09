@@ -235,7 +235,7 @@ fn quote(value: &str) -> String {
 }
 
 /// One value of the configuration, read from the text.
-fn read_string(text: &str, name: &'static str) -> Result<String, ConfigError> {
+pub(crate) fn read_string(text: &str, name: &'static str) -> Result<String, ConfigError> {
     let mut found = text.lines().filter_map(|line| {
         property(line)
             .filter(|(_, n, _)| *n == name)
