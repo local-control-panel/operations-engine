@@ -289,3 +289,29 @@ fn a_read_only_default_site_is_unlocked_for_the_run_and_put_back() {
     assert!(unlock_default_site(&req).is_none());
     assert_eq!(mode(&default), 0o775);
 }
+
+#[test]
+fn the_step_journal_is_appended_in_order_and_holds_only_step_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let backups = dir.path().join("backups");
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(backups.join(format!("drupal-updates/{ID}"))).unwrap();
+    fs::create_dir_all(&state_dir).unwrap();
+    let (managed_backups, state) = (managed(&backups), managed(&state_dir));
+    let ctx = Context {
+        engine_state: &state,
+        docker_program: "docker",
+        tar_program: "tar",
+        tools_dir: dir.path(),
+        backup_root: &managed_backups,
+        backup_path: &backups,
+    };
+    let id = RequestId::parse(ID).unwrap();
+    record(&ctx, id, Step::Bundled);
+    record(&ctx, id, Step::ComposerDone);
+    let text = fs::read_to_string(backups.join(format!("drupal-updates/{ID}/steps.json"))).unwrap();
+    let journal: steps::Journal = serde_json::from_str(&text).unwrap();
+    let names: Vec<Step> = journal.steps.iter().map(|e| e.step).collect();
+    assert_eq!(names, [Step::Bundled, Step::ComposerDone]);
+    assert!(!text.contains('/'), "no paths in the journal: {text}");
+}
