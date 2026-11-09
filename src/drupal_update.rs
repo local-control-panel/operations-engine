@@ -250,7 +250,7 @@ pub enum Error {
     BundleFailed,
     BundleMissing,
     BundleCorrupt,
-    ComposerFailed(SubprocessDiagnostics),
+    ComposerFailed(SubprocessDiagnostics, ComposerReason),
     /// Rolled back automatically did not work out: the site needs
     /// `restoreUpdate`, or hands.
     RecoveryRequired(String),
@@ -324,9 +324,13 @@ impl Error {
                 ErrorCode::InvalidInput,
                 "the recovery bundle does not match its manifest; nothing was changed".into(),
             ),
-            Self::ComposerFailed(diagnostics) => (
+            Self::ComposerFailed(diagnostics, reason) => (
                 drupal_action::subprocess_code(diagnostics),
-                "Composer could not update the packages".into(),
+                format!(
+                    "Composer could not update the packages (reason: {}): {}",
+                    reason.token(),
+                    reason.sentence()
+                ),
             ),
             Self::RecoveryRequired(why) => (
                 ErrorCode::SubprocessFailed,
@@ -603,10 +607,9 @@ fn composer_update(
         cancel,
     )?;
     if !exited_ok(&output) {
-        return Err(Error::ComposerFailed(SubprocessDiagnostics::from_output(
-            ctx.docker_program,
-            &output,
-        )));
+        let diagnostics = SubprocessDiagnostics::from_output(ctx.docker_program, &output);
+        let reason = ComposerReason::classify(&diagnostics, &output);
+        return Err(Error::ComposerFailed(diagnostics, reason));
     }
     Ok(())
 }
@@ -1095,6 +1098,9 @@ fn fail(
     );
     error
 }
+
+mod composer_reason;
+use composer_reason::ComposerReason;
 
 #[cfg(all(test, unix))]
 mod tests;
