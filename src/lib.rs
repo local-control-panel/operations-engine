@@ -76,6 +76,7 @@ pub mod rollback;
 pub mod runtime_config;
 pub mod secret_result;
 #[cfg(unix)]
+pub mod security_affected;
 pub mod security_feed;
 #[cfg(unix)]
 pub mod security_timer;
