@@ -38,8 +38,8 @@ pub const UNAPPROVE_OPERATION: &str = "agent.unapprove";
 /// fetches agents from; no request can change them. The operator's
 /// environment may replace them (`ORBDEN_AGENTS_RELEASES_URL`,
 /// `ORBDEN_AGENTS_RAW_URL`); see [`Source::from_env`].
-pub const RELEASES_BASE: &str = "https://agents.orbden.com/releases/download";
-pub const RAW_BASE: &str = "https://agents.orbden.com/raw";
+pub const RELEASES_BASE: &str = "https://github.com/orbden/agents/releases/download";
+pub const RAW_BASE: &str = "https://raw.githubusercontent.com/orbden/agents";
 pub const RELEASES_ENV: &str = "ORBDEN_AGENTS_RELEASES_URL";
 pub const RAW_ENV: &str = "ORBDEN_AGENTS_RAW_URL";
 
