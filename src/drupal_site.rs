@@ -91,6 +91,40 @@ impl SitesMap {
     }
 }
 
+/// Reads `<docroot>/sites/sites.php` as text, without following a symlink.
+/// A missing file is an empty map (so every host is unmapped); anything that
+/// is not a regular file, or is too large, is refused.
+#[cfg(unix)]
+pub fn read_sites_map(docroot: &Path) -> Result<SitesMap, Error> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = docroot.join("sites").join("sites.php");
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SitesMap::default());
+        }
+        Err(_) => return Err(Error::DirectoryNotUsable),
+    };
+    if !file
+        .metadata()
+        .map_err(|_| Error::DirectoryNotUsable)?
+        .is_file()
+    {
+        return Err(Error::DirectoryNotUsable);
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_MAP_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Error::DirectoryNotUsable)?;
+    let text = String::from_utf8(bytes).map_err(|_| Error::DynamicMap)?;
+    SitesMap::parse(&text)
+}
+
 /// `$sites['host'] = 'dir';`, optionally followed by a `//` comment. Returns
 /// the two quoted strings, or `None` for any other shape.
 fn assignment(line: &str) -> Option<(&str, &str)> {
@@ -115,7 +149,7 @@ fn quoted(text: &str) -> Option<(&str, &str)> {
     Some((value, &body[end + 1..]))
 }
 
-fn check_host(host: &str) -> Result<(), Error> {
+pub fn check_host(host: &str) -> Result<(), Error> {
     let ok = !host.is_empty()
         && host.len() <= MAX_HOST_LEN
         && host
@@ -129,7 +163,7 @@ fn check_host(host: &str) -> Result<(), Error> {
 
 /// One path component under `sites/`: no separators, no dot names, not the
 /// shared `all` directory.
-fn check_directory(dir: &str) -> Result<(), Error> {
+pub fn check_directory(dir: &str) -> Result<(), Error> {
     let ok = !dir.is_empty()
         && dir.len() <= MAX_DIR_LEN
         && dir
@@ -169,6 +203,11 @@ impl DrupalSiteIdentity {
 
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// The directory name under `sites/`.
+    pub fn directory(&self) -> &str {
+        &self.directory
     }
 
     /// `sites/<directory>`, relative to the project root.
@@ -289,6 +328,31 @@ mod tests {
             DrupalSiteIdentity::resolve(project.path(), &map, "other.com"),
             Err(Error::NotMapped)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_map_file_is_read_as_text_and_never_through_a_symlink() {
+        let docroot = tempfile::tempdir().unwrap();
+        fs::create_dir_all(docroot.path().join("sites")).unwrap();
+        assert_eq!(read_sites_map(docroot.path()), Ok(SitesMap::default()));
+        let file = docroot.path().join("sites/sites.php");
+        fs::write(&file, "<?php\n$sites['a.com'] = 'a';\n").unwrap();
+        assert_eq!(
+            read_sites_map(docroot.path()).unwrap().directory("a.com"),
+            Ok("a")
+        );
+        fs::remove_file(&file).unwrap();
+        let elsewhere = docroot.path().join("elsewhere.php");
+        fs::write(&elsewhere, "$sites['a.com'] = 'a';").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+        assert_eq!(
+            read_sites_map(docroot.path()),
+            Err(Error::DirectoryNotUsable)
+        );
+        fs::remove_file(&file).unwrap();
+        fs::write(&file, "$sites['a.com'] = getenv('X');").unwrap();
+        assert_eq!(read_sites_map(docroot.path()), Err(Error::DynamicMap));
     }
 
     #[cfg(unix)]

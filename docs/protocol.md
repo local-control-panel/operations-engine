@@ -834,6 +834,18 @@ referer and location are never returned. Without Drush the error is
 with `SUBPROCESS_FAILED`. Advertised in `capabilities.operations` as
 `drupal.watchdog`.
 
+In a multisite project the request adds `site: {"host", "directory"}`
+(advertised as `features.drupalWatchdogSite`). The engine reads
+`<documentRoot>/sites/sites.php` as text (never executed, no symlink followed):
+only plain `$sites['host'] = 'directory';` lines are accepted, `directory` must
+be the one mapped to `host` (no fallback to `default`), and `sites/<directory>`
+must be a real directory. It then runs Drush with `--uri=<host>` and requires
+`drush status` to report `sites/<directory>` with `Connected` and the same
+database name as `drush sql:conf`. Otherwise the request fails with
+`INVALID_INPUT` and a message ending `nothing was read`. The answer then adds
+`site: {host, directory, database, tablePrefix?}`; no credential is returned.
+Without `site` the request and the answer are unchanged.
+
 ## `drupal.cacheRebuild`, `drupal.cronRun`, `drupal.maintenance`
 
 `drupal cache-rebuild`, `drupal cron-run` and `drupal maintenance` each accept
