@@ -4,8 +4,8 @@
 //! `sites.php` that maps host names to those directories. The directory is
 //! not always the host name, and several hosts may share one directory.
 //!
-//! This module only *describes and checks* an identity; no operation uses it
-//! yet. It never runs `sites.php`: the file is read as text and accepted only
+//! This module *describes and checks* an identity, and defines the lock
+//! order a Drupal mutation takes ([`acquire_locks`]). It never runs `sites.php`: the file is read as text and accepted only
 //! when every line is a plain `$sites['host'] = 'directory';` assignment.
 //! Anything else (a function call, an `include`, a variable, a multi-line
 //! statement) is a dynamic map and is refused, because evaluating it would
@@ -15,6 +15,11 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+};
+
+use crate::{
+    filesystem::ManagedRoot,
+    transaction::{RequestId, lock::SiteLockGuard, resource_lock},
 };
 
 const MAX_MAP_BYTES: usize = 64 * 1024;
@@ -236,6 +241,65 @@ fn confirm_directory(root: &Path, directory: &str) -> Result<(), Error> {
     }
 }
 
+/// Why [`acquire_locks`] did not hand out the locks.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LockError {
+    /// Another request holds the project or the site, or the lock state
+    /// could not be used. Nothing stays locked.
+    Busy,
+    /// The identity belongs to another project root than the one asked for.
+    RootMismatch,
+}
+
+/// The locks a Drupal mutation holds. Dropping releases the site lock first,
+/// then the project lock (field order).
+pub struct SiteLocks<'a> {
+    _site: Option<SiteLockGuard<'a>>,
+    _project: SiteLockGuard<'a>,
+}
+
+/// The lock order of a Drupal mutation: the project lock first, then, only
+/// when the request names a site of a multisite project, a lock for that
+/// `sites/<directory>`. The order is never inverted.
+///
+/// The project lock is the same lock every single-site Drupal operation takes
+/// (`resource_lock` on the project root), so a multisite request and a
+/// single-site-style request on the same project exclude each other, and
+/// Composer/core changes cannot overlap with work on any site. With no
+/// identity this is exactly `resource_lock::acquire(project_root)`.
+///
+/// Locks never wait: a busy lock fails at once, and a guard already taken is
+/// released on the way out.
+pub fn acquire_locks<'a>(
+    engine_state: &'a ManagedRoot,
+    project_root: &Path,
+    identity: Option<&DrupalSiteIdentity>,
+    holder: RequestId,
+) -> Result<SiteLocks<'a>, LockError> {
+    if let Some(identity) = identity {
+        if identity.project_root() != project_root {
+            return Err(LockError::RootMismatch);
+        }
+    }
+    let project =
+        resource_lock::acquire(engine_state, project_root, holder).map_err(|_| LockError::Busy)?;
+    let site = match identity {
+        Some(identity) => Some(
+            resource_lock::acquire(
+                engine_state,
+                &project_root.join(identity.relative_path()),
+                holder,
+            )
+            .map_err(|_| LockError::Busy)?,
+        ),
+        None => None,
+    };
+    Ok(SiteLocks {
+        _site: site,
+        _project: project,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +438,190 @@ mod tests {
                 DrupalSiteIdentity::resolve(project.path(), &map, "a.com"),
                 Err(Error::DirectoryNotUsable),
                 "{dir}"
+            );
+        }
+    }
+
+    mod locks {
+        use super::*;
+        use crate::{site::TrustedRoot, transaction::lock::LockError as RawLockError};
+
+        const FIRST: &str = "550e8400-e29b-41d4-a716-446655440000";
+        const SECOND: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+        fn id(uuid: &str) -> RequestId {
+            RequestId::parse(uuid).unwrap()
+        }
+
+        fn engine_state(dir: &Path) -> ManagedRoot {
+            ManagedRoot::open(&TrustedRoot::parse(dir).unwrap()).unwrap()
+        }
+
+        /// A project with two sites, `a.example.com` and `b.example.com`.
+        fn project() -> (tempfile::TempDir, DrupalSiteIdentity, DrupalSiteIdentity) {
+            let project = tempfile::tempdir().unwrap();
+            for dir in ["a", "b"] {
+                fs::create_dir_all(project.path().join("sites").join(dir)).unwrap();
+            }
+            let map =
+                SitesMap::parse("$sites['a.example.com'] = 'a';\n$sites['b.example.com'] = 'b';\n")
+                    .unwrap();
+            let a = DrupalSiteIdentity::resolve(project.path(), &map, "a.example.com").unwrap();
+            let b = DrupalSiteIdentity::resolve(project.path(), &map, "b.example.com").unwrap();
+            (project, a, b)
+        }
+
+        #[test]
+        fn a_request_without_identity_takes_the_plain_project_lock() {
+            let (project, ..) = project();
+            let state = tempfile::tempdir().unwrap();
+            let state = engine_state(state.path());
+            let root = project.path().canonicalize().unwrap();
+            let held = acquire_locks(&state, &root, None, id(FIRST)).unwrap();
+            assert!(matches!(
+                resource_lock::acquire(&state, &root, id(SECOND)),
+                Err(RawLockError::Held { .. })
+            ));
+            assert_eq!(
+                acquire_locks(&state, &root, None, id(SECOND)).err(),
+                Some(LockError::Busy)
+            );
+            drop(held);
+            assert!(acquire_locks(&state, &root, None, id(SECOND)).is_ok());
+        }
+
+        #[test]
+        fn two_sites_of_one_project_exclude_each_other_on_the_project_lock() {
+            let (_project, a, b) = project();
+            let state = tempfile::tempdir().unwrap();
+            let state = engine_state(state.path());
+            let root = a.project_root().to_path_buf();
+            let held = acquire_locks(&state, &root, Some(&a), id(FIRST)).unwrap();
+            assert_eq!(
+                acquire_locks(&state, &root, Some(&b), id(SECOND)).err(),
+                Some(LockError::Busy)
+            );
+            // Not even a single-site style request gets in.
+            assert_eq!(
+                acquire_locks(&state, &root, None, id(SECOND)).err(),
+                Some(LockError::Busy)
+            );
+            drop(held);
+            assert!(acquire_locks(&state, &root, Some(&b), id(SECOND)).is_ok());
+        }
+
+        #[test]
+        fn the_same_site_twice_conflicts() {
+            let (_project, a, _b) = project();
+            let state = tempfile::tempdir().unwrap();
+            let state = engine_state(state.path());
+            let root = a.project_root().to_path_buf();
+            let _held = acquire_locks(&state, &root, Some(&a), id(FIRST)).unwrap();
+            assert_eq!(
+                acquire_locks(&state, &root, Some(&a), id(SECOND)).err(),
+                Some(LockError::Busy)
+            );
+        }
+
+        #[test]
+        fn a_failed_attempt_leaves_nothing_locked() {
+            let (_project, a, _b) = project();
+            let state = tempfile::tempdir().unwrap();
+            let state = engine_state(state.path());
+            let root = a.project_root().to_path_buf();
+            let site_path = root.join(a.relative_path());
+
+            // The site lock is held by someone else: the project lock taken
+            // on the way is released again.
+            let stray = resource_lock::acquire(&state, &site_path, id(SECOND)).unwrap();
+            assert_eq!(
+                acquire_locks(&state, &root, Some(&a), id(FIRST)).err(),
+                Some(LockError::Busy)
+            );
+            assert!(resource_lock::acquire(&state, &root, id(FIRST)).is_ok());
+            drop(stray);
+
+            // The project lock is held by someone else: the site lock is
+            // never touched.
+            let project_holder = resource_lock::acquire(&state, &root, id(SECOND)).unwrap();
+            assert_eq!(
+                acquire_locks(&state, &root, Some(&a), id(FIRST)).err(),
+                Some(LockError::Busy)
+            );
+            assert!(resource_lock::acquire(&state, &site_path, id(FIRST)).is_ok());
+            drop(project_holder);
+
+            // Everything is free again.
+            assert!(acquire_locks(&state, &root, Some(&a), id(FIRST)).is_ok());
+        }
+
+        #[test]
+        fn the_site_lock_is_held_inside_the_project_lock_and_released_first() {
+            let (_project, a, _b) = project();
+            let state = tempfile::tempdir().unwrap();
+            let state = engine_state(state.path());
+            let root = a.project_root().to_path_buf();
+            let site_path = root.join(a.relative_path());
+            let held = acquire_locks(&state, &root, Some(&a), id(FIRST)).unwrap();
+            for path in [&root, &site_path] {
+                assert!(matches!(
+                    resource_lock::acquire(&state, path, id(SECOND)),
+                    Err(RawLockError::Held { .. })
+                ));
+            }
+            drop(held);
+            for path in [&root, &site_path] {
+                assert!(resource_lock::acquire(&state, path, id(SECOND)).is_ok());
+            }
+        }
+
+        #[test]
+        fn an_identity_of_another_project_is_refused() {
+            let (_project, a, _b) = project();
+            let other = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let state = engine_state(state.path());
+            assert_eq!(
+                acquire_locks(
+                    &state,
+                    &other.path().canonicalize().unwrap(),
+                    Some(&a),
+                    id(FIRST)
+                )
+                .err(),
+                Some(LockError::RootMismatch)
+            );
+        }
+
+        #[test]
+        fn racing_requests_on_two_sites_let_exactly_one_through() {
+            let (_project, a, b) = project();
+            let state_dir = tempfile::tempdir().unwrap();
+            let root = a.project_root().to_path_buf();
+            let barrier = std::sync::Barrier::new(2);
+            let outcomes: Vec<bool> = std::thread::scope(|scope| {
+                let handles: Vec<_> = [(&a, FIRST), (&b, SECOND)]
+                    .into_iter()
+                    .map(|(identity, holder)| {
+                        let (barrier, root, state_path) =
+                            (&barrier, &root, state_dir.path().to_path_buf());
+                        scope.spawn(move || {
+                            let state = engine_state(&state_path);
+                            barrier.wait();
+                            let attempt = acquire_locks(&state, root, Some(identity), id(holder));
+                            let won = attempt.is_ok();
+                            // Hold the lock until both have tried.
+                            barrier.wait();
+                            won
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            assert_eq!(
+                outcomes.iter().filter(|won| **won).count(),
+                1,
+                "{outcomes:?}"
             );
         }
     }

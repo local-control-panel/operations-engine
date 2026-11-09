@@ -24,6 +24,7 @@ use crate::{
         self, COMPOSER_HOME, CONTAINER_COMPOSER, INSTALL_TIMEOUT, MAX_OUTPUT, READ_TIMEOUT,
         RUN_TIMEOUT, UPDATE_TIMEOUT, container_exec, drush, exited_ok,
     },
+    drupal_site,
     error::ErrorCode,
     filesystem::ManagedRoot,
     mutation::preflight,
@@ -1017,8 +1018,9 @@ pub fn execute(
     }
     // Same lock the other Drupal actions take: no cron or cache action runs
     // against a half-updated project.
-    let _resource_lock = resource_lock::acquire(ctx.engine_state, req.root(), req.request_id)
-        .map_err(|_| Error::ResourceBusy)?;
+    let _resource_lock =
+        drupal_site::acquire_locks(ctx.engine_state, req.root(), None, req.request_id)
+            .map_err(|_| Error::ResourceBusy)?;
 
     let operation = req.operation();
     let admitted = match preflight::run(
