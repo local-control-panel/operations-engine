@@ -499,6 +499,14 @@ const RECONCILED: [&str; 6] = [
     "site.migrateRuntime",
 ];
 
+/// Drupal updates: the next Drupal update request of the project rolls an
+/// interrupted one back by itself; `drupal.restoreUpdate` does it on demand.
+const DRUPAL_UPDATES: [&str; 3] = [
+    "drupal.updateCore",
+    "drupal.updatePackages",
+    "drupal.restoreUpdate",
+];
+
 /// A recovery marker (`pending/*.json`) found by [`incomplete`].
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -586,9 +594,13 @@ pub fn incomplete(
                         list.interrupted.push(IncompleteOperation {
                             scope: label.clone(),
                             request_id: record.request_id,
-                            recovered_by: RECONCILED
-                                .contains(&record.operation.as_str())
-                                .then_some("site.reconcile"),
+                            recovered_by: if RECONCILED.contains(&record.operation.as_str()) {
+                                Some("site.reconcile")
+                            } else if DRUPAL_UPDATES.contains(&record.operation.as_str()) {
+                                Some("drupal.restoreUpdate")
+                            } else {
+                                None
+                            },
                             operation: record.operation,
                             started_at_unix_secs: record.started_at_unix_secs,
                         });
@@ -1103,7 +1115,12 @@ mod tests {
         let dir = root
             .open_managed_dir(&SiteRelativePath::parse("wordpress-clone/abc").unwrap())
             .unwrap();
-        for (id, operation) in [(id, "wordpress.clone"), (other, "site.deploy")] {
+        let drupal = RequestId::parse("523e4567-e89b-12d3-a456-426614174000").unwrap();
+        for (id, operation) in [
+            (id, "wordpress.clone"),
+            (other, "site.deploy"),
+            (drupal, "drupal.updateCore"),
+        ] {
             create(
                 &dir,
                 &SiteRelativePath::parse(format!("transactions/{id}.json")).unwrap(),
@@ -1129,6 +1146,7 @@ mod tests {
         };
         assert_eq!(by("wordpress.clone"), Some("site.reconcile"));
         assert_eq!(by("site.deploy"), None);
+        assert_eq!(by("drupal.updateCore"), Some("drupal.restoreUpdate"));
     }
 
     #[test]

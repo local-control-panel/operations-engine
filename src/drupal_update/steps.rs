@@ -67,12 +67,18 @@ pub struct Journal {
     pub steps: Vec<Entry>,
 }
 
+impl Journal {
+    pub fn last(&self) -> Option<Step> {
+        self.steps.last().map(|entry| entry.step)
+    }
+}
+
 fn path(id: RequestId) -> crate::site::SiteRelativePath {
     rel(format!("drupal-updates/{id}/steps.json"))
 }
 
 /// The journal of an update; an absent or unreadable one is `None`.
-fn load(ctx: &Context<'_>, id: RequestId) -> Option<Journal> {
+pub(super) fn load(ctx: &Context<'_>, id: RequestId) -> Option<Journal> {
     let text = ctx.backup_root.read_to_string(&path(id)).ok()?;
     if text.len() > MAX_JOURNAL_BYTES {
         return None;
