@@ -940,7 +940,10 @@ on request and reports `outcome: "restored"`; it refuses a missing bundle
 (`NOT_FOUND`) or one whose files do not match the manifest (`INVALID_INPUT`)
 before removing anything. A successful update reports `outcome: "updated"` and
 `versionsBefore`/`versionsAfter` for the requested packages and core. Results
-carry no Composer or Drush output.
+carry no Composer or Drush output. `composer update` is blocked by Composer itself when the
+locked core is affected by security advisories; such a request fails and is rolled back with
+nothing changed.
+
 ## `security.setPolicy`, `security.refresh`, `security.status`
 
 A check-only consumer of the public security feed. Nothing is fetched unless the
@@ -968,6 +971,11 @@ than five minutes ahead is `clockUnreliable`. An expired index is not accepted
 `security status` reports the policy, the accepted revision (sequence, times,
 advisory ids, titles, severities, statuses, revocation count), freshness and the
 last check. Fixes in the manifest are not read, downloaded or run.
+
+`set-policy` also syncs the schedule: `check-only` writes the fixed systemd units
+`wcp-security-refresh.service` and `.timer` (about hourly, `RandomizedDelaySec=10min`,
+`Persistent=true`) and enables the timer; `off` disables and removes them. The result's
+`timer` is `installed`, `removed` or `unavailable` (systemd is not the running init).
 
 ## `cms.clearCache`
 

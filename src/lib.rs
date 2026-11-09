@@ -76,6 +76,8 @@ pub mod runtime_config;
 pub mod secret_result;
 #[cfg(unix)]
 pub mod security_feed;
+#[cfg(unix)]
+pub mod security_timer;
 pub mod site;
 pub mod site_admin;
 #[cfg(unix)]

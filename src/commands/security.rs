@@ -21,7 +21,16 @@ pub fn run(command: SecurityCommand) -> Result<Response, ResponseBuildError> {
             };
             mutate(security_feed::SET_POLICY, &request_id, |state, id| {
                 security_feed::set_policy(state, mode, id).map(|()| {
-                    serde_json::json!({ "mode": if mode == security_feed::Mode::Off { "off" } else { "checkOnly" } })
+                    let timer = crate::security_timer::sync(
+                        mode == security_feed::Mode::CheckOnly,
+                        std::path::Path::new(crate::security_timer::UNIT_DIR),
+                        std::path::Path::new(crate::security_timer::RUN_DIR),
+                        "systemctl",
+                    );
+                    serde_json::json!({
+                        "mode": if mode == security_feed::Mode::Off { "off" } else { "checkOnly" },
+                        "timer": timer.name(),
+                    })
                 })
             })
         }
