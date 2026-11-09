@@ -956,7 +956,7 @@ carry no Composer or Drush output. `composer update` is blocked by Composer itse
 locked core is affected by security advisories; such a request fails and is rolled back with
 nothing changed.
 
-## `security.setPolicy`, `security.refresh`, `security.status`
+## `security.setPolicy`, `security.refresh`, `security.status`, `security.history`
 
 A check-only consumer of the public security feed. Nothing is fetched unless the
 stored policy is `checkOnly`; the default is `off`. `security set-policy --mode
@@ -983,6 +983,15 @@ than five minutes ahead is `clockUnreliable`. An expired index is not accepted
 `security status` reports the policy, the accepted revision (sequence, times,
 advisory ids, titles, severities, statuses, revocation count), freshness and the
 last check. Fixes in the manifest are not read, downloaded or run.
+
+`security history [--limit N]` (1 to 200, default 50) lists the recorded checks,
+newest first, without a request or a lock. Every `refresh` that ran (not one refused for the
+policy) appends `{atUnix, result, sequence, manifestPrefix}` to
+`security-updates/history.jsonl` (0600): the result word, the accepted revision at that time
+and the first 12 characters of its manifest hash; no URL, body or error text. The file keeps
+the newest 200 entries within 90 days. A line that cannot be parsed is skipped and counted in
+`unreadableLines`; a file that cannot be read (or is over 1 MiB) is reported as
+`available: false` with no entries, never as an empty history, and is not overwritten.
 
 `set-policy` also syncs the schedule: `check-only` writes the fixed systemd units
 `wcp-security-refresh.service` and `.timer` (about hourly, `RandomizedDelaySec=10min`,

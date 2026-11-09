@@ -305,6 +305,11 @@ pub enum SecurityCommand {
     },
     /// Report the policy, the accepted feed revision, its freshness and the last check.
     Status,
+    /// List the most recent checks (read-only, newest first).
+    History {
+        #[arg(long)]
+        limit: Option<u32>,
+    },
 }
 
 impl SecurityCommand {
@@ -313,6 +318,7 @@ impl SecurityCommand {
             Self::SetPolicy { .. } => "security.setPolicy",
             Self::Refresh { .. } => "security.refresh",
             Self::Status => "security.status",
+            Self::History { .. } => "security.history",
         }
     }
 }
