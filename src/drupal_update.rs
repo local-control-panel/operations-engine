@@ -552,6 +552,32 @@ fn prune_bundles(ctx: &Context<'_>, keep: RequestId) {
     }
 }
 
+/// Drupal makes `sites/default` read-only after install, and the core
+/// scaffold plugin writes there on every `composer update`. The directory is
+/// made owner-writable for the run and put back afterwards. Returns what to
+/// restore.
+fn unlock_default_site(req: &Request) -> Option<(std::path::PathBuf, u32)> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = Path::new(&req.base.document_root_str()).join("sites/default");
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o200 != 0 {
+        return None;
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode | 0o200)).ok()?;
+    Some((path, mode))
+}
+
+fn relock_default_site(saved: Option<(std::path::PathBuf, u32)>) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some((path, mode)) = saved {
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+    }
+}
+
 fn composer_update(
     ctx: &Context<'_>,
     req: &Request,
@@ -592,6 +618,7 @@ fn probe(
     ctx: &Context<'_>,
     req: &Request,
     expect_core: Option<&str>,
+    require_no_pending: bool,
     cancel: &CancellationToken,
 ) -> Result<(), String> {
     let action = ctx.action();
@@ -618,6 +645,11 @@ fn probe(
                 "Drupal reports {reported}, composer.lock holds {expected}"
             ));
         }
+    }
+    // A site restored to its earlier state may legitimately have updates
+    // pending; only a fresh update must leave none.
+    if !require_no_pending {
+        return Ok(());
     }
     match drupal_action::update_status(&action, &req.base, cancel) {
         Ok(0) => Ok(()),
@@ -653,7 +685,7 @@ fn apply(
     let core = (req.kind == Kind::Core)
         .then(|| after.get("drupal/core").cloned())
         .flatten();
-    probe(ctx, req, core.as_deref(), cancel)?;
+    probe(ctx, req, core.as_deref(), true, cancel)?;
     Ok(after)
 }
 
@@ -832,7 +864,7 @@ fn rollback(ctx: &Context<'_>, req: &Request, id: RequestId) -> Result<Manifest,
     }
     drush(&action, &req.base, &["cache:rebuild"], RUN_TIMEOUT, &cancel)?;
     let before = manifest.versions_before.get("drupal/core").cloned();
-    probe(ctx, req, before.as_deref(), &cancel)
+    probe(ctx, req, before.as_deref(), false, &cancel)
         .map_err(|why| Error::RecoveryRequired(format!("after restoring: {why}")))?;
     Ok(manifest)
 }
@@ -893,6 +925,7 @@ fn run(
     bundle(ctx, req, previous, &watched, cancel)?;
 
     // From here a failure is rolled back by the engine.
+    let unlocked = unlock_default_site(req);
     let attempt = (|| {
         if !previous {
             drupal_action::set_maintenance(&action, &req.base, true, cancel)
@@ -900,6 +933,7 @@ fn run(
         }
         apply(ctx, req, &names, cancel)
     })();
+    relock_default_site(unlocked);
     let restore_cancel = CancellationToken::default();
     match attempt {
         Ok(after) => {

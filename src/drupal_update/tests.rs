@@ -265,3 +265,27 @@ fn bundles_older_than_a_week_are_pruned_and_fresh_ones_kept() {
     assert!(!old.exists());
     assert!(fresh.exists());
 }
+
+#[test]
+fn a_read_only_default_site_is_unlocked_for_the_run_and_put_back() {
+    let fx = fixture(LOCK, JSON, false);
+    let default = fx.root.join("web/sites/default");
+    fs::create_dir_all(&default).unwrap();
+    fs::set_permissions(&default, fs::Permissions::from_mode(0o555)).unwrap();
+    let req = Request::parse(
+        "update-core",
+        &plan(fx.root.to_str().unwrap(), ""),
+        ID,
+        None,
+    )
+    .unwrap();
+    let saved = unlock_default_site(&req);
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&default), 0o755);
+    relock_default_site(saved);
+    assert_eq!(mode(&default), 0o555);
+    // Already writable: nothing to restore.
+    fs::set_permissions(&default, fs::Permissions::from_mode(0o775)).unwrap();
+    assert!(unlock_default_site(&req).is_none());
+    assert_eq!(mode(&default), 0o775);
+}
