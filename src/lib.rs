@@ -123,6 +123,7 @@ pub mod tar_extract;
 pub mod tool_manage;
 pub mod transaction;
 pub mod update_db;
+pub mod update_steps;
 pub mod valkey;
 pub mod wordpress;
 pub mod wordpress_bounded_action;

@@ -483,74 +483,15 @@ fn target_version(
 // ── Journal ──────────────────────────────────────────────────────────────
 
 mod steps {
-    //! A diagnostic journal of how far one update got, so an interrupted
-    //! update can be told apart from one that never started changing
-    //! anything. Step names only: no paths, tool output or secrets. Writing
-    //! it is best effort; it is not the recovery data (the bundle is).
+    //! The journal of how far one update got (see `update_steps`). Step names
+    //! only: no paths, tool output or secrets. Writing it is best effort; it
+    //! is not the recovery data (the bundle is).
     //! `WCP_FAILPOINT=joomla-update-after-<step>` kills the process after a
     //! step is written (failpoints feature, tests only).
 
     use super::{Context, now, rel};
     use crate::transaction::RequestId;
-    use serde::{Deserialize, Serialize};
-
-    const MAX_STEPS: usize = 32;
-    const MAX_JOURNAL_BYTES: usize = 8 * 1024;
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub enum Step {
-        /// The recovery bundle is complete (manifest written).
-        Bundled,
-        OfflineOn,
-        /// `core:update` returned success.
-        Updated,
-        /// The health probe after the update passed.
-        Probed,
-        /// The update ended well and the site is back in its earlier mode.
-        Finished,
-        RollbackStarted,
-        FilesRestored,
-        DatabaseRestored,
-        /// The rollback ended and its probe passed.
-        RolledBack,
-    }
-
-    impl Step {
-        fn failpoint(self) -> &'static str {
-            match self {
-                Self::Bundled => "joomla-update-after-bundled",
-                Self::OfflineOn => "joomla-update-after-offline-on",
-                Self::Updated => "joomla-update-after-updated",
-                Self::Probed => "joomla-update-after-probed",
-                Self::Finished => "joomla-update-after-finished",
-                Self::RollbackStarted => "joomla-update-after-rollback-started",
-                Self::FilesRestored => "joomla-update-after-files-restored",
-                Self::DatabaseRestored => "joomla-update-after-database-restored",
-                Self::RolledBack => "joomla-update-after-rolled-back",
-            }
-        }
-    }
-
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct Entry {
-        pub step: Step,
-        pub at_unix_secs: u64,
-    }
-
-    #[derive(Debug, Default, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct Journal {
-        pub version: u32,
-        pub steps: Vec<Entry>,
-    }
-
-    impl Journal {
-        pub fn last(&self) -> Option<Step> {
-            self.steps.last().map(|entry| entry.step)
-        }
-    }
+    pub use crate::update_steps::{Journal, Step};
 
     fn path(id: RequestId) -> crate::site::SiteRelativePath {
         rel(format!("{}/{id}/steps.json", super::BUNDLES_DIR))
@@ -558,28 +499,17 @@ mod steps {
 
     /// The journal of an update; an absent or unreadable one is `None`.
     pub(super) fn load(ctx: &Context<'_>, id: RequestId) -> Option<Journal> {
-        let text = ctx.backup_root.read_to_string(&path(id)).ok()?;
-        if text.len() > MAX_JOURNAL_BYTES {
-            return None;
-        }
-        serde_json::from_str(&text).ok()
+        Journal::parse(&ctx.backup_root.read_to_string(&path(id)).ok()?)
     }
 
     /// Appends `step` to the journal of update `id`, then hits the step's
     /// failpoint. Errors are ignored: the journal is diagnostic.
     pub fn record(ctx: &Context<'_>, id: RequestId, step: Step) {
-        let mut journal = load(ctx, id).unwrap_or_default();
-        journal.version = 1;
-        if journal.steps.len() < MAX_STEPS {
-            journal.steps.push(Entry {
-                step,
-                at_unix_secs: now(),
-            });
-            if let Ok(bytes) = serde_json::to_vec(&journal) {
-                let _ = ctx.backup_root.write_atomic(&path(id), &bytes);
-            }
+        let journal = load(ctx, id).unwrap_or_default();
+        if let Some(bytes) = journal.with_step(step, now()) {
+            let _ = ctx.backup_root.write_atomic(&path(id), &bytes);
         }
-        crate::failpoint::hit(step.failpoint());
+        crate::failpoint::hit(&step.failpoint("joomla"));
     }
 }
 use steps::{Step, record};
@@ -914,10 +844,7 @@ mod reconcile {
     //! A bundle that cannot be rolled back stops the new request with
     //! `recovery required` and stays for a manual `restoreUpdate`.
 
-    use super::{
-        BUNDLES_DIR, CORE, Context, Error, Manifest, RESTORE, rel, rollback,
-        steps::{self, Step},
-    };
+    use super::{BUNDLES_DIR, CORE, Context, Error, Manifest, RESTORE, rel, rollback, steps};
     use crate::{
         drupal_action,
         error::ErrorCode,
@@ -986,8 +913,10 @@ mod reconcile {
             if manifest.project_root != base.root().display().to_string() {
                 continue;
             }
-            let needs_rollback = match steps::load(ctx, id).and_then(|journal| journal.last()) {
-                Some(last) => !matches!(last, Step::Finished | Step::RolledBack),
+            let needs_rollback = match crate::update_steps::needs_rollback(
+                steps::load(ctx, id).and_then(|journal| journal.last()),
+            ) {
+                Some(interrupted) => interrupted,
                 None => transaction_in_progress(scope, id),
             };
             if needs_rollback {
