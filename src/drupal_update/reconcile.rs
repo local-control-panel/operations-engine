@@ -14,10 +14,7 @@
 //! A bundle that cannot be rolled back stops the new request with `recovery
 //! required` and stays for the next attempt or a manual `restoreUpdate`.
 
-use super::{
-    Context, Error, Manifest, RESTORE, rel, rollback,
-    steps::{self, Step},
-};
+use super::{Context, Error, Manifest, RESTORE, rel, rollback, steps};
 use crate::{
     drupal_action,
     error::ErrorCode,
@@ -90,8 +87,10 @@ fn incomplete(
         if manifest.project_root != base.root().display().to_string() {
             continue;
         }
-        let needs_rollback = match steps::load(ctx, id).and_then(|journal| journal.last()) {
-            Some(last) => !matches!(last, Step::Finished | Step::RolledBack),
+        let needs_rollback = match crate::update_steps::needs_rollback(
+            steps::load(ctx, id).and_then(|journal| journal.last()),
+        ) {
+            Some(interrupted) => interrupted,
             // Killed between the manifest and the first journal entry, or a
             // bundle from before the journal: only a transaction that never
             // finished says it was interrupted.
