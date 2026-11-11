@@ -195,6 +195,18 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Install the pending apt upgrades of the named packages
+    /// (`apt-get install --only-upgrade`) from a root-owned request file
+    /// `{"packages": [...]}`. Never reboots; refuses Docker packages and
+    /// anything that is not a pending upgrade.
+    UpdatesApply {
+        #[arg(long = "request-file")]
+        request_file: std::path::PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Report pending apt upgrades, a pending reboot and the last apt refresh
     /// and upgrade (read-only; unreadable facts are `unknown`).
     UpdatesStatus,
@@ -236,6 +248,7 @@ impl SystemCommand {
             Self::CreateSwap { .. } => "system.createSwap",
             Self::UpdatesStatus => "system.updatesStatus",
             Self::UpdatesCheck { .. } => "system.updatesCheck",
+            Self::UpdatesApply { .. } => "system.updatesApply",
             Self::DeleteSwap { .. } => "system.deleteSwap",
             Self::ResizeSwap { .. } => "system.resizeSwap",
         }

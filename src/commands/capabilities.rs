@@ -231,6 +231,7 @@ pub const OPERATIONS: &[&str] = &[
     "system.signalProcess",
     "system.updatesStatus",
     "system.updatesCheck",
+    "system.updatesApply",
     "system.createSwap",
     "system.deleteSwap",
     "system.resizeSwap",
