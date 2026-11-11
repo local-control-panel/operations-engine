@@ -1001,6 +1001,10 @@ Read-only. Reports the host's pending apt upgrades (a simulated `apt-get -s dist
 
 A fact that cannot be read is reported as `unknown` (`pending.state`, `reboot.state`) or `null` (the two times), never as "nothing pending" or "no reboot needed". A failed or oversized `apt-get` run makes `pending` unknown. It does not run `apt-get update`; the lists may be stale, and `listsUpdatedAt` says how stale. Linux hosts only.
 
+## `system.updatesCheck`
+
+Refreshes the apt package lists with `apt-get update` (nothing is upgraded or installed) under the usual lock, idempotency key, transaction and audit record, so `system.updatesStatus` can report current lists. A failed refresh is `SUBPROCESS_FAILED` (`TIMEOUT` after 10 minutes) and leaves the previous lists as they were; a replay of a finished request returns the recorded result without running apt again. Takes only `--request-id` and an optional `--idempotency-key`. Linux hosts only.
+
 ## `security.setPolicy`, `security.refresh`, `security.status`, `security.history`, `security.affected`
 
 A check-only consumer of the public security feed. Nothing is fetched unless the

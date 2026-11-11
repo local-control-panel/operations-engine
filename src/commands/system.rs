@@ -4,7 +4,7 @@ use crate::{
     error::ErrorCode,
     process::CancellationToken,
     protocol::{Response, ResponseBuildError},
-    system_autoupdates, system_autoupdates_install, system_start_docker,
+    system_autoupdates, system_autoupdates_install, system_start_docker, system_updates_check,
 };
 
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
@@ -140,6 +140,10 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             idempotency_key.as_deref(),
         ),
         SystemCommand::UpdatesStatus => updates_status(),
+        SystemCommand::UpdatesCheck {
+            request_id,
+            idempotency_key,
+        } => updates_check(&request_id, idempotency_key.as_deref()),
         SystemCommand::CreateSwap {
             size_mb,
             request_id,
@@ -1196,6 +1200,69 @@ fn install_autoupdates(
             system_autoupdates_install::OPERATION,
             ErrorCode::UnsupportedPlatform,
             "system.installAutoupdates requires a Unix host",
+        ))
+    }
+}
+
+fn updates_check(request_id: &str, key: Option<&str>) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_updates_check::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let request = match system_updates_check::Request::parse(request_id, key) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_updates_check::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-id or idempotency-key is invalid",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_updates_check::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let ctx = system_updates_check::Context {
+            engine_state: &state,
+            apt_get_program: "apt-get",
+        };
+        match system_updates_check::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) | Err(system_updates_check::Error::PostCommit { result: v }) => {
+                Response::success(system_updates_check::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(
+                    system_updates_check::OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request_id, key);
+        Ok(Response::failure(
+            system_updates_check::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "system.updatesCheck requires a Unix host",
         ))
     }
 }
