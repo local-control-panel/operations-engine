@@ -8,7 +8,7 @@
 //! directory can be read.
 
 use crate::process::{self, CancellationToken, ProcessLimits, ProcessRequest, ProcessTermination};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -48,7 +48,7 @@ pub enum Pending {
     },
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "state")]
 pub enum Reboot {
     Required { packages: Vec<String> },
@@ -97,7 +97,7 @@ pub fn status(ctx: &Context<'_>, cancellation: &CancellationToken) -> UpdatesSta
     }
 }
 
-fn pending(ctx: &Context<'_>, cancellation: &CancellationToken) -> Pending {
+pub(crate) fn pending(ctx: &Context<'_>, cancellation: &CancellationToken) -> Pending {
     let request = ProcessRequest::new(ctx.apt_get)
         .args([
             "-s",
@@ -175,7 +175,7 @@ fn parse_inst(line: &str) -> Option<Package> {
     })
 }
 
-fn package_name_ok(name: &str) -> bool {
+pub(crate) fn package_name_ok(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name
@@ -183,7 +183,7 @@ fn package_name_ok(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-' | b':'))
 }
 
-fn reboot(ctx: &Context<'_>) -> Reboot {
+pub(crate) fn reboot(ctx: &Context<'_>) -> Reboot {
     match std::fs::symlink_metadata(ctx.reboot_required) {
         Ok(_) => {
             let packages = read_small(ctx.reboot_required_pkgs)

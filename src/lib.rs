@@ -119,6 +119,7 @@ pub mod system_signal;
 pub mod system_start_docker;
 #[cfg(unix)]
 pub mod system_swap;
+pub mod system_updates_apply;
 pub mod system_updates_check;
 #[cfg(unix)]
 pub mod system_updates_status;

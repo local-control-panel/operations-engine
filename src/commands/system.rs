@@ -4,7 +4,8 @@ use crate::{
     error::ErrorCode,
     process::CancellationToken,
     protocol::{Response, ResponseBuildError},
-    system_autoupdates, system_autoupdates_install, system_start_docker, system_updates_check,
+    system_autoupdates, system_autoupdates_install, system_start_docker, system_updates_apply,
+    system_updates_check,
 };
 
 const CONFIG_PATH: &str = "/etc/operations-engine/config.json";
@@ -144,6 +145,11 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             request_id,
             idempotency_key,
         } => updates_check(&request_id, idempotency_key.as_deref()),
+        SystemCommand::UpdatesApply {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => updates_apply(&request_file, &request_id, idempotency_key.as_deref()),
         SystemCommand::CreateSwap {
             size_mb,
             request_id,
@@ -1263,6 +1269,85 @@ fn updates_check(request_id: &str, key: Option<&str>) -> Result<Response, Respon
             system_updates_check::OPERATION,
             ErrorCode::UnsupportedPlatform,
             "system.updatesCheck requires a Unix host",
+        ))
+    }
+}
+
+fn updates_apply(
+    path: &std::path::Path,
+    request_id: &str,
+    key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot, system_updates_status};
+        let config = match EngineConfig::load_root_owned(std::path::Path::new(CONFIG_PATH)) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_updates_apply::OPERATION,
+                    ErrorCode::Internal,
+                    crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+                ));
+            }
+        };
+        let json = match read_root_owned_content_file(path) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_updates_apply::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file must be a root-owned regular file",
+                ));
+            }
+        };
+        let request = match system_updates_apply::Request::parse(&json, request_id, key) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_updates_apply::OPERATION,
+                    ErrorCode::InvalidInput,
+                    "request-file is not a valid package update plan",
+                ));
+            }
+        };
+        let state = match ManagedRoot::open(&config.state_root) {
+            Ok(v) => v,
+            Err(_) => {
+                return Ok(Response::failure(
+                    system_updates_apply::OPERATION,
+                    ErrorCode::Internal,
+                    "engine state root is unavailable",
+                ));
+            }
+        };
+        let ctx = system_updates_apply::Context {
+            engine_state: &state,
+            apt_get_program: "apt-get",
+            dpkg_query_program: "dpkg-query",
+            status: system_updates_status::Context::system(),
+        };
+        match system_updates_apply::execute(&ctx, &request, &CancellationToken::default()) {
+            Ok(v) | Err(system_updates_apply::Error::PostCommit { result: v }) => {
+                Response::success(system_updates_apply::OPERATION, v)
+            }
+            Err(e) => {
+                let (code, message) = e.protocol();
+                Ok(Response::failure(
+                    system_updates_apply::OPERATION,
+                    code,
+                    &message,
+                ))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, key);
+        Ok(Response::failure(
+            system_updates_apply::OPERATION,
+            ErrorCode::UnsupportedPlatform,
+            "system.updatesApply requires a Unix host",
         ))
     }
 }

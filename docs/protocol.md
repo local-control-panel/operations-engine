@@ -1005,6 +1005,16 @@ A fact that cannot be read is reported as `unknown` (`pending.state`, `reboot.st
 
 Refreshes the apt package lists with `apt-get update` (nothing is upgraded or installed) under the usual lock, idempotency key, transaction and audit record, so `system.updatesStatus` can report current lists. A failed refresh is `SUBPROCESS_FAILED` (`TIMEOUT` after 10 minutes) and leaves the previous lists as they were; a replay of a finished request returns the recorded result without running apt again. Takes only `--request-id` and an optional `--idempotency-key`. Linux hosts only.
 
+## `system.updatesApply`
+
+Installs the pending apt upgrades of the packages named in a root-owned request file `{"packages": [...]}` (1 to 100 names, no duplicates, plain Debian names without an architecture suffix or pattern characters; unknown keys are refused) with `apt-get install --only-upgrade`, under the usual lock, idempotency key, transaction and audit record. There is no "upgrade everything".
+
+Before installing anything, and under the lock, the engine refuses with `INVALID_INPUT` a package that is not a pending upgrade of an installed package (so this cannot install an arbitrary package), a Docker package (`docker-ce`, `docker-ce-cli`, `docker.io`, `containerd`, `containerd.io`, `runc`, the Compose and Buildx plugins and the rest of what `system.installDocker` owns or replaces; those are updated through the managed services), and any request whose simulation (`apt-get -s install --only-upgrade`) would remove a package, change a Docker package, or install a package that `system.updatesStatus` does not list as pending. Pending upgrades that cannot be read make the request fail (`SUBPROCESS_FAILED`) rather than be guessed.
+
+The install runs with `DEBIAN_FRONTEND=noninteractive`, `NEEDRESTART_MODE=l` (needrestart only lists; it restarts nothing) and `--force-confold`, for at most 30 minutes (`TIMEOUT`). A held apt or dpkg lock is `CONFLICT`. The host is never rebooted and the `unattended-upgrades` configuration is not touched.
+
+The result lists, per package, the installed version before and after (`dpkg-query`) and `upgraded`, `unchanged` or `unknown` (a version that could not be read is never reported as unchanged), `completion` (`complete`, or `partial` when `apt-get` failed after some packages had changed; a failure that changed nothing is `SUBPROCESS_FAILED`) and `reboot` (`required`, `notRequired` or `unknown`, as in `system.updatesStatus`). A replay of a finished request returns the recorded result, and of a failed one the recorded failure, without running apt again. Linux hosts only.
+
 ## `security.setPolicy`, `security.refresh`, `security.status`, `security.history`, `security.affected`
 
 A check-only consumer of the public security feed. Nothing is fetched unless the

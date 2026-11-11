@@ -180,6 +180,7 @@ fn capabilities_describe_only_implemented_operations() {
             "system.signalProcess",
             "system.updatesStatus",
             "system.updatesCheck",
+            "system.updatesApply",
             "system.createSwap",
             "system.deleteSwap",
             "system.resizeSwap",
