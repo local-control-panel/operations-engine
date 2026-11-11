@@ -139,6 +139,7 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+        SystemCommand::UpdatesStatus => updates_status(),
         SystemCommand::CreateSwap {
             size_mb,
             request_id,
@@ -161,6 +162,25 @@ pub fn run(command: SystemCommand) -> Result<Response, ResponseBuildError> {
             &request_id,
             idempotency_key.as_deref(),
         ),
+    }
+}
+
+fn updates_status() -> Result<Response, ResponseBuildError> {
+    #[cfg(unix)]
+    {
+        use crate::system_updates_status as updates;
+        Response::success(
+            updates::OPERATION,
+            updates::status(&updates::Context::system(), &CancellationToken::default()),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Response::failure(
+            "system.updatesStatus",
+            ErrorCode::UnsupportedPlatform,
+            "update status requires a Linux host",
+        ))
     }
 }
 

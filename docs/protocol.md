@@ -995,6 +995,12 @@ carry no Composer or Drush output. `composer update` is blocked by Composer itse
 locked core is affected by security advisories; such a request fails and is rolled back with
 nothing changed.
 
+## `system.updatesStatus`
+
+Read-only. Reports the host's pending apt upgrades (a simulated `apt-get -s dist-upgrade` over the package lists already on disk, so nothing is installed and no lock is taken), whether `/var/run/reboot-required` exists, the time of the last successful `apt-get update` and the `End-Date` of the newest apt run that upgraded packages (server-local, as apt logged it). Each package carries its name, installed and candidate version and whether the candidate is in a `-security` pocket; at most 500 are listed and `truncated` says when more are pending.
+
+A fact that cannot be read is reported as `unknown` (`pending.state`, `reboot.state`) or `null` (the two times), never as "nothing pending" or "no reboot needed". A failed or oversized `apt-get` run makes `pending` unknown. It does not run `apt-get update`; the lists may be stale, and `listsUpdatedAt` says how stale. Linux hosts only.
+
 ## `security.setPolicy`, `security.refresh`, `security.status`, `security.history`, `security.affected`
 
 A check-only consumer of the public security feed. Nothing is fetched unless the
