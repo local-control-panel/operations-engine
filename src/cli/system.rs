@@ -187,6 +187,14 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Refresh the apt package lists (`apt-get update`) under one lock/
+    /// idempotency/transaction/audit-backed request. Installs nothing.
+    UpdatesCheck {
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
     /// Report pending apt upgrades, a pending reboot and the last apt refresh
     /// and upgrade (read-only; unreadable facts are `unknown`).
     UpdatesStatus,
@@ -227,6 +235,7 @@ impl SystemCommand {
             Self::SignalProcess { .. } => "system.signalProcess",
             Self::CreateSwap { .. } => "system.createSwap",
             Self::UpdatesStatus => "system.updatesStatus",
+            Self::UpdatesCheck { .. } => "system.updatesCheck",
             Self::DeleteSwap { .. } => "system.deleteSwap",
             Self::ResizeSwap { .. } => "system.resizeSwap",
         }

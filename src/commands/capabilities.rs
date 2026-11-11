@@ -230,6 +230,7 @@ pub const OPERATIONS: &[&str] = &[
     "system.startDocker",
     "system.signalProcess",
     "system.updatesStatus",
+    "system.updatesCheck",
     "system.createSwap",
     "system.deleteSwap",
     "system.resizeSwap",
