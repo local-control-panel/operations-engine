@@ -229,6 +229,7 @@ pub const OPERATIONS: &[&str] = &[
     "system.installDocker",
     "system.startDocker",
     "system.signalProcess",
+    "system.updatesStatus",
     "system.createSwap",
     "system.deleteSwap",
     "system.resizeSwap",

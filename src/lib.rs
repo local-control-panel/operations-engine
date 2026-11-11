@@ -119,6 +119,8 @@ pub mod system_signal;
 pub mod system_start_docker;
 #[cfg(unix)]
 pub mod system_swap;
+#[cfg(unix)]
+pub mod system_updates_status;
 pub mod tar_extract;
 pub mod tool_manage;
 pub mod transaction;

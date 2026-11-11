@@ -178,6 +178,7 @@ fn capabilities_describe_only_implemented_operations() {
             "system.installDocker",
             "system.startDocker",
             "system.signalProcess",
+            "system.updatesStatus",
             "system.createSwap",
             "system.deleteSwap",
             "system.resizeSwap",

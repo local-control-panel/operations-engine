@@ -187,6 +187,9 @@ pub enum SystemCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Report pending apt upgrades, a pending reboot and the last apt refresh
+    /// and upgrade (read-only; unreadable facts are `unknown`).
+    UpdatesStatus,
     /// Disable and remove the managed `/swapfile` and its fstab entry.
     DeleteSwap {
         #[arg(long = "request-id")]
@@ -223,6 +226,7 @@ impl SystemCommand {
             Self::Service { .. } => "system.service",
             Self::SignalProcess { .. } => "system.signalProcess",
             Self::CreateSwap { .. } => "system.createSwap",
+            Self::UpdatesStatus => "system.updatesStatus",
             Self::DeleteSwap { .. } => "system.deleteSwap",
             Self::ResizeSwap { .. } => "system.resizeSwap",
         }
