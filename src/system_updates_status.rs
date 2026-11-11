@@ -19,6 +19,11 @@ pub const REBOOT_REQUIRED: &str = "/var/run/reboot-required";
 pub const REBOOT_REQUIRED_PKGS: &str = "/var/run/reboot-required.pkgs";
 pub const UPDATE_STAMP: &str = "/var/lib/apt/periodic/update-success-stamp";
 pub const APT_HISTORY: &str = "/var/log/apt/history.log";
+pub const UNATTENDED_LOG: &str = "/var/log/unattended-upgrades/unattended-upgrades.log";
+pub const BOOT_DIR: &str = "/boot";
+pub const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
+/// Days of `unattended-upgrades` history counted as attempts.
+pub const ATTEMPT_WINDOW_DAYS: u64 = 30;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -56,9 +61,56 @@ pub enum Reboot {
     Unknown,
 }
 
+/// Runs of `unattended-upgrades` in the current log file within the window.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum Attempts {
+    Known {
+        window_days: u64,
+        /// Runs that started (`Starting unattended upgrades script`).
+        runs: u32,
+        /// Runs during which the script logged an error.
+        failed: u32,
+        /// First day (`YYYY-MM-DD`) the counted log covers; rotated logs are
+        /// not read, so this can be later than the window start.
+        since: Option<String>,
+    },
+    Unknown {
+        reason: &'static str,
+    },
+}
+
+/// The running kernel against the newest one installed in `/boot`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum Kernel {
+    Known {
+        running: String,
+        /// Newest installed kernel of the same flavour; `None` when `/boot`
+        /// lists none (the running one cannot be compared).
+        newest_installed: Option<String>,
+        /// A newer kernel is installed than the one running.
+        behind: bool,
+    },
+    Unknown {
+        reason: &'static str,
+    },
+}
+
+/// Whether `unattended-upgrades` is allowed to install from a `-security` pocket.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum SecurityUpdates {
+    Known { enabled: bool },
+    Unknown { reason: &'static str },
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatesStatus {
+    pub attempts: Attempts,
+    pub kernel: Kernel,
+    pub security_updates: SecurityUpdates,
     pub pending: Pending,
     pub reboot: Reboot,
     /// Unix seconds of the last successful `apt-get update`; `None` when unknown.
@@ -74,6 +126,12 @@ pub struct Context<'a> {
     pub reboot_required_pkgs: &'a Path,
     pub update_stamp: &'a Path,
     pub apt_history: &'a Path,
+    pub unattended_log: &'a Path,
+    pub boot_dir: &'a Path,
+    pub osrelease: &'a Path,
+    pub apt_config: &'a str,
+    /// Unix seconds "now", for the attempts window.
+    pub now: u64,
 }
 
 impl Context<'static> {
@@ -84,12 +142,20 @@ impl Context<'static> {
             reboot_required_pkgs: Path::new(REBOOT_REQUIRED_PKGS),
             update_stamp: Path::new(UPDATE_STAMP),
             apt_history: Path::new(APT_HISTORY),
+            unattended_log: Path::new(UNATTENDED_LOG),
+            boot_dir: Path::new(BOOT_DIR),
+            osrelease: Path::new(OSRELEASE),
+            apt_config: "apt-config",
+            now: now_unix(),
         }
     }
 }
 
 pub fn status(ctx: &Context<'_>, cancellation: &CancellationToken) -> UpdatesStatus {
     UpdatesStatus {
+        attempts: attempts(ctx),
+        kernel: kernel(ctx),
+        security_updates: security_updates(ctx, cancellation),
         pending: pending(ctx, cancellation),
         reboot: reboot(ctx),
         lists_updated_at: mtime_secs(ctx.update_stamp),
@@ -253,6 +319,154 @@ fn last_upgrade(path: &Path) -> Option<String> {
     newest
 }
 
+/// Days since 1970-01-01 of a civil date (proleptic Gregorian).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// `YYYY-MM-DD` at the start of a log line, as days since the epoch.
+fn line_day(line: &str) -> Option<(i64, &str)> {
+    let date = line.get(..10)?;
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some((days_from_civil(year, month, day), date))
+}
+
+/// Counts runs and failed runs in the current `unattended-upgrades` log. A run
+/// starts at `Starting unattended upgrades script`; it failed when an `ERROR`
+/// line follows before the next start. An unreadable log is unknown; a log with
+/// no run inside the window is a real `0`.
+fn attempts(ctx: &Context<'_>) -> Attempts {
+    let Some(text) = read_small(ctx.unattended_log) else {
+        return Attempts::Unknown {
+            reason: "the unattended-upgrades log could not be read",
+        };
+    };
+    let first_day = (ctx.now / 86_400).saturating_sub(ATTEMPT_WINDOW_DAYS) as i64;
+    let (mut runs, mut failed) = (0u32, 0u32);
+    let (mut in_run, mut run_failed) = (false, false);
+    let mut since: Option<&str> = None;
+    for line in text.lines() {
+        let Some((day, date)) = line_day(line) else {
+            continue;
+        };
+        if day < first_day {
+            continue;
+        }
+        if line.contains(" INFO Starting unattended upgrades script") {
+            if in_run && run_failed {
+                failed += 1;
+            }
+            in_run = true;
+            run_failed = false;
+            runs += 1;
+            since = since.or(Some(date));
+        } else if in_run && line.contains(" ERROR ") {
+            run_failed = true;
+        }
+    }
+    if in_run && run_failed {
+        failed += 1;
+    }
+    Attempts::Known {
+        window_days: ATTEMPT_WINDOW_DAYS,
+        runs,
+        failed,
+        since: since.map(str::to_string),
+    }
+}
+
+/// Numeric parts of `6.8.0-100-generic` without the flavour: `[6, 8, 0, 100]`.
+fn kernel_key(release: &str) -> Option<(Vec<u64>, &str)> {
+    let (version, flavour) = release.rsplit_once('-')?;
+    let numbers: Option<Vec<u64>> = version
+        .split(['.', '-'])
+        .map(|part| part.parse().ok())
+        .collect();
+    let numbers = numbers?;
+    (!numbers.is_empty() && !flavour.is_empty()).then_some((numbers, flavour))
+}
+
+fn kernel(ctx: &Context<'_>) -> Kernel {
+    let Some(running) = read_small(ctx.osrelease).map(|s| s.trim().to_string()) else {
+        return Kernel::Unknown {
+            reason: "the running kernel could not be read",
+        };
+    };
+    let Some((running_key, flavour)) = kernel_key(&running) else {
+        return Kernel::Unknown {
+            reason: "the running kernel version was not understood",
+        };
+    };
+    let Ok(entries) = std::fs::read_dir(ctx.boot_dir) else {
+        return Kernel::Unknown {
+            reason: "/boot could not be read",
+        };
+    };
+    let mut newest: Option<(Vec<u64>, String)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(release) = name.strip_prefix("vmlinuz-") else {
+            continue;
+        };
+        let Some((key, entry_flavour)) = kernel_key(release) else {
+            continue;
+        };
+        if entry_flavour == flavour && newest.as_ref().is_none_or(|(best, _)| key > *best) {
+            newest = Some((key, release.to_string()));
+        }
+    }
+    Kernel::Known {
+        running,
+        behind: newest.as_ref().is_some_and(|(key, _)| *key > running_key),
+        newest_installed: newest.map(|(_, release)| release),
+    }
+}
+
+fn security_updates(ctx: &Context<'_>, cancellation: &CancellationToken) -> SecurityUpdates {
+    let request = ProcessRequest::new(ctx.apt_config)
+        .args(["dump", "Unattended-Upgrade::Allowed-Origins"])
+        .env("LC_ALL", "C");
+    let limits = ProcessLimits {
+        timeout: Duration::from_secs(15),
+        max_stdout_bytes: 64 * 1024,
+        max_stderr_bytes: 16 * 1024,
+    };
+    let Ok(output) = process::run(&request, &limits, cancellation) else {
+        return SecurityUpdates::Unknown {
+            reason: "apt-config could not be started",
+        };
+    };
+    if !matches!(
+        output.termination,
+        ProcessTermination::Exited { success: true, .. }
+    ) || output.stdout.truncated
+    {
+        return SecurityUpdates::Unknown {
+            reason: "apt-config did not finish successfully",
+        };
+    }
+    let text = String::from_utf8_lossy(&output.stdout.bytes);
+    // `Unattended-Upgrade::Allowed-Origins:: "${distro_id}:${distro_codename}-security";`
+    let enabled = text.lines().any(|line| {
+        line.trim_end()
+            .trim_end_matches(';')
+            .trim_end_matches('"')
+            .ends_with("-security")
+    });
+    SecurityUpdates::Known { enabled }
+}
+
 pub fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -263,6 +477,9 @@ pub fn now_unix() -> u64 {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// 2026-11-11 12:00:00 UTC.
+    const NOW: u64 = 1_794_398_400;
 
     fn fake_apt(dir: &Path, script: &str) -> String {
         let path = dir.join("apt-get");
@@ -278,6 +495,11 @@ mod tests {
             reboot_required_pkgs: Box::leak(dir.join("reboot-required.pkgs").into_boxed_path()),
             update_stamp: Box::leak(dir.join("stamp").into_boxed_path()),
             apt_history: Box::leak(dir.join("history.log").into_boxed_path()),
+            unattended_log: Box::leak(dir.join("unattended.log").into_boxed_path()),
+            boot_dir: Box::leak(dir.join("boot").into_boxed_path()),
+            osrelease: Box::leak(dir.join("osrelease").into_boxed_path()),
+            apt_config: "/nonexistent/apt-config",
+            now: NOW,
         }
     }
 
@@ -372,7 +594,164 @@ mod tests {
             reboot_required_pkgs: Box::leak(gone.join("pkgs").into_boxed_path()),
             update_stamp: Box::leak(gone.join("stamp").into_boxed_path()),
             apt_history: Box::leak(gone.join("history").into_boxed_path()),
+            unattended_log: Box::leak(gone.join("unattended.log").into_boxed_path()),
+            boot_dir: Box::leak(gone.join("boot").into_boxed_path()),
+            osrelease: Box::leak(gone.join("osrelease").into_boxed_path()),
+            apt_config: "/nonexistent/apt-config",
+            now: NOW,
         };
         status(&ctx, &CancellationToken::default())
+    }
+
+    fn write_log(dir: &Path, text: &str) {
+        std::fs::write(dir.join("unattended.log"), text).unwrap();
+    }
+
+    #[test]
+    fn counts_runs_and_failed_runs_inside_the_window_only() {
+        let dir = tempfile::tempdir().unwrap();
+        write_log(
+            dir.path(),
+            "2026-09-01 06:00:00,000 INFO Starting unattended upgrades script\n\
+2026-09-01 06:00:01,000 ERROR too old to count\n\
+2026-11-01 06:00:00,000 INFO Starting unattended upgrades script\n\
+2026-11-01 06:01:00,000 INFO All upgrades installed\n\
+2026-11-05 06:00:00,000 INFO Starting unattended upgrades script\n\
+2026-11-05 06:00:30,000 ERROR Installing the upgrades failed!\n\
+2026-11-05 06:00:31,000 ERROR Lock could not be acquired\n\
+2026-11-09 06:00:00,000 INFO Starting unattended upgrades script\n\
+2026-11-09 06:00:10,000 WARNING Could not figure out development release\n\
+a line with no date\n",
+        );
+        let attempts = attempts(&ctx(dir.path(), "unused"));
+        assert_eq!(
+            attempts,
+            Attempts::Known {
+                window_days: 30,
+                runs: 3,
+                failed: 1,
+                since: Some("2026-11-01".into())
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_window_is_zero_but_an_unreadable_log_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            attempts(&ctx(dir.path(), "unused")),
+            Attempts::Unknown { .. }
+        ));
+        write_log(
+            dir.path(),
+            "2026-01-01 06:00:00,000 INFO Starting unattended upgrades script\n",
+        );
+        assert_eq!(
+            attempts(&ctx(dir.path(), "unused")),
+            Attempts::Known {
+                window_days: 30,
+                runs: 0,
+                failed: 0,
+                since: None
+            }
+        );
+    }
+
+    #[test]
+    fn days_from_civil_matches_known_dates() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2026, 11, 11), (NOW / 86_400) as i64);
+    }
+
+    fn boot(dir: &Path, running: &str, installed: &[&str]) {
+        std::fs::write(dir.join("osrelease"), format!("{running}\n")).unwrap();
+        std::fs::create_dir_all(dir.join("boot")).unwrap();
+        for release in installed {
+            std::fs::write(dir.join("boot").join(format!("vmlinuz-{release}")), "").unwrap();
+        }
+    }
+
+    #[test]
+    fn kernel_behind_compares_numbers_not_text_and_ignores_other_flavours() {
+        let dir = tempfile::tempdir().unwrap();
+        boot(
+            dir.path(),
+            "6.8.0-9-generic",
+            &["6.8.0-9-generic", "6.8.0-100-generic", "6.9.0-1-aws"],
+        );
+        assert_eq!(
+            kernel(&ctx(dir.path(), "unused")),
+            Kernel::Known {
+                running: "6.8.0-9-generic".into(),
+                newest_installed: Some("6.8.0-100-generic".into()),
+                behind: true
+            }
+        );
+        let dir = tempfile::tempdir().unwrap();
+        boot(
+            dir.path(),
+            "6.8.0-100-generic",
+            &["6.8.0-9-generic", "6.8.0-100-generic"],
+        );
+        assert!(matches!(
+            kernel(&ctx(dir.path(), "unused")),
+            Kernel::Known { behind: false, .. }
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_kernel_fact_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            kernel(&ctx(dir.path(), "unused")),
+            Kernel::Unknown { .. }
+        ));
+        std::fs::write(dir.path().join("osrelease"), "6.8.0-1-generic\n").unwrap();
+        assert!(matches!(
+            kernel(&ctx(dir.path(), "unused")),
+            Kernel::Unknown { reason } if reason.contains("/boot")
+        ));
+        std::fs::write(dir.path().join("osrelease"), "weird\n").unwrap();
+        assert!(matches!(
+            kernel(&ctx(dir.path(), "unused")),
+            Kernel::Unknown { .. }
+        ));
+    }
+
+    fn fake_apt_config(dir: &Path, script: &str) -> String {
+        let path = dir.join("apt-config");
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn security_origin_is_detected_and_a_failure_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = ctx(dir.path(), "unused");
+        let on = fake_apt_config(
+            dir.path(),
+            "echo 'Unattended-Upgrade::Allowed-Origins:: \"${distro_id}:${distro_codename}\";'\necho 'Unattended-Upgrade::Allowed-Origins:: \"${distro_id}:${distro_codename}-security\";'",
+        );
+        c.apt_config = &on;
+        assert_eq!(
+            security_updates(&c, &CancellationToken::default()),
+            SecurityUpdates::Known { enabled: true }
+        );
+        let off = fake_apt_config(
+            dir.path(),
+            "echo 'Unattended-Upgrade::Allowed-Origins:: \"${distro_id}:${distro_codename}-updates\";'",
+        );
+        c.apt_config = &off;
+        assert_eq!(
+            security_updates(&c, &CancellationToken::default()),
+            SecurityUpdates::Known { enabled: false }
+        );
+        let broken = fake_apt_config(dir.path(), "exit 1");
+        c.apt_config = &broken;
+        assert!(matches!(
+            security_updates(&c, &CancellationToken::default()),
+            SecurityUpdates::Unknown { .. }
+        ));
     }
 }
