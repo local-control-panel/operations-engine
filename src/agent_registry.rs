@@ -304,6 +304,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// The allowlisted `details` of a `DEPENDENCY_UNAVAILABLE` refusal:
+    /// `{"kind": "operations" | "helpers" | "tools", "missing": [names]}`.
+    /// The names were checked by `valid_requirement` (short, restricted
+    /// characters) before they could be reported, so they are identifiers
+    /// only. Other refusals have no details.
+    pub fn details(&self) -> Option<serde_json::Value> {
+        let (kind, names) = match self {
+            Self::MissingOperations(names) => ("operations", names),
+            Self::MissingHelpers(names) => ("helpers", names),
+            Self::MissingTools(names) => ("tools", names),
+            _ => return None,
+        };
+        Some(serde_json::json!({ "kind": kind, "missing": names }))
+    }
+
     pub fn protocol(&self) -> (ErrorCode, String) {
         match self {
             Self::Fetch(fetch::Error::Timeout) => (
@@ -804,6 +819,25 @@ mod tests {
             Error::UnsupportedTools(vec!["jq".into()]).protocol().0,
             ErrorCode::InvalidInput
         );
+    }
+
+    #[test]
+    fn dependency_refusals_name_the_missing_things_in_details() {
+        let details = Error::MissingOperations(vec!["a.b".into(), "c.d".into()]).details();
+        assert_eq!(
+            details,
+            Some(serde_json::json!({"kind": "operations", "missing": ["a.b", "c.d"]}))
+        );
+        assert_eq!(
+            Error::MissingHelpers(vec!["tool".into()]).details(),
+            Some(serde_json::json!({"kind": "helpers", "missing": ["tool"]}))
+        );
+        assert_eq!(
+            Error::MissingTools(vec!["docker".into()]).details(),
+            Some(serde_json::json!({"kind": "tools", "missing": ["docker"]}))
+        );
+        assert_eq!(Error::UnsupportedTools(vec!["jq".into()]).details(), None);
+        assert_eq!(Error::Revoked.details(), None);
     }
 
     fn hash() -> String {
