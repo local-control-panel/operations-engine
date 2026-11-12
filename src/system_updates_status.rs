@@ -29,6 +29,9 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PACKAGES: usize = 500;
 const MAX_REBOOT_PACKAGES: usize = 50;
+/// Newest `unattended-upgrades` runs reported in the history.
+pub const HISTORY_RUNS: usize = 10;
+const MAX_RUN_PACKAGES: usize = 30;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +83,46 @@ pub enum Attempts {
     },
 }
 
+/// How one `unattended-upgrades` run ended, as its log says.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RunResult {
+    /// `All upgrades installed`.
+    Installed,
+    /// `No packages found that can be upgraded unattended`.
+    NothingToDo,
+    /// An `ERROR` line followed the start.
+    Failed,
+    /// No recognised end line (still running, or a line this reader does not know).
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Run {
+    /// Server-local `YYYY-MM-DD HH:MM:SS` of the start line.
+    pub started_local: String,
+    pub result: RunResult,
+    /// Packages the run announced (`Packages that will be upgraded:`), at most 30.
+    pub packages: Vec<String>,
+    /// How many packages were announced, also past the listed ones.
+    pub package_count: u32,
+}
+
+/// The newest runs in the current `unattended-upgrades` log, newest first.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "state")]
+pub enum History {
+    Known {
+        runs: Vec<Run>,
+        /// Older runs exist in the current log than are listed.
+        truncated: bool,
+    },
+    Unknown {
+        reason: &'static str,
+    },
+}
+
 /// The running kernel against the newest one installed in `/boot`.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "state")]
@@ -109,6 +152,7 @@ pub enum SecurityUpdates {
 #[serde(rename_all = "camelCase")]
 pub struct UpdatesStatus {
     pub attempts: Attempts,
+    pub history: History,
     pub kernel: Kernel,
     pub security_updates: SecurityUpdates,
     pub pending: Pending,
@@ -154,6 +198,7 @@ impl Context<'static> {
 pub fn status(ctx: &Context<'_>, cancellation: &CancellationToken) -> UpdatesStatus {
     UpdatesStatus {
         attempts: attempts(ctx),
+        history: history(ctx),
         kernel: kernel(ctx),
         security_updates: security_updates(ctx, cancellation),
         pending: pending(ctx, cancellation),
@@ -384,6 +429,78 @@ fn attempts(ctx: &Context<'_>) -> Attempts {
         failed,
         since: since.map(str::to_string),
     }
+}
+
+/// The newest [`HISTORY_RUNS`] runs of the current log. Only the start,
+/// package-list and result lines are read; configuration lines (allowed
+/// origins, blacklists) and everything unrecognised are ignored, and a run
+/// without a recognised result is `unknown`. Rotated logs are not read.
+fn history(ctx: &Context<'_>) -> History {
+    let Some(text) = read_small(ctx.unattended_log) else {
+        return History::Unknown {
+            reason: "the unattended-upgrades log could not be read",
+        };
+    };
+    let mut runs: Vec<Run> = Vec::new();
+    let mut current: Option<Run> = None;
+    let mut failed = false;
+    let finish = |current: &mut Option<Run>, failed: bool, runs: &mut Vec<Run>| {
+        if let Some(mut run) = current.take() {
+            if failed && run.result == RunResult::Unknown {
+                run.result = RunResult::Failed;
+            }
+            runs.push(run);
+        }
+    };
+    for line in text.lines() {
+        let Some(stamp) = line.get(..19).filter(|s| timestamp_ok(s)) else {
+            continue;
+        };
+        if line.contains(" INFO Starting unattended upgrades script") {
+            finish(&mut current, failed, &mut runs);
+            failed = false;
+            current = Some(Run {
+                started_local: stamp.to_string(),
+                result: RunResult::Unknown,
+                packages: Vec::new(),
+                package_count: 0,
+            });
+            continue;
+        }
+        let Some(run) = current.as_mut() else {
+            continue;
+        };
+        if let Some(list) = line.split_once(" INFO Packages that will be upgraded:") {
+            for name in list.1.split_whitespace().filter(|n| package_name_ok(n)) {
+                run.package_count = run.package_count.saturating_add(1);
+                if run.packages.len() < MAX_RUN_PACKAGES {
+                    run.packages.push(name.to_string());
+                }
+            }
+        } else if line.contains(" INFO All upgrades installed") {
+            run.result = RunResult::Installed;
+        } else if line.contains(" INFO No packages found that can be upgraded unattended") {
+            run.result = RunResult::NothingToDo;
+        } else if line.contains(" ERROR ") {
+            failed = true;
+        }
+    }
+    finish(&mut current, failed, &mut runs);
+    let truncated = runs.len() > HISTORY_RUNS;
+    runs.reverse();
+    runs.truncate(HISTORY_RUNS);
+    History::Known { runs, truncated }
+}
+
+/// `YYYY-MM-DD HH:MM:SS`.
+fn timestamp_ok(s: &str) -> bool {
+    s.len() == 19
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            4 | 7 => b == b'-',
+            10 => b == b' ',
+            13 | 16 => b == b':',
+            _ => b.is_ascii_digit(),
+        })
 }
 
 /// Numeric parts of `6.8.0-100-generic` without the flavour: `[6, 8, 0, 100]`.
@@ -633,6 +750,65 @@ a line with no date\n",
                 since: Some("2026-11-01".into())
             }
         );
+    }
+
+    #[test]
+    fn history_lists_newest_runs_with_packages_and_results() {
+        let dir = tempfile::tempdir().unwrap();
+        write_log(
+            dir.path(),
+            "2026-11-01 06:00:00,000 INFO Starting unattended upgrades script\n\
+2026-11-01 06:00:01,000 INFO Allowed origins are: o=Ubuntu,a=noble-security\n\
+2026-11-01 06:00:02,000 INFO Packages that will be upgraded: libc6 libc-bin bad;name\n\
+2026-11-01 06:01:00,000 INFO All upgrades installed\n\
+2026-11-05 06:00:00,000 INFO Starting unattended upgrades script\n\
+2026-11-05 06:00:02,000 INFO Packages that will be upgraded: openssl\n\
+2026-11-05 06:00:30,000 ERROR Installing the upgrades failed!\n\
+2026-11-09 06:00:00,000 INFO Starting unattended upgrades script\n\
+2026-11-09 06:00:05,000 INFO No packages found that can be upgraded unattended and no pending auto-removals\n\
+2026-11-10 06:00:00,000 INFO Starting unattended upgrades script\n\
+garbage line\n",
+        );
+        let History::Known { runs, truncated } = history(&ctx(dir.path(), "unused")) else {
+            panic!("expected known");
+        };
+        assert!(!truncated);
+        let results: Vec<RunResult> = runs.iter().map(|r| r.result).collect();
+        assert_eq!(
+            results,
+            [
+                RunResult::Unknown,
+                RunResult::NothingToDo,
+                RunResult::Failed,
+                RunResult::Installed
+            ]
+        );
+        assert_eq!(runs[0].started_local, "2026-11-10 06:00:00");
+        assert_eq!(runs[2].packages, ["openssl"]);
+        assert_eq!(runs[3].packages, ["libc6", "libc-bin"]);
+        assert_eq!(runs[3].package_count, 2);
+    }
+
+    #[test]
+    fn history_is_capped_and_an_unreadable_log_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            history(&ctx(dir.path(), "unused")),
+            History::Unknown { .. }
+        ));
+        let mut text = String::new();
+        for day in 1..=12 {
+            text.push_str(&format!(
+                "2026-10-{day:02} 06:00:00,000 INFO Starting unattended upgrades script\n"
+            ));
+        }
+        write_log(dir.path(), &text);
+        let History::Known { runs, truncated } = history(&ctx(dir.path(), "unused")) else {
+            panic!("expected known");
+        };
+        assert!(truncated);
+        assert_eq!(runs.len(), HISTORY_RUNS);
+        assert_eq!(runs[0].started_local, "2026-10-12 06:00:00");
     }
 
     #[test]
