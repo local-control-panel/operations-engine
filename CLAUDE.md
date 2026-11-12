@@ -8,6 +8,8 @@ Never add a `Co-Authored-By:` trailer to commit messages in this repository.
 
 `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`,
 `cargo test --all-features`. CI also checks the minimum supported Rust version.
+Checks run locally: `scripts/ci-local.sh` runs them on HEAD and reports the two
+required checks as commit statuses on the pull request (hosted Actions are manual only).
 
 ## Rules that always apply
 
