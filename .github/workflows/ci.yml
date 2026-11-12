@@ -1,9 +1,9 @@
 name: CI
 
+# Hosted runs are manual only: the checks branch protection requires are
+# reported by `scripts/ci-local.sh` as commit statuses.
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
