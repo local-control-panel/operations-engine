@@ -1071,6 +1071,67 @@ applied, no request leaves the machine.
 `Persistent=true`) and enables the timer; `off` disables and removes them. The result's
 `timer` is `installed`, `removed` or `unavailable` (systemd is not the running init).
 
+## `security.baselineCapture`, `security.baselineCompare`, `security.baselineAccept`, `security.baselinePrune`
+
+PHP code baseline: a SHA-256 map (relative path to hash, nothing else) of the
+application's code files that an operator explicitly accepted. Each takes a
+root-owned JSON request file (`--request-file`, `--request-id`; capture,
+accept and prune also `--idempotency-key`). Common fields: `siteId` (UUID),
+`projectRoot` (absolute, inside a configured content root; its canonical form
+is what is scanned and stored), `kind` (`wordpress`, `drupal`, `joomla`,
+`laravel`; not for prune), optional `subsite` (a token; part of the identity).
+Unknown fields and fields that do not belong to the operation are rejected.
+
+Scope: files with the extensions `php`, `phtml`, `inc`, `module`, `install`,
+`theme`, `phar` (case-insensitive), minus directories excluded per kind,
+anchored at the project root (`*` is one segment, a leading `**/` matches at
+any depth): WordPress `wp-content/uploads`, `wp-content/cache`,
+`wp-content/upgrade`, `**/node_modules`; Drupal `sites/*/files`,
+`sites/*/private`, `**/node_modules`, `vendor`; Joomla `cache`, `tmp`,
+`administrator/cache`, `images`; Laravel `vendor`, `storage`,
+`bootstrap/cache`, `**/node_modules`, `public/storage`. The scope text is
+stored with a baseline; a baseline of another scope, root, kind or subsite is
+not comparable (`unavailable`). Symlinks are never followed: directories are
+opened one component at a time with `O_NOFOLLOW`, and a symlink with a code
+name is recorded by the hash of its link text. Limits: 50 000 files, 256 MiB
+read, 120 s. A limit, an unreadable or special file with a code name, a name
+that cannot be recorded, or a file that still changes after three reads makes
+the scan incomplete; incomplete is never a match.
+
+Storage (below the state root, root-owned): `security-baselines/<siteId>/`
+(0700) with `index.json` (accepted, candidate, retained generations) and
+immutable `gen-<n>.json` (0600), every write a temporary name plus `rename`;
+files the index does not name (an interrupted write) are swept by the next
+mutation. At most 3 generations are kept (accepted, candidate and the newest
+others). Nothing but paths and hashes is stored; results never contain
+absolute paths.
+
+- `baselineCapture` scans under the project resource lock (the one deploy and
+  CMS mutations take; held elsewhere gives `conflict`) and writes a new
+  *candidate*. It never replaces the accepted generation. Result:
+  `{generation, digest, complete, incompleteReason, stoppedAt, fileCount,
+  bytesRead, acceptedGeneration, diffFromAccepted, journalRecorded}`.
+- `baselineCompare` is read-only for the site. Optional `generation` selects
+  a stored generation (default: the accepted one). `status` is `noBaseline`,
+  `match`, `differs` (counts and at most 100 paths per `added`/`changed`/
+  `deleted`, `truncated`), `incomplete` (`reason`, `stoppedAt`) or
+  `unavailable` (`reason`: `baselineUnreadable`, `baselineIncomplete`,
+  `scopeChanged`, `rootChanged`, `subsiteChanged`).
+- `baselineAccept` (`generation`, `digest`, `actor`) makes the candidate the
+  accepted generation. It refuses (`conflict`) when the digest is not the
+  reviewed one or the code under the lock no longer matches the candidate, and
+  (`invalid_input`) an incomplete or non-candidate generation.
+- `baselinePrune` (`mode`: `candidate`, `superseded`, `all`; `actor`) removes
+  stored generations.
+
+Capture, accept and prune use the usual idempotency, transaction and audit
+records and write a change journal entry (`security.baselineCapture`,
+`security.baselineAccept`, `security.baselinePrune`: actor, site, generation,
+counts; no paths, no content); `journalRecorded` is false when the journal
+write failed. A successful update does not accept anything: the next compare
+shows the difference until a new candidate is reviewed and accepted. Server-local
+storage is not external evidence of host integrity.
+
 ## `cms.clearCache`
 
 `cms clear-cache` takes a root-owned JSON request `{kind, container,

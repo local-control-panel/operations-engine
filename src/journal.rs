@@ -105,6 +105,7 @@ pub const ACTION_NAMESPACES: &[&str] = &[
     "joomla",
     "panel",
     "runtime",
+    "security",
     "site",
     "stack",
     "system",
