@@ -678,6 +678,11 @@ exit \"$(cat \"$D/install-exit\")\"\n"
                     reboot_required_pkgs: &self.reboot_required_pkgs,
                     update_stamp: Path::new("/nonexistent/stamp"),
                     apt_history: Path::new("/nonexistent/history"),
+                    unattended_log: Path::new("/nonexistent/unattended.log"),
+                    boot_dir: Path::new("/nonexistent/boot"),
+                    osrelease: Path::new("/nonexistent/osrelease"),
+                    apt_config: "/nonexistent/apt-config",
+                    now: 0,
                 },
             }
         }
