@@ -1301,6 +1301,12 @@ Protocol version 1 reserves these stable codes:
 | `ARTIFACT_NOT_RUNNABLE` | A verified binary did not run on this host during its pre-activation smoke test, so it was rejected before anything was activated (`engine install`). |
 | `ROLLBACK_INCOMPLETE` | The operation failed and the engine could not finish undoing its work (`site.migrateRuntime`); the journal stays for `site.reconcile`. A compensated failure keeps the failing step's own code, so this code alone tells a client the outcome is not known to be clean. |
 
+`agent.installFromRegistry` refuses with `DEPENDENCY_UNAVAILABLE` when the
+agent needs engine operations, helper commands or tools this host lacks, and
+sets `details` to `{"kind": "operations" | "helpers" | "tools", "missing":
+["name", ...]}`: the names are the registry's validated requirement
+identifiers. Every other refusal of that operation has `details: null`.
+
 Error messages are safe summaries for operators, not stable API values. The
 optional `details` object is `null` unless an operation documents an allowlisted
 shape for its error code. It must contain identifiers, limits, or state needed

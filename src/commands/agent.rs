@@ -365,7 +365,10 @@ fn install_from_registry(
         Ok(v) => v,
         Err(error) => {
             let (code, message) = error.protocol();
-            return failure(code, &message);
+            return match error.details() {
+                Some(details) => Response::failure_with_details(operation, code, &message, details),
+                None => failure(code, &message),
+            };
         }
     };
     let install = agent_lifecycle::InstallRequest {

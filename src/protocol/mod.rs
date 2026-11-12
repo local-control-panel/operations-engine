@@ -101,6 +101,21 @@ impl Response {
         }
     }
 
+    /// A failure whose operation documents an allowlisted `details` shape
+    /// (`docs/protocol.md`): identifiers and limits only, never output.
+    pub fn failure_with_details(
+        operation: &'static str,
+        code: ErrorCode,
+        message: &str,
+        details: Value,
+    ) -> Self {
+        let mut response = Self::failure(operation, code, message);
+        if let Some(error) = response.error.as_mut() {
+            error.details = Some(details);
+        }
+        response
+    }
+
     pub fn with_warnings(mut self, warnings: Vec<Warning>) -> Self {
         self.warnings = warnings;
         self
