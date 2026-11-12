@@ -1076,7 +1076,7 @@ applied, no request leaves the machine.
 PHP code baseline: a SHA-256 map (relative path to hash, nothing else) of the
 application's code files that an operator explicitly accepted. Each takes a
 root-owned JSON request file (`--request-file`, `--request-id`; capture,
-accept and prune also `--idempotency-key`). Common fields: `siteId` (UUID),
+accept and prune also `--idempotency-key`). Common fields: `site` (the site's domain, the engine's site identifier for the journal),
 `projectRoot` (absolute, inside a configured content root; its canonical form
 is what is scanned and stored), `kind` (`wordpress`, `drupal`, `joomla`,
 `laravel`; not for prune), optional `subsite` (a token; part of the identity).
@@ -1098,7 +1098,7 @@ read, 120 s. A limit, an unreadable or special file with a code name, a name
 that cannot be recorded, or a file that still changes after three reads makes
 the scan incomplete; incomplete is never a match.
 
-Storage (below the state root, root-owned): `security-baselines/<siteId>/`
+Storage (below the state root, root-owned): `security-baselines/<domain>/`
 (0700) with `index.json` (accepted, candidate, retained generations) and
 immutable `gen-<n>.json` (0600), every write a temporary name plus `rename`;
 files the index does not name (an interrupted write) are swept by the next

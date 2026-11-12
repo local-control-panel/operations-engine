@@ -7,7 +7,7 @@
 //! the first snapshot was clean and it is server-local: a root compromise is
 //! outside what it guarantees.
 //!
-//! * Storage: `<state root>/security-baselines/<siteId>/` (0700, files 0600),
+//! * Storage: `<state root>/security-baselines/<domain>/` (0700, files 0600),
 //!   root-owned, outside every web root. `index.json` names the accepted and
 //!   candidate generation; `gen-<n>.json` files are immutable once written.
 //!   Every write is a temporary name plus `rename`. A generation file that

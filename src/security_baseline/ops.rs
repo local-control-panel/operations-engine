@@ -20,7 +20,7 @@ use crate::{
     filesystem::ManagedRoot,
     journal::{self, NewEntry, RawEntry, Source},
     mutation::preflight,
-    site::{SiteId, SiteRelativePath, TrustedRoot},
+    site::{Domain, SiteRelativePath, TrustedRoot},
     transaction::{
         IdempotencyKey, RequestId,
         audit::{self, AuditRecord},
@@ -61,7 +61,7 @@ pub enum PruneMode {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Plan {
-    site_id: String,
+    site: String,
     project_root: String,
     #[serde(default)]
     kind: Option<String>,
@@ -80,7 +80,7 @@ struct Plan {
 #[derive(Debug)]
 pub struct Request {
     pub op: Op,
-    site_id: SiteId,
+    site: Domain,
     kind: Option<Kind>,
     project_root: PathBuf,
     subsite: Option<String>,
@@ -123,7 +123,7 @@ impl Request {
         key: Option<&str>,
     ) -> Result<Self, RequestError> {
         let plan: Plan = serde_json::from_str(json).map_err(|_| RequestError::InvalidJson)?;
-        let site_id = SiteId::parse(&plan.site_id).map_err(|_| RequestError::InvalidSite)?;
+        let site = Domain::parse(&plan.site).map_err(|_| RequestError::InvalidSite)?;
         let project_root =
             super::project_root_ok(&plan.project_root).ok_or(RequestError::InvalidRoot)?;
         let needs_kind = op != Op::Prune;
@@ -168,7 +168,7 @@ impl Request {
         };
         Ok(Self {
             op,
-            site_id,
+            site,
             kind,
             project_root,
             subsite: plan.subsite,
@@ -355,7 +355,7 @@ fn new_generation(
     let complete = scan.incomplete.is_none();
     Generation {
         schema_version: SCHEMA_VERSION,
-        site_id: req.site_id.to_string(),
+        site: req.site.as_str().to_owned(),
         subsite: req.subsite.clone(),
         kind: kind.name().into(),
         root: target.canonical.clone(),
@@ -400,7 +400,7 @@ fn lock<'a>(
 pub fn compare(ctx: &Context<'_>, req: &Request) -> Result<Value, Error> {
     let target = open_target(ctx, req)?;
     let _lock = lock(ctx, req)?;
-    let site = req.site_id.to_string();
+    let site = req.site.as_str().to_owned();
     let Some(store) = Store::open(ctx.engine_state, &site, false).map_err(Error::Io)? else {
         return Ok(json!({ "status": "noBaseline" }));
     };
@@ -471,7 +471,7 @@ fn journal_record(
     summary: &str,
     target: Option<&str>,
 ) -> bool {
-    let site = req.site_id.to_string();
+    let site = req.site.as_str().to_owned();
     let Ok(entry) = NewEntry::parse(RawEntry {
         actor: req.actor.as_deref().unwrap_or("engine"),
         action,
@@ -560,7 +560,7 @@ fn mutate(
         SiteRelativePath::parse(format!("transactions/{}.json", req.request_id)).unwrap();
     let audit_path = SiteRelativePath::parse("audit/events.jsonl").unwrap();
 
-    let site = req.site_id.to_string();
+    let site = req.site.as_str().to_owned();
     let outcome = Store::open(ctx.engine_state, &site, true)
         .map_err(Error::Io)
         .and_then(|store| store.ok_or(Error::Store("baseline store is unavailable")))
@@ -808,7 +808,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    const SITE: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const SITE: &str = "example.com";
 
     struct Fixture {
         state_dir: tempfile::TempDir,
@@ -873,7 +873,7 @@ mod tests {
                 r#","actor":"user:1""#
             };
             let json = format!(
-                r#"{{"siteId":"{SITE}","projectRoot":"{}"{kind}{actor}{extra}}}"#,
+                r#"{{"site":"{SITE}","projectRoot":"{}"{kind}{actor}{extra}}}"#,
                 self.root()
             );
             let request = Request::parse(op, &json, &self.id(), None).unwrap();
@@ -1138,7 +1138,7 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         fs::write(other.path().join("index.php"), "x").unwrap();
         let json = format!(
-            r#"{{"siteId":"{SITE}","projectRoot":"{}","kind":"wordpress"}}"#,
+            r#"{{"site":"{SITE}","projectRoot":"{}","kind":"wordpress"}}"#,
             other.path().canonicalize().unwrap().display()
         );
         let request = Request::parse(Op::Compare, &json, &f.id(), None).unwrap();
@@ -1153,7 +1153,7 @@ mod tests {
         assert_eq!(result["reason"], "rootChanged");
         // A different kind is a different scope.
         let json = format!(
-            r#"{{"siteId":"{SITE}","projectRoot":"{}","kind":"drupal"}}"#,
+            r#"{{"site":"{SITE}","projectRoot":"{}","kind":"drupal"}}"#,
             f.root()
         );
         let request = Request::parse(Op::Compare, &json, &f.id(), None).unwrap();
@@ -1170,7 +1170,7 @@ mod tests {
         let f = Fixture::new();
         let state = f.state();
         let json = format!(
-            r#"{{"siteId":"{SITE}","projectRoot":"{}","kind":"wordpress"}}"#,
+            r#"{{"site":"{SITE}","projectRoot":"{}","kind":"wordpress"}}"#,
             f.root()
         );
         let request = Request::parse(Op::Compare, &json, &f.id(), None).unwrap();
@@ -1187,7 +1187,7 @@ mod tests {
         let id = "123e4567-e89b-12d3-a456-426614174000";
         let base = |extra: &str| {
             format!(
-                r#"{{"siteId":"{SITE}","projectRoot":"/var/www/a","kind":"wordpress","actor":"user:1"{extra}}}"#
+                r#"{{"site":"{SITE}","projectRoot":"/var/www/a","kind":"wordpress","actor":"user:1"{extra}}}"#
             )
         };
         assert!(Request::parse(Op::Capture, &base(""), id, None).is_ok());
@@ -1231,9 +1231,8 @@ mod tests {
             Request::parse(Op::Compare, &base(""), id, None).is_err(),
             "compare has no actor"
         );
-        let prune = format!(
-            r#"{{"siteId":"{SITE}","projectRoot":"/var/www/a","actor":"u","mode":"bogus"}}"#
-        );
+        let prune =
+            format!(r#"{{"site":"{SITE}","projectRoot":"/var/www/a","actor":"u","mode":"bogus"}}"#);
         assert!(Request::parse(Op::Prune, &prune, id, None).is_err());
     }
 }

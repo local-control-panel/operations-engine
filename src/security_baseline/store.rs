@@ -46,7 +46,7 @@ pub struct LimitsRecord {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Generation {
     pub schema_version: u32,
-    pub site_id: String,
+    pub site: String,
     pub subsite: Option<String>,
     pub kind: String,
     /// Canonical content root. Kept for identity checks, never sent to the UI.
@@ -87,9 +87,9 @@ pub struct Store {
 
 impl Store {
     /// `create == false` returns `None` when the site has no directory yet.
-    pub fn open(state: &ManagedRoot, site_id: &str, create: bool) -> io::Result<Option<Self>> {
+    pub fn open(state: &ManagedRoot, site: &str, create: bool) -> io::Result<Option<Self>> {
         let base = rel(ROOT_DIR);
-        let site = rel(format!("{ROOT_DIR}/{site_id}"));
+        let site = rel(format!("{ROOT_DIR}/{site}"));
         if create {
             state.create_dir_all(&site)?;
             state.set_mode(&base, 0o700)?;
@@ -193,7 +193,7 @@ mod tests {
     use crate::site::TrustedRoot;
     use std::{fs, os::unix::fs::PermissionsExt};
 
-    const SITE: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const SITE: &str = "example.com";
 
     fn state(path: &std::path::Path) -> ManagedRoot {
         ManagedRoot::open(&TrustedRoot::parse(path).unwrap()).unwrap()
@@ -204,7 +204,7 @@ mod tests {
         files.insert("a.php".to_owned(), "00".repeat(32));
         Generation {
             schema_version: SCHEMA_VERSION,
-            site_id: SITE.into(),
+            site: SITE.into(),
             subsite: None,
             kind: "wordpress".into(),
             root: "/var/www/x".into(),
