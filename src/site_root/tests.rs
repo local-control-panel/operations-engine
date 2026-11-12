@@ -842,3 +842,76 @@ fn remove_with_a_relative_root_takes_only_that_directory_and_prunes_empty_parent
     // A missing root is a no-op.
     assert!(remove("u.test", THIRD_ID).removed.is_empty());
 }
+
+// ---- real interruption of site.moveRoot ----
+
+#[cfg(all(feature = "failpoints", unix))]
+#[test]
+fn move_crash_child() {
+    let Ok(base) = std::env::var("MOVE_CRASH_FIXTURE") else {
+        return;
+    };
+    let base = PathBuf::from(base);
+    let state = ManagedRoot::open(&TrustedRoot::parse(base.join("state")).unwrap()).unwrap();
+    let content = TrustedRoot::parse(base.join("www")).unwrap();
+    let _ = move_root(
+        &state,
+        std::slice::from_ref(&content),
+        &req("old.test", "new.test", ID, Some("mv-crash")),
+    );
+    panic!("the configured crash point was not reached");
+}
+
+#[cfg(all(feature = "failpoints", unix))]
+#[test]
+fn sigkill_around_the_rename_leaves_one_directory_and_the_next_move_recovers() {
+    use std::os::unix::process::ExitStatusExt;
+    for (point, moved) in [
+        ("site-move-root-before-rename", false),
+        ("site-move-root-after-rename", true),
+    ] {
+        let fixture = Fixture::new();
+        fixture.site("old.test");
+        let base = fixture.path("..");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "site_root::tests::move_crash_child",
+                "--nocapture",
+            ])
+            .env("MOVE_CRASH_FIXTURE", base.canonicalize().unwrap())
+            .env("WCP_FAILPOINT", point)
+            .output()
+            .unwrap();
+        assert_eq!(child.status.signal(), Some(libc::SIGKILL), "{point}");
+
+        // Exactly one of the two directories exists, with its content.
+        assert_eq!(fixture.path("old.test").exists(), !moved, "{point}");
+        assert_eq!(fixture.path("new.test").exists(), moved, "{point}");
+        let live = fixture.path(if moved { "new.test" } else { "old.test" });
+        assert_eq!(fs::read_to_string(live.join("index.php")).unwrap(), "<?php");
+
+        // The killed request stays in progress: its key does not replay a result.
+        assert!(matches!(
+            fixture.run(&req("old.test", "new.test", OTHER_ID, Some("mv-crash"))),
+            Err(Error::ReplayInProgress)
+        ));
+
+        // A fresh request completes (before the rename) or undoes the move
+        // (after it): the panel's rollback is this same call with the domains
+        // swapped.
+        if moved {
+            fixture
+                .run(&req("new.test", "old.test", THIRD_ID, Some("mv-back")))
+                .unwrap();
+            assert!(fixture.path("old.test/index.php").exists());
+            assert!(!fixture.path("new.test").exists());
+        } else {
+            fixture
+                .run(&req("old.test", "new.test", THIRD_ID, Some("mv-again")))
+                .unwrap();
+            assert!(fixture.path("new.test/index.php").exists());
+            assert!(!fixture.path("old.test").exists());
+        }
+    }
+}

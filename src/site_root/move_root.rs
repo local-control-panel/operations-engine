@@ -88,10 +88,12 @@ pub fn move_root(
     let state_path = transaction_path(req.request_id);
     let audit_path = rel("audit/events.jsonl");
 
+    crate::failpoint::hit("site-move-root-before-rename");
     let value = match rename(content_root, req, from_path, to_path) {
         Ok(value) => value,
         Err(error) => return Err(fail(&scope, &state_path, &audit_path, state, error)),
     };
+    crate::failpoint::hit("site-move-root-after-rename");
 
     let encoded = serde_json::to_value(&value).expect("operation results always serialize");
     state
