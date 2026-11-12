@@ -495,6 +495,43 @@ fn journal_record(
     .is_ok()
 }
 
+/// The failure counterpart of [`journal_record`]: actor, site, generation when
+/// the request names one and the error code. No messages and no paths.
+fn journal_failure(ctx: &Context<'_>, req: &Request, code: ErrorCode) {
+    let action = match req.op {
+        Op::Capture => "security.baselineCapture",
+        Op::Accept => "security.baselineAccept",
+        Op::Prune => "security.baselinePrune",
+        Op::Compare => return,
+    };
+    let site = req.site.as_str().to_owned();
+    let code_name = serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned));
+    let target = req.generation.map(|g| format!("gen{g}"));
+    let Ok(entry) = NewEntry::parse(RawEntry {
+        actor: req.actor.as_deref().unwrap_or("engine"),
+        action,
+        result: "failed",
+        site: Some(&site),
+        subsite: req.subsite.as_deref(),
+        target: target.as_deref(),
+        error_code: code_name.as_deref(),
+        summary: Some("failed"),
+        ..RawEntry::default()
+    }) else {
+        return;
+    };
+    let _ = journal::append(
+        ctx.engine_state,
+        &entry,
+        req.request_id,
+        req.idempotency_key.as_ref(),
+        Source::Engine,
+        journal::unix_now_secs(),
+    );
+}
+
 /// Keeps the accepted and candidate generations plus the newest others, at
 /// most [`RETAINED_GENERATIONS`] in all.
 fn apply_retention(store: &Store, index: &mut Index) {
@@ -571,6 +608,9 @@ fn mutate(
             let (code, message) = error.protocol();
             let _ = state.mark_failed(code, message);
             let _ = state::save(&scope, &state_path, &state);
+            // Recorded once, here: a replay of this failed request returns
+            // from `replay` above and never reaches this point.
+            journal_failure(ctx, req, code);
             let _ = audit::append(
                 &scope,
                 &audit_path,
@@ -1128,6 +1168,47 @@ mod tests {
         assert!(journal.contains("security.baselinePrune"));
         assert!(journal.contains("user:1"));
         assert!(!journal.contains("index.php"));
+    }
+
+    #[test]
+    fn a_failed_accept_is_journaled_once_without_paths() {
+        let f = Fixture::new();
+        let captured = f.run(Op::Capture, "").unwrap();
+        let extra = format!(
+            r#","generation":{},"digest":"{}""#,
+            captured["generation"],
+            "0".repeat(64)
+        );
+        let json = format!(
+            r#"{{"site":"{SITE}","projectRoot":"{}","kind":"wordpress","actor":"user:1"{extra}}}"#,
+            f.root()
+        );
+        let id = "123e4567-e89b-12d3-a456-426614174099";
+        let state = f.state();
+        let ctx = Context {
+            engine_state: &state,
+            content_roots: vec![f.site_dir.path().canonicalize().unwrap()],
+            limits: Limits::DEFAULT,
+        };
+        let request = Request::parse(Op::Accept, &json, id, Some("key-1")).unwrap();
+        assert!(matches!(accept(&ctx, &request), Err(Error::Conflict(_))));
+        // The same request again replays the stored failure.
+        assert!(matches!(
+            accept(&ctx, &request),
+            Err(Error::Replayed { .. })
+        ));
+        let journal = fs::read_to_string(f.state_dir.path().join("journal/events.jsonl")).unwrap();
+        let failed: Vec<&str> = journal
+            .lines()
+            .filter(|l| l.contains("security.baselineAccept"))
+            .collect();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].contains("\"failed\""));
+        assert!(failed[0].contains("CONFLICT"));
+        assert!(failed[0].contains("user:1"));
+        assert!(failed[0].contains("example.com"));
+        assert!(!failed[0].contains(&f.root()));
+        assert!(!failed[0].contains("index.php"));
     }
 
     #[test]
