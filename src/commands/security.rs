@@ -2,6 +2,7 @@ use crate::{
     cli::SecurityCommand,
     error::ErrorCode,
     protocol::{Response, ResponseBuildError},
+    security_baseline::{self, Op},
     security_feed,
 };
 
@@ -67,6 +68,40 @@ pub fn run(command: SecurityCommand) -> Result<Response, ResponseBuildError> {
                 ),
             )
         }),
+        SecurityCommand::BaselineCapture {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => baseline(
+            Op::Capture,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SecurityCommand::BaselineCompare {
+            request_file,
+            request_id,
+        } => baseline(Op::Compare, &request_file, &request_id, None),
+        SecurityCommand::BaselineAccept {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => baseline(
+            Op::Accept,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
+        SecurityCommand::BaselinePrune {
+            request_file,
+            request_id,
+            idempotency_key,
+        } => baseline(
+            Op::Prune,
+            &request_file,
+            &request_id,
+            idempotency_key.as_deref(),
+        ),
         SecurityCommand::History { limit } => with_state(security_feed::HISTORY, |state| {
             Response::success(
                 security_feed::HISTORY,
@@ -125,4 +160,90 @@ fn mutate(
             Ok(Response::failure(operation, code, &message))
         }
     })
+}
+
+fn baseline(
+    op: Op,
+    path: &std::path::Path,
+    request_id: &str,
+    idempotency_key: Option<&str>,
+) -> Result<Response, ResponseBuildError> {
+    let operation = match op {
+        Op::Capture => security_baseline::CAPTURE,
+        Op::Compare => security_baseline::COMPARE,
+        Op::Accept => security_baseline::ACCEPT,
+        Op::Prune => security_baseline::PRUNE,
+    };
+    #[cfg(unix)]
+    {
+        use crate::{config::EngineConfig, filesystem::ManagedRoot};
+        let Ok(config) = EngineConfig::load_root_owned(std::path::Path::new(
+            "/etc/operations-engine/config.json",
+        )) else {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                crate::commands::CONFIG_UNAVAILABLE_MESSAGE,
+            ));
+        };
+        let Ok(json) = crate::commands::read_root_owned_content_file(path) else {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::InvalidInput,
+                "request-file must be a root-owned regular file",
+            ));
+        };
+        let request =
+            match security_baseline::Request::parse(op, &json, request_id, idempotency_key) {
+                Ok(request) => request,
+                Err(_) => {
+                    return Ok(Response::failure(
+                        operation,
+                        ErrorCode::InvalidInput,
+                        "request-file is not a valid baseline request",
+                    ));
+                }
+            };
+        let content_roots: Vec<std::path::PathBuf> = config
+            .content_roots
+            .iter()
+            .filter_map(|root| std::fs::canonicalize(root.as_path()).ok())
+            .collect();
+        let Ok(state) = ManagedRoot::open(&config.state_root) else {
+            return Ok(Response::failure(
+                operation,
+                ErrorCode::Internal,
+                "engine state root is unavailable",
+            ));
+        };
+        let context = security_baseline::Context {
+            engine_state: &state,
+            content_roots,
+            limits: security_baseline::scan::Limits::DEFAULT,
+        };
+        let result = match op {
+            Op::Capture => security_baseline::capture(&context, &request),
+            Op::Compare => security_baseline::compare(&context, &request),
+            Op::Accept => security_baseline::accept(&context, &request),
+            Op::Prune => security_baseline::prune(&context, &request),
+        };
+        match result {
+            Ok(value) | Err(security_baseline::Error::PostCommit { result: value }) => {
+                Response::success(operation, value)
+            }
+            Err(error) => {
+                let (code, message) = error.protocol();
+                Ok(Response::failure(operation, code, &message))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, idempotency_key);
+        Ok(Response::failure(
+            operation,
+            ErrorCode::UnsupportedPlatform,
+            "security baselines require a Unix host",
+        ))
+    }
 }

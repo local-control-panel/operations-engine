@@ -312,6 +312,40 @@ pub enum SecurityCommand {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Hash the application's PHP files into a new candidate baseline (never replaces the accepted one).
+    BaselineCapture {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Compare the PHP files with a stored baseline generation (reads only the site).
+    BaselineCompare {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+    },
+    /// Accept the reviewed candidate as the baseline (explicit, journaled).
+    BaselineAccept {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
+    /// Remove stored baseline generations.
+    BaselinePrune {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl SecurityCommand {
@@ -322,6 +356,10 @@ impl SecurityCommand {
             Self::Status => "security.status",
             Self::History { .. } => "security.history",
             Self::Affected => "security.affected",
+            Self::BaselineCapture { .. } => "security.baselineCapture",
+            Self::BaselineCompare { .. } => "security.baselineCompare",
+            Self::BaselineAccept { .. } => "security.baselineAccept",
+            Self::BaselinePrune { .. } => "security.baselinePrune",
         }
     }
 }
