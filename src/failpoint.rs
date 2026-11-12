@@ -11,6 +11,12 @@ pub fn hit(name: &str) {
     if std::env::var("WCP_FAILPOINT").is_ok_and(|v| v == name) {
         // SAFETY: kill(2) on our own pid; no memory is touched.
         unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+        // kill(2) on our own pid returns before the signal is acted on when the
+        // kernel picks another thread to receive it, so the caller would keep
+        // running past the crash point. Park until the SIGKILL lands.
+        loop {
+            std::thread::park();
+        }
     }
     #[cfg(not(all(feature = "failpoints", unix)))]
     let _ = name;
