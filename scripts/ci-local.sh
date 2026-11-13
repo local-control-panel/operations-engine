@@ -53,5 +53,5 @@ lint_and_test() {
 
 failed=0
 run_check "Format, lint, and test" lint_and_test || failed=1
-run_check "Minimum Rust version" cargo +1.85.0 check --all-features || failed=1
+run_check "Minimum Rust version" cargo +1.88.0 check --all-features || failed=1
 exit $failed

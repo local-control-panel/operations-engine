@@ -1,3 +1,7 @@
+// Operation errors carry the finished result (`PostCommit`) and protocol responses are
+// returned as `Err` on purpose; boxing every one of them would only move the size.
+#![allow(clippy::result_large_err)]
+
 pub mod agent_config;
 #[cfg(unix)]
 pub mod agent_configure;
