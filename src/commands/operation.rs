@@ -229,7 +229,18 @@ fn status(
             }
         };
         match state {
-            Ok(state) => Response::success(OPERATION, state),
+            Ok(state) => {
+                let progress = update_progress(&state);
+                let mut value = serde_json::to_value(&state).expect("status serializes");
+                if let (Some(progress), Some(object)) = (progress, value.as_object_mut()) {
+                    object.insert("lastStep".into(), serde_json::json!(progress.last_step));
+                    object.insert(
+                        "bundleComplete".into(),
+                        serde_json::json!(progress.bundle_complete),
+                    );
+                }
+                Response::success(OPERATION, value)
+            }
             Err(
                 StatusError::InvalidScope
                 | StatusError::InvalidSiteId
@@ -342,4 +353,21 @@ fn resource_status(
             "resource status requires Unix",
         ))
     }
+}
+
+/// The step journal of an update, when the record names one and the backup
+/// root can be opened. Best effort: any failure leaves the answer as it was.
+#[cfg(unix)]
+fn update_progress(
+    state: &operation_status::OperationStatus,
+) -> Option<crate::update_steps::Progress> {
+    use crate::{backup_delete::BACKUP_ROOT, site::TrustedRoot};
+    crate::update_steps::journal_dir(&state.transaction.operation)?;
+    let root = TrustedRoot::parse(Path::new(BACKUP_ROOT)).ok()?;
+    let backups = ManagedRoot::open(&root).ok()?;
+    operation_status::update_progress(
+        &backups,
+        &state.transaction.operation,
+        state.transaction.request_id,
+    )
 }

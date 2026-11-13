@@ -81,6 +81,19 @@ pub fn load_stack(
     load_scoped(engine_state, &scope_path, request_id)
 }
 
+/// How far an update got, from its step journal in the backup root. Reads
+/// only; an operation without a journal, a missing, oversized or unreadable
+/// file and an empty journal are all `None` (unknown, never a guess).
+pub fn update_progress(
+    backup_root: &ManagedRoot,
+    operation: &str,
+    request_id: RequestId,
+) -> Option<crate::update_steps::Progress> {
+    let dir = crate::update_steps::journal_dir(operation)?;
+    let path = SiteRelativePath::parse(format!("{dir}/{request_id}/steps.json")).ok()?;
+    crate::update_steps::Journal::parse(&backup_root.read_to_string(&path).ok()?)?.progress()
+}
+
 /// Largest page `operation.list` will return; larger requests are clamped.
 pub const LIST_MAX_LIMIT: usize = 100;
 pub const LIST_DEFAULT_LIMIT: usize = 20;
@@ -734,6 +747,39 @@ mod tests {
         root.create_dir_all(&SiteRelativePath::parse(format!("sites/{SITE_ID}/locks")).unwrap())
             .unwrap();
         (directory, root)
+    }
+
+    fn write_journal(root: &ManagedRoot, dir: &str, text: &str) {
+        let folder = SiteRelativePath::parse(format!("{dir}/{REQUEST_ID}")).unwrap();
+        root.create_dir_all(&folder).unwrap();
+        root.write_atomic(
+            &SiteRelativePath::parse(format!("{dir}/{REQUEST_ID}/steps.json")).unwrap(),
+            text.as_bytes(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn update_progress_reads_the_journal_and_is_none_when_it_cannot() {
+        let directory = tempfile::tempdir().unwrap();
+        let backups = ManagedRoot::open(&TrustedRoot::parse(directory.path()).unwrap()).unwrap();
+        let id = RequestId::parse(REQUEST_ID).unwrap();
+        // No journal yet, an operation without one, and an unreadable file.
+        assert_eq!(update_progress(&backups, "drupal.updateCore", id), None);
+        write_journal(
+            &backups,
+            "drupal-updates",
+            r#"{"version":1,"steps":[{"step":"bundled","atUnixSecs":1},{"step":"probed","atUnixSecs":2}]}"#,
+        );
+        let progress = update_progress(&backups, "drupal.updateCore", id).unwrap();
+        assert_eq!(progress.last_step, crate::update_steps::Step::Probed);
+        assert!(progress.bundle_complete);
+        assert_eq!(update_progress(&backups, "site.deploy", id), None);
+        assert_eq!(update_progress(&backups, "joomla.updateCore", id), None);
+        write_journal(&backups, "joomla-updates", "{ not json");
+        assert_eq!(update_progress(&backups, "joomla.updateCore", id), None);
+        write_journal(&backups, "joomla-updates", r#"{"version":1,"steps":[]}"#);
+        assert_eq!(update_progress(&backups, "joomla.updateCore", id), None);
     }
 
     #[test]
