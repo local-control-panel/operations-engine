@@ -831,8 +831,7 @@ mod tests {
             assert_eq!(
                 child.status.signal(),
                 Some(libc::SIGKILL),
-                "{point}: {:?}",
-                child
+                "{point}: {child:?}"
             );
             let site = site(&open("public"), DOMAIN).unwrap();
             assert_eq!(

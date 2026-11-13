@@ -87,14 +87,14 @@ existing test fixtures as a production distribution channel.
 
 ## Development
 
-Rust 1.85 is the minimum supported compiler. The repository toolchain file
+Rust 1.88 is the minimum supported compiler. The repository toolchain file
 selects the local development toolchain. CI runs these checks on Linux:
 
 ```console
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo +1.85.0 check --all-features
+cargo +1.88.0 check --all-features
 ```
 
 macOS is useful for development; operational behavior and releases target

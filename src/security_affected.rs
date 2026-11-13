@@ -94,7 +94,7 @@ pub struct Affected {
 }
 
 fn judge(rule: &ImageRule, facts: &ImageFacts) -> Verdict {
-    if !rule.platforms.iter().any(|p| *p == facts.platform) {
+    if !rule.platforms.contains(&facts.platform) {
         return Verdict::Unknown;
     }
     if facts.digests.iter().any(|d| rule.from_digests.contains(d)) {

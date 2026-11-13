@@ -55,7 +55,7 @@ Required local validation:
 cargo fmt --all --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
-cargo +1.85.0 check --all-features
+cargo +1.88.0 check --all-features
 ```
 
 ## Completed foundation — Phases 0–6
