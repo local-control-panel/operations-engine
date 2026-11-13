@@ -10,6 +10,7 @@ pub mod agent_run;
 pub mod agent_systemd;
 #[cfg(unix)]
 pub mod agent_tool;
+pub mod agent_validate;
 pub mod backup_create;
 pub mod backup_delete;
 pub mod backup_deploy;

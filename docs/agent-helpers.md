@@ -64,7 +64,7 @@ Bundled agents have no requirements.
 
 ## Running and configuring an agent (protocol operations)
 
-These two are protocol operations (`capabilities.operations`), not helpers for
+These three are protocol operations (`capabilities.operations`), not helpers for
 scripts: they print one envelope.
 
 ### `agent.run`
@@ -111,3 +111,37 @@ file is replaced atomically under a per-agent lock; the same request again
 reports `changed: false`. The answer lists key names (`keys`, `removed`) and
 **never a value**; errors never contain one either. The engine checks syntax and
 size, not which keys an agent reads.
+
+### `agent.validate`
+
+`ops-engine agent validate --directory DIR --manifest-file FILE`
+
+Read-only. The rules an agent's `agent.toml` and script must meet to be
+released, kept here so the agents repository's checker and the installer never
+disagree. FILE is the agent's `agent.toml` converted to JSON (TOML syntax is the
+caller's job; at most 64 KiB); the script is read from DIR (a regular file, not a
+link, at most 256 KiB). Nothing is written and no manifest value is echoed back.
+
+The answer is `{valid, agent, problems, warnings}`. `problems` and `warnings`
+are lists of `{code, field?, message}`; `valid` is true only when `problems` is
+empty. An invalid agent is still an answered request (`ok: true`). Inputs that
+cannot be read or parsed are an `INVALID_INPUT` failure with no `result`: the
+caller must treat that as "not validated", never as valid.
+
+Problem codes: `manifest_not_an_object`, `missing_key`, `wrong_type`,
+`invalid_author`, `invalid_name`, `invalid_version`, `unknown_tier`,
+`unknown_schedule`, `schedule_not_empty`, `invalid_default_schedule`,
+`invalid_script_name`, `script_missing`, `script_too_large`, `script_not_text`,
+`invalid_paths`, `unknown_isolation`, `writable_paths_without_systemd`,
+`invalid_writable_paths`, `systemd_without_schedule`, `invalid_requires`,
+`invalid_config_keys`, `invalid_network`, `header_version_mismatch`,
+`header_name_mismatch`, `embedded_library`, `library_import_form`,
+`library_path_missing`, `undeclared_helper`, `no_lock`. Warnings: `no_heartbeat`,
+`unknown_key`.
+
+Where the installer already has a rule (author text, `x.y.z` versions, cron
+schedules, script name and shebang, writable paths) the same function decides
+here. Rules only a release needs (script header, lock, declared helpers, list
+shapes) live in this operation alone. One rule is stricter than the installer:
+`default_schedule` must not be `@midnight` or `@annually` (use `@daily`,
+`@yearly`).

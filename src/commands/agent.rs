@@ -31,6 +31,10 @@ pub fn run(command: AgentCommand) -> Result<Response, ResponseBuildError> {
             timeout_seconds,
         } => run_agent(&name, dry_run, timeout_seconds),
         AgentCommand::Configure { request_file } => configure(&request_file),
+        AgentCommand::Validate {
+            directory,
+            manifest_file,
+        } => validate(&directory, &manifest_file),
         AgentCommand::Install {
             request_file,
             request_id,
@@ -573,5 +577,21 @@ fn configure(path: &std::path::Path) -> Result<Response, ResponseBuildError> {
             ErrorCode::UnsupportedPlatform,
             "agent.configure requires a Unix host",
         ))
+    }
+}
+
+/// `agent.validate`: read-only. An answer with `valid: false` is still `ok`;
+/// only inputs that cannot be read at all fail.
+fn validate(
+    directory: &std::path::Path,
+    manifest_file: &std::path::Path,
+) -> Result<Response, ResponseBuildError> {
+    match crate::agent_validate::validate_paths(directory, manifest_file) {
+        Ok(report) => Response::success(crate::agent_validate::OPERATION, report),
+        Err(error) => Ok(Response::failure(
+            crate::agent_validate::OPERATION,
+            ErrorCode::InvalidInput,
+            error.message(),
+        )),
     }
 }
