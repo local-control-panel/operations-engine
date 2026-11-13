@@ -111,6 +111,15 @@ impl Journal {
         self.steps.last().map(|entry| entry.step)
     }
 
+    /// How far the update got, for a status answer. `None` for an empty
+    /// journal: nothing is known then, which is not the same as "no steps".
+    pub fn progress(&self) -> Option<Progress> {
+        Some(Progress {
+            last_step: self.last()?,
+            bundle_complete: self.steps.iter().any(|entry| entry.step == Step::Bundled),
+        })
+    }
+
     /// Reads a journal; text that is too large or not a journal is `None`.
     pub fn parse(text: &str) -> Option<Self> {
         if text.len() > MAX_JOURNAL_BYTES {
@@ -128,6 +137,26 @@ impl Journal {
         }
         self.steps.push(Entry { step, at_unix_secs });
         serde_json::to_vec(&self).ok()
+    }
+}
+
+/// What `operation.status` adds for an update: the last step in the journal
+/// and whether the recovery bundle was complete (`Bundled` reached). Read
+/// only; without a readable journal neither field is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Progress {
+    pub last_step: Step,
+    pub bundle_complete: bool,
+}
+
+/// The directory below the backup root that holds the step journals of an
+/// operation; `None` for an operation that keeps none.
+pub fn journal_dir(operation: &str) -> Option<&'static str> {
+    match operation {
+        "drupal.updateCore" | "drupal.updatePackages" => Some("drupal-updates"),
+        "joomla.updateCore" => Some("joomla-updates"),
+        _ => None,
     }
 }
 
@@ -260,5 +289,43 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 2 * Step::ALL.len());
+    }
+
+    #[test]
+    fn progress_names_the_last_step_and_whether_the_bundle_was_complete() {
+        assert_eq!(Journal::default().progress(), None);
+        let journal = |steps: &[Step]| Journal {
+            version: 1,
+            steps: steps
+                .iter()
+                .map(|&step| Entry {
+                    step,
+                    at_unix_secs: 1,
+                })
+                .collect(),
+        };
+        assert_eq!(
+            journal(&[Step::Bundled, Step::MaintenanceOn, Step::Probed]).progress(),
+            Some(Progress {
+                last_step: Step::Probed,
+                bundle_complete: true
+            })
+        );
+        assert_eq!(
+            journal(&[Step::MaintenanceOn]).progress(),
+            Some(Progress {
+                last_step: Step::MaintenanceOn,
+                bundle_complete: false
+            })
+        );
+    }
+
+    #[test]
+    fn only_the_update_operations_keep_a_journal() {
+        assert_eq!(journal_dir("drupal.updateCore"), Some("drupal-updates"));
+        assert_eq!(journal_dir("drupal.updatePackages"), Some("drupal-updates"));
+        assert_eq!(journal_dir("joomla.updateCore"), Some("joomla-updates"));
+        assert_eq!(journal_dir("drupal.restoreUpdate"), None);
+        assert_eq!(journal_dir("site.deploy"), None);
     }
 }
