@@ -174,6 +174,7 @@ pub const OPERATIONS: &[&str] = &[
     "wordpress.import",
     "wordpress.clone",
     "joomla.clone",
+    "joomla.clearCache",
     "joomla.restoreUpdate",
     "joomla.updateCore",
     "drupal.clone",
