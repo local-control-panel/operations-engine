@@ -838,6 +838,115 @@ fn a_failing_composer_step_is_reported_as_composer_with_its_exit_code_and_no_out
     );
 }
 
+/// A container whose Drush installs but does not start until `robo_fixes`
+/// and the robo pin ran. `grep` answers "not in composer.json".
+fn broken_drush_docker(directory: &std::path::Path, robo_fixes: bool) -> String {
+    let log = directory.join("drush.log");
+    let installed = directory.join("drush-installed");
+    let pinned = directory.join("robo-pinned");
+    let path = directory.join("fake-docker-broken");
+    fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"test -x ./vendor/bin/drush"*) [ -e '{installed}' ]; exit $? ;;
+  *"test -f ./composer.json"*) exit 0 ;;
+  *"grep -qF"*) exit 1 ;;
+  *"composer.phar require drush/drush"*) touch '{installed}'; exit 0 ;;
+  *"composer.phar require consolidation/robo:5.1.0 --with-all-dependencies"*) {pin}; exit 0 ;;
+  *"composer.phar remove"*) rm -f '{installed}' '{pinned}'; exit 0 ;;
+  *"--version"*) [ -e '{pinned}' ]; exit $? ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            installed = installed.display(),
+            pinned = pinned.display(),
+            pin = if robo_fixes {
+                format!("touch '{}'", pinned.display())
+            } else {
+                "true".to_owned()
+            },
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn install_drush_pins_robo_when_drush_does_not_start() {
+    let dir = tempfile::tempdir().unwrap();
+    with_composer(dir.path());
+    let docker = broken_drush_docker(dir.path(), true);
+    let state = managed(dir.path());
+    let tools = dir.path().join("tools");
+    let ctx = Context {
+        engine_state: &state,
+        docker_program: &docker,
+        tools_dir: &tools,
+        backup_root: &state,
+    };
+    let first = execute(
+        &ctx,
+        &request("install-drush", None, ID, None),
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    assert_eq!(first.changed, Some(true));
+    let recorded = log(dir.path());
+    assert!(recorded.contains("require consolidation/robo:5.1.0 --with-all-dependencies"));
+    assert!(!recorded.contains("composer.phar remove"));
+    // Installed means it runs: the next call is a no-op.
+    let second = execute(
+        &ctx,
+        &request("install-drush", None, ID2, None),
+        &CancellationToken::default(),
+    )
+    .unwrap();
+    assert_eq!(second.changed, Some(false));
+}
+
+#[test]
+fn install_drush_removes_what_it_added_when_drush_never_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    with_composer(dir.path());
+    let docker = broken_drush_docker(dir.path(), false);
+    let state = managed(dir.path());
+    let tools = dir.path().join("tools");
+    let ctx = Context {
+        engine_state: &state,
+        docker_program: &docker,
+        tools_dir: &tools,
+        backup_root: &state,
+    };
+    let error = execute(
+        &ctx,
+        &request("install-drush", None, ID, None),
+        &CancellationToken::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::DrushDoesNotRun(_)), "{error:?}");
+    let recorded = log(dir.path());
+    assert!(recorded.contains("composer.phar remove drush/drush consolidation/robo"));
+    assert!(
+        !dir.path().join("drush-installed").exists(),
+        "no broken binary stays"
+    );
+    // The broken binary is gone, so the next call installs again instead of
+    // treating the project as done.
+    let again = execute(
+        &ctx,
+        &request("install-drush", None, ID2, None),
+        &CancellationToken::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(again, Error::DrushDoesNotRun(_)), "{again:?}");
+    assert_eq!(log(dir.path()).matches("require drush/drush").count(), 2);
+}
+
 #[test]
 fn subprocess_outcomes_read_plainly() {
     let base = SubprocessDiagnostics {

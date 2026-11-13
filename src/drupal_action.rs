@@ -530,14 +530,77 @@ pub(crate) fn exited_ok(output: &process::ProcessOutput) -> bool {
     )
 }
 
+/// `Ok(None)` when the project's Drush runs `--version`, otherwise what the
+/// failed run reported.
+fn drush_runs(
+    ctx: &Context<'_>,
+    req: &Request,
+    cancel: &CancellationToken,
+) -> Result<Option<SubprocessDiagnostics>, Error> {
+    match drush(ctx, req, &["--version"], READ_TIMEOUT, cancel) {
+        Ok(_) => Ok(None),
+        Err(Error::Rejected(diagnostics)) => Ok(Some(diagnostics)),
+        Err(other) => Err(other),
+    }
+}
+
+/// Runs the managed Composer in the project with a fixed argument list.
+fn composer(
+    ctx: &Context<'_>,
+    req: &Request,
+    args: &[&str],
+    cancel: &CancellationToken,
+) -> Result<process::ProcessOutput, Error> {
+    let home = format!("COMPOSER_HOME={COMPOSER_HOME}");
+    let cache = format!("COMPOSER_CACHE_DIR={COMPOSER_HOME}/cache");
+    let mut full = vec!["php", CONTAINER_COMPOSER];
+    full.extend_from_slice(args);
+    full.extend_from_slice(&[
+        "--no-interaction",
+        "--no-ansi",
+        "--no-progress",
+        "--no-scripts",
+        "--quiet",
+    ]);
+    container_exec(
+        ctx,
+        req,
+        &[&home, &cache, "COMPOSER_NO_INTERACTION=1"],
+        &full,
+        INSTALL_TIMEOUT,
+        cancel,
+    )
+}
+
+/// Whether `composer.json` names `package` (a fixed string, not a pattern).
+fn composer_json_names(
+    ctx: &Context<'_>,
+    req: &Request,
+    package: &str,
+    cancel: &CancellationToken,
+) -> Result<bool, Error> {
+    Ok(exited_ok(&container_exec(
+        ctx,
+        req,
+        &[],
+        &["grep", "-qF", &format!("\"{package}\""), "./composer.json"],
+        READ_TIMEOUT,
+        cancel,
+    )?))
+}
+
 /// Installs Drush into the project with the managed Composer. Returns
-/// whether anything changed.
+/// whether anything changed. Drush counts as installed only when it runs.
+/// Some Drupal 10 projects resolve `consolidation/robo` to a release that
+/// needs a newer Symfony than the project has, and Drush then fails at
+/// start; the install retries once with robo 5.1.0, and when Drush still
+/// does not run, removes what this call added so no broken binary stays.
 fn install_drush(
     ctx: &Context<'_>,
     req: &Request,
     cancel: &CancellationToken,
 ) -> Result<bool, Error> {
-    // Already there: a Composer project whose vendor/bin/drush is executable.
+    // Already there: an executable vendor/bin/drush that also runs.
     if exited_ok(&container_exec(
         ctx,
         req,
@@ -545,7 +608,8 @@ fn install_drush(
         &["test", "-x", "./vendor/bin/drush"],
         READ_TIMEOUT,
         cancel,
-    )?) {
+    )?) && drush_runs(ctx, req, cancel)?.is_none()
+    {
         return Ok(false);
     }
     if !exited_ok(&container_exec(
@@ -565,26 +629,9 @@ fn install_drush(
     {
         return Err(Error::ComposerMissing);
     }
-    let home = format!("COMPOSER_HOME={COMPOSER_HOME}");
-    let cache = format!("COMPOSER_CACHE_DIR={COMPOSER_HOME}/cache");
-    let output = container_exec(
-        ctx,
-        req,
-        &[&home, &cache, "COMPOSER_NO_INTERACTION=1"],
-        &[
-            "php",
-            CONTAINER_COMPOSER,
-            "require",
-            "drush/drush",
-            "--no-interaction",
-            "--no-ansi",
-            "--no-progress",
-            "--no-scripts",
-            "--quiet",
-        ],
-        INSTALL_TIMEOUT,
-        cancel,
-    )?;
+    let had_drush = composer_json_names(ctx, req, "drush/drush", cancel)?;
+    let had_robo = composer_json_names(ctx, req, "consolidation/robo", cancel)?;
+    let output = composer(ctx, req, &["require", "drush/drush"], cancel)?;
     if !exited_ok(&output) {
         return Err(Error::ComposerFailed(SubprocessDiagnostics::from_output(
             ctx.docker_program,
@@ -592,11 +639,40 @@ fn install_drush(
         )));
     }
     // Prove the result works the way later operations will run it.
-    drush(ctx, req, &["--version"], READ_TIMEOUT, cancel).map_err(|error| match error {
-        Error::Rejected(diagnostics) => Error::DrushDoesNotRun(diagnostics),
-        other => other,
-    })?;
-    Ok(true)
+    let Some(mut failure) = drush_runs(ctx, req, cancel)? else {
+        return Ok(true);
+    };
+    let mut pinned_robo = false;
+    let retry = composer(
+        ctx,
+        req,
+        &[
+            "require",
+            "consolidation/robo:5.1.0",
+            "--with-all-dependencies",
+        ],
+        cancel,
+    )?;
+    if exited_ok(&retry) {
+        pinned_robo = !had_robo;
+        match drush_runs(ctx, req, cancel)? {
+            None => return Ok(true),
+            Some(diagnostics) => failure = diagnostics,
+        }
+    }
+    // Still broken: take back what this call added (best effort).
+    let mut remove = vec!["remove"];
+    if !had_drush {
+        remove.push("drush/drush");
+    }
+    if pinned_robo {
+        remove.push("consolidation/robo");
+    }
+    if remove.len() > 1 {
+        remove.push("--update-with-dependencies");
+        let _ = composer(ctx, req, &remove, cancel);
+    }
+    Err(Error::DrushDoesNotRun(failure))
 }
 
 fn maintenance_flag(bytes: &[u8]) -> Option<bool> {
