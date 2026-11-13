@@ -144,4 +144,5 @@ schedules, script name and shebang, writable paths) the same function decides
 here. Rules only a release needs (script header, lock, declared helpers, list
 shapes) live in this operation alone. One rule is stricter than the installer:
 `default_schedule` must not be `@midnight` or `@annually` (use `@daily`,
-`@yearly`).
+`@yearly`); the finding is `invalid_default_schedule` and its message names the
+spelling to use. It is a spelling rule, not a cron error: the installer accepts both.

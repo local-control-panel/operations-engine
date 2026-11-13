@@ -112,6 +112,15 @@ pub struct Finding {
     pub message: String,
 }
 
+/// The canonical spelling of a cron alias that has a second one.
+fn canonical_alias(schedule: &str) -> Option<&'static str> {
+    match schedule {
+        "@midnight" => Some("@daily"),
+        "@annually" => Some("@yearly"),
+        _ => None,
+    }
+}
+
 fn finding(code: &'static str, field: Option<&'static str>, message: impl Into<String>) -> Finding {
     Finding {
         code,
@@ -349,15 +358,19 @@ pub fn validate(manifest: &Value, directory_name: &str, script: &dyn Fn(&str) ->
                 "default_schedule must be empty when schedule = none",
             ));
         }
-    } else if Schedule::parse(default_schedule).is_err()
-        || matches!(default_schedule, "@midnight" | "@annually")
-    {
-        // The installer also accepts the `@midnight` and `@annually` aliases;
-        // published agents use the canonical `@daily` and `@yearly`.
+    } else if Schedule::parse(default_schedule).is_err() {
         problems.push(finding(
             "invalid_default_schedule",
             Some("default_schedule"),
             "default_schedule is not a cron expression",
+        ));
+    } else if let Some(canonical) = canonical_alias(default_schedule) {
+        // The installer also accepts these aliases; published agents use the
+        // canonical spelling, so one meaning has one spelling.
+        problems.push(finding(
+            "invalid_default_schedule",
+            Some("default_schedule"),
+            format!("write default_schedule as {canonical}, the spelling published agents use"),
         ));
     }
     let script_name = text("script").unwrap_or_default();
@@ -886,11 +899,16 @@ mod tests {
         assert!(check(&m, &script("1.0.0")).valid);
         m["default_schedule"] = json!("@hourly");
         assert!(check(&m, &script("1.0.0")).valid);
-        m["default_schedule"] = json!("@midnight");
-        assert_eq!(
-            codes(&check(&m, &script("1.0.0"))),
-            ["invalid_default_schedule"]
-        );
+        for (alias, canonical) in [("@midnight", "@daily"), ("@annually", "@yearly")] {
+            m["default_schedule"] = json!(alias);
+            let report = check(&m, &script("1.0.0"));
+            assert_eq!(codes(&report), ["invalid_default_schedule"]);
+            assert!(
+                report.problems[0].message.contains(canonical),
+                "{:?}",
+                report.problems[0]
+            );
+        }
         m["default_schedule"] = json!("1 2 3 4 ?");
         assert_eq!(
             codes(&check(&m, &script("1.0.0"))),
