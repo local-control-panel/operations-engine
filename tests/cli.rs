@@ -177,6 +177,7 @@ fn capabilities_describe_only_implemented_operations() {
             "agent.bruteforceUnban",
             "agent.run",
             "agent.configure",
+            "agent.validate",
             "system.activateAutoupdatesConfig",
             "system.installAutoupdates",
             "system.installDocker",

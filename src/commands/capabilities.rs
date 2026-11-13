@@ -228,6 +228,7 @@ pub const OPERATIONS: &[&str] = &[
     "agent.bruteforceUnban",
     "agent.run",
     "agent.configure",
+    "agent.validate",
     "system.activateAutoupdatesConfig",
     "system.installAutoupdates",
     "system.installDocker",

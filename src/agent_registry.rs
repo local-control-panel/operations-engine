@@ -21,7 +21,7 @@
 
 use crate::{
     agent_lifecycle::{self, Agent, valid_agent_name},
-    agent_systemd,
+    agent_systemd, agent_validate,
     backup_schedule::Schedule,
     engine::fetch,
     error::ErrorCode,
@@ -488,16 +488,6 @@ fn sha256(bytes: &[u8]) -> String {
     ConfigHash::of(bytes).as_str().to_owned()
 }
 
-fn parse_semver(text: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = text.split('.');
-    let triple = (
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    );
-    parts.next().is_none().then_some(triple)
-}
-
 /// Downloads and verifies one agent. Approval of a community agent is checked
 /// by the caller with `approved`, so this stays free of filesystem access.
 pub fn fetch_verified(
@@ -537,10 +527,7 @@ pub fn fetch_verified(
         return Err(Error::Revoked);
     }
     // The name is shown to operators and written into the manifest.
-    if entry.author.chars().count() > 100
-        || entry.author.chars().any(char::is_control)
-        || entry.author != entry.author.trim()
-    {
+    if !agent_validate::author_text_ok(&entry.author) {
         return Err(Error::BadRegistry("invalid author"));
     }
     let tier = match entry.tier.as_str() {
@@ -549,8 +536,8 @@ pub fn fetch_verified(
         _ => return Err(Error::BadRegistry("unknown tier")),
     };
     let (Some(needed), Some(have)) = (
-        parse_semver(&entry.min_engine),
-        parse_semver(engine_version),
+        agent_validate::parse_semver(&entry.min_engine),
+        agent_validate::parse_semver(engine_version),
     ) else {
         return Err(Error::BadRegistry("version is not x.y.z"));
     };
@@ -558,7 +545,7 @@ pub fn fetch_verified(
         return Err(Error::EngineTooOld);
     }
     check_requirements(entry, host)?;
-    if parse_semver(&entry.version).is_none() {
+    if agent_validate::parse_semver(&entry.version).is_none() {
         return Err(Error::BadRegistry("version is not x.y.z"));
     }
     let (configurable, default_schedule) = match entry.schedule.as_str() {
@@ -591,10 +578,7 @@ pub fn fetch_verified(
     if request.schedule.is_some() && !configurable {
         return Err(Error::ScheduleNotConfigurable);
     }
-    if entry.script.is_empty()
-        || entry.script.contains(['/', '\\'])
-        || entry.script.starts_with('.')
-    {
+    if !agent_validate::valid_script_name(&entry.script) {
         return Err(Error::BadRegistry("script name is not a plain file name"));
     }
     let path = format!("agents/{}/{}", request.name, entry.script);
@@ -620,7 +604,7 @@ pub fn fetch_verified(
         return Err(Error::NotApproved);
     }
     let script = String::from_utf8(bytes).map_err(|_| Error::BadRegistry("script is not UTF-8"))?;
-    if script.contains('\0') || !script.starts_with("#!") {
+    if !agent_validate::valid_script_text(&script) {
         return Err(Error::BadRegistry("script must be text starting with #!"));
     }
     let agent = Agent::from_registry_by(

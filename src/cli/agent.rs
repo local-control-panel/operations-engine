@@ -83,6 +83,19 @@ pub enum AgentCommand {
         #[arg(long = "request-file")]
         request_file: PathBuf,
     },
+    /// Check an agent's manifest and script against the rules the engine
+    /// installs by. Read-only. `--manifest-file` is the agent's `agent.toml`
+    /// as JSON; the script is read from `--directory`. The answer is
+    /// `{valid, agent, problems[], warnings[]}`; a manifest that cannot be
+    /// read or parsed is an `INVALID_INPUT` failure, never `valid`.
+    Validate {
+        /// The agent's directory (its name must equal the manifest's `name`).
+        #[arg(long)]
+        directory: PathBuf,
+        /// The agent's `agent.toml` converted to JSON.
+        #[arg(long = "manifest-file")]
+        manifest_file: PathBuf,
+    },
     /// Helper for agent scripts: write `$WCP_DIR/agents/NAME.heartbeat`
     /// atomically. Silent on success; exit 0, or 1 on I/O failure, 2 on a bad
     /// name. Skipped under `WCP_DRY_RUN=1`.
@@ -296,6 +309,7 @@ impl AgentCommand {
             Self::BruteforceUnban { .. } => "agent.bruteforceUnban",
             Self::Run { .. } => "agent.run",
             Self::Configure { .. } => "agent.configure",
+            Self::Validate { .. } => "agent.validate",
             Self::Heartbeat { .. } => "agent.heartbeat",
             Self::Lock { .. } => "agent.lock",
             Self::Log { .. } => "agent.log",
