@@ -1132,6 +1132,25 @@ write failed. A successful update does not accept anything: the next compare
 shows the difference until a new candidate is reviewed and accepted. Server-local
 storage is not external evidence of host integrity.
 
+## `joomla.clearCache`
+
+`joomla clear-cache` takes a root-owned JSON request `{projectRoot}`; unknown
+fields are rejected. Joomla's console cannot clear every cache group
+(`cache:clean` cleans only the default one), so the engine empties the
+contents of `cache/` and `administrator/cache/` itself, descriptor-relative
+through the engine's managed roots: both directories are opened without
+following a symlink, children are entered the same way, and a symlink found
+inside is unlinked, never followed. A root that is a symlink or not a
+directory is refused (`invalid_input`) before anything is deleted; a missing
+one counts as empty. The directories themselves, their owner and mode, the
+shipped `index.html`, `.htaccess` and `web.config` at their top level, and
+every other path (`tmp/`, `logs/`, sessions, the database) stay. `invalid_input`
+when the project root has no `configuration.php`. Lock, idempotency,
+transaction and audit as for the other site operations; the result is
+`{removedEntries, removedBytes, completedAtUnixSecs}` (`removedBytes` counts
+regular files) and a replay returns it without deleting again. Advertised as
+`joomla.clearCache`.
+
 ## `cms.clearCache`
 
 `cms clear-cache` takes a root-owned JSON request `{kind, container,
@@ -1143,8 +1162,8 @@ inside the site's container from the project root: `php artisan optimize:clear
 the application cache store, so sessions kept in the cache store are dropped).
 WordPress and Drupal keep `wordpress.boundedAction` (`cacheFlush`) and
 `drupal.cacheRebuild`. Joomla is not a kind: its only native console command,
-`cache:clean`, cleans just the default cache group and cannot be told to clean
-all of them, so it would leave page and component caches behind. Lock,
+`cache:clean`, cleans just the default cache group, so Joomla has its own
+operation, `joomla.clearCache`. Lock,
 idempotency, transaction and audit as for the Drupal actions; the result is
 `{kind, completedAtUnixSecs}` with no command output. Advertised as
 `cms.clearCache`.

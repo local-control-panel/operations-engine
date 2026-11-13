@@ -538,6 +538,16 @@ pub enum JoomlaCommand {
         #[arg(long = "idempotency-key")]
         idempotency_key: Option<String>,
     },
+    /// Empty the contents of `cache/` and `administrator/cache/` (no symlink
+    /// is followed; the directories and everything else stay).
+    ClearCache {
+        #[arg(long = "request-file")]
+        request_file: PathBuf,
+        #[arg(long = "request-id")]
+        request_id: String,
+        #[arg(long = "idempotency-key")]
+        idempotency_key: Option<String>,
+    },
 }
 
 impl JoomlaCommand {
@@ -546,6 +556,7 @@ impl JoomlaCommand {
             Self::Clone { .. } => "joomla.clone",
             Self::UpdateCore { .. } => "joomla.updateCore",
             Self::RestoreUpdate { .. } => "joomla.restoreUpdate",
+            Self::ClearCache { .. } => "joomla.clearCache",
         }
     }
 }

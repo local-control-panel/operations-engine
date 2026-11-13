@@ -6,7 +6,7 @@
 //!   files, config, route, view and event caches, and the application cache
 //!   store). Sessions kept in the cache store are cleared with it.
 //!
-//! Joomla is deliberately not a kind: its only native console command,
+//! Joomla is deliberately not a kind (it has `joomla.clearCache`): its only native console command,
 //! `cache:clean`, cleans just the default cache group and cannot be told to
 //! clean all of them (that needs Joomla's admin UI), so a "clear cache"
 //! button over it would leave page and component caches behind.
