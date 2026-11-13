@@ -500,6 +500,11 @@ pub struct IncompleteOperation {
     /// The operation that finishes this one, when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovered_by: Option<&'static str>,
+    /// For a Drupal or Joomla update: the last step in its step journal and
+    /// whether the recovery bundle was complete. Left out (unknown) when the
+    /// journal is missing, unreadable or empty.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::update_steps::Progress>,
 }
 
 /// Operations whose interrupted runs `site.reconcile` rolls back.
@@ -549,6 +554,7 @@ pub struct IncompleteList {
 pub fn incomplete(
     engine_state: &ManagedRoot,
     state_root: &std::path::Path,
+    backup_root: Option<&ManagedRoot>,
 ) -> Result<IncompleteList, StatusError> {
     let mut scopes = Vec::new();
     collect_scopes(state_root, std::path::Path::new(""), 0, &mut scopes);
@@ -619,6 +625,9 @@ pub fn incomplete(
                             } else {
                                 None
                             },
+                            progress: backup_root.and_then(|backups| {
+                                update_progress(backups, &record.operation, record.request_id)
+                            }),
                             operation: record.operation,
                             started_at_unix_secs: record.started_at_unix_secs,
                         });
@@ -1138,7 +1147,7 @@ mod tests {
         std::fs::create_dir_all(import.join("transactions")).unwrap();
         std::fs::write(import.join("pending/abc.json"), "{}").unwrap();
 
-        let found = incomplete(&root, directory.path()).unwrap();
+        let found = incomplete(&root, directory.path(), None).unwrap();
         assert_eq!(found.interrupted.len(), 1, "{found:?}");
         assert_eq!(found.interrupted[0].request_id, stuck);
         assert_eq!(found.interrupted[0].scope, format!("sites/{SITE_ID}"));
@@ -1150,6 +1159,59 @@ mod tests {
                 name: "abc.json".into()
             }]
         );
+    }
+
+    #[test]
+    fn an_interrupted_update_row_carries_its_journal_progress() {
+        let (directory, root) = state_root();
+        let scope = directory.path().join("drupal-update/abc");
+        std::fs::create_dir_all(scope.join("transactions")).unwrap();
+        let updating = RequestId::parse(REQUEST_ID).unwrap();
+        let no_journal = RequestId::parse("223e4567-e89b-12d3-a456-426614174000").unwrap();
+        for (id, operation) in [
+            (updating, "drupal.updatePackages"),
+            (no_journal, "drupal.updateCore"),
+        ] {
+            std::fs::write(
+                scope.join(format!("transactions/{id}.json")),
+                serde_json::to_vec(&TransactionState::start(id, None, operation)).unwrap(),
+            )
+            .unwrap();
+        }
+        let backup_dir = tempfile::tempdir().unwrap();
+        let backups = ManagedRoot::open(&TrustedRoot::parse(backup_dir.path()).unwrap()).unwrap();
+        write_journal(
+            &backups,
+            "drupal-updates",
+            r#"{"version":1,"steps":[{"step":"bundled","atUnixSecs":1},{"step":"probed","atUnixSecs":2}]}"#,
+        );
+
+        let found = incomplete(&root, directory.path(), Some(&backups)).unwrap();
+        let row = |id| {
+            found
+                .interrupted
+                .iter()
+                .find(|r| r.request_id == id)
+                .unwrap()
+        };
+        assert_eq!(
+            row(updating).progress,
+            Some(crate::update_steps::Progress {
+                last_step: crate::update_steps::Step::Probed,
+                bundle_complete: true
+            })
+        );
+        assert_eq!(row(no_journal).progress, None);
+        let json = serde_json::to_value(&found).unwrap();
+        let rows = json["interrupted"].as_array().unwrap();
+        let with = rows.iter().find(|r| r["requestId"] == REQUEST_ID).unwrap();
+        assert_eq!(with["lastStep"], "probed");
+        assert_eq!(with["bundleComplete"], true);
+        let without = rows.iter().find(|r| r["requestId"] != REQUEST_ID).unwrap();
+        assert!(without.get("lastStep").is_none() && without.get("bundleComplete").is_none());
+        // Without a backup root the rows still list, just without progress.
+        let found = incomplete(&root, directory.path(), None).unwrap();
+        assert!(found.interrupted.iter().all(|r| r.progress.is_none()));
     }
 
     #[test]
@@ -1179,7 +1241,7 @@ mod tests {
             )
             .unwrap();
         }
-        let found = incomplete(&root, directory.path()).unwrap();
+        let found = incomplete(&root, directory.path(), None).unwrap();
         assert_eq!(
             found.markers,
             vec![PendingMarker {
@@ -1204,7 +1266,7 @@ mod tests {
     fn incomplete_on_an_empty_state_root_is_empty() {
         let directory = tempfile::tempdir().unwrap();
         let root = ManagedRoot::open(&TrustedRoot::parse(directory.path()).unwrap()).unwrap();
-        let found = incomplete(&root, directory.path()).unwrap();
+        let found = incomplete(&root, directory.path(), None).unwrap();
         assert!(found.interrupted.is_empty() && found.markers.is_empty());
     }
     #[test]
